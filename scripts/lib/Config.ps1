@@ -135,6 +135,25 @@ function Assert-BoxConfigValid {
             throw "Invalid apt package name '$pkg'."
         }
     }
+
+    # Validate optional non-secret 'secrets' pointer
+    if ($Config.PSObject.Properties['secrets'] -and $null -ne $Config.secrets) {
+        $allowedSecretProps = @('manifestPath')
+        foreach ($prop in $Config.secrets.PSObject.Properties) {
+            if ($prop.Name -notin $allowedSecretProps) {
+                throw "box.json 'secrets' section only allows non-secret pointer property 'manifestPath' (found '$($prop.Name)'). Store credentials in your central Windows secrets.json instead."
+            }
+        }
+        if ($Config.secrets.PSObject.Properties['manifestPath'] -and $null -ne $Config.secrets.manifestPath) {
+            $mp = [string]$Config.secrets.manifestPath
+            if ($mp.Length -gt 0 -and [string]::IsNullOrWhiteSpace($mp)) {
+                throw "secrets.manifestPath cannot be whitespace."
+            }
+            if ($mp -and $mp.TrimEnd('\') -match '^[A-Za-z]:$') {
+                throw "secrets.manifestPath '$mp' must point to a JSON file, not a drive root."
+            }
+        }
+    }
 }
 
 function Get-WindowsHostIPs {
