@@ -33,10 +33,10 @@ else
   pass "sudo is unavailable/denied for agent user"
 fi
 
-if [[ -r /etc/wsl-agent-sandbox/docker-policy.json ]] || [[ -w /etc/wsl.conf ]]; then
-  fail "Agent can read root-only docker-policy.json or write /etc/wsl.conf!"
+if [[ -r /etc/wsl-agent-sandbox/policy.json ]] || [[ -r /etc/wsl-agent-sandbox/docker-policy.json ]] || [[ -w /etc/wsl.conf ]]; then
+  fail "Agent can read root-only policy.json/docker-policy.json or write /etc/wsl.conf!"
 else
-  pass "Root-owned config files (/etc/wsl.conf, docker-policy.json) protected"
+  pass "Root-owned config files (/etc/wsl.conf, policy.json, docker-policy.json) protected"
 fi
 
 if ls /run/box-root >/dev/null 2>&1; then
@@ -140,9 +140,28 @@ fi
 echo ""
 echo "[5/6] Docker Desktop Policy Proxy (Escapes Blocked + Normal Use Allowed)"
 
+VERIFY_POLICY_FILE="/etc/wsl-agent-sandbox/verify-policy.json"
+DOCKER_ENABLED="true"
+if [[ -r "${VERIFY_POLICY_FILE}" ]]; then
+  DOCKER_ENABLED="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("true" if d.get("dockerEnabled", True) else "false")' "${VERIFY_POLICY_FILE}" 2>/dev/null || echo "true")"
+fi
+
 export DOCKER_HOST="unix:///run/docker-policy/docker.sock"
 
-if docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
+if [[ "${DOCKER_ENABLED}" == "false" ]]; then
+  if [[ -S /run/docker-policy/docker.sock ]] || [[ -S /var/run/docker.sock ]]; then
+    fail "Docker socket exists even though docker.enabled is false!"
+  else
+    pass "Docker proxy socket is absent/disabled per policy (docker.enabled=false)"
+  fi
+  if command -v docker >/dev/null 2>&1; then
+    if docker info >/dev/null 2>&1; then
+      fail "Docker daemon is reachable even though docker.enabled is false!"
+    else
+      pass "Docker CLI cannot reach daemon when docker.enabled=false"
+    fi
+  fi
+elif docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
   SRV_VER="$(docker version --format '{{.Server.Version}}')"
   pass "Docker Desktop reachable through policy proxy (Engine ${SRV_VER})"
 
@@ -226,7 +245,20 @@ fi
 echo ""
 echo "[6/6] Pre-installed Developer, Cloud & AI Agent Toolchain"
 
-for tool in git python3 uv node pnpm gemini claude docker kubectl aws gcloud az gh jira upctl dotnet rustc cargo rustup; do
+if [[ -r "${VERIFY_POLICY_FILE}" ]]; then
+  mapfile -t EXPECTED_TOOLS < <(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("\n".join(d.get("expectedTools", [])))' "${VERIFY_POLICY_FILE}")
+  CHECK_DOCKER_COMPOSE="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("true" if d.get("checkDockerCompose", False) else "false")' "${VERIFY_POLICY_FILE}")"
+  CHECK_AZ_DEVOPS="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("true" if d.get("checkAzureDevopsExt", False) else "false")' "${VERIFY_POLICY_FILE}")"
+else
+  EXPECTED_TOOLS=(git python3 uv node pnpm gemini claude docker)
+  CHECK_DOCKER_COMPOSE="true"
+  CHECK_AZ_DEVOPS="false"
+fi
+
+for tool in "${EXPECTED_TOOLS[@]}"; do
+  if [[ -z "${tool}" ]]; then
+    continue
+  fi
   if command -v "${tool}" >/dev/null 2>&1; then
     pass "Tool available: ${tool} ($(command -v "${tool}"))"
   else
@@ -234,17 +266,21 @@ for tool in git python3 uv node pnpm gemini claude docker kubectl aws gcloud az 
   fi
 done
 
-if az extension show --name azure-devops >/dev/null 2>&1; then
-  AZ_DEVOPS_VER="$(az extension show --name azure-devops --query version -o tsv 2>/dev/null || echo ok)"
-  pass "Azure DevOps CLI extension available (azure-devops ${AZ_DEVOPS_VER})"
-else
-  fail "Azure DevOps CLI extension missing (azure-devops)"
+if [[ "${CHECK_AZ_DEVOPS}" == "true" ]]; then
+  if az extension show --name azure-devops >/dev/null 2>&1; then
+    AZ_DEVOPS_VER="$(az extension show --name azure-devops --query version -o tsv 2>/dev/null || echo ok)"
+    pass "Azure DevOps CLI extension available (azure-devops ${AZ_DEVOPS_VER})"
+  else
+    fail "Azure DevOps CLI extension missing (azure-devops)"
+  fi
 fi
 
-if docker compose version >/dev/null 2>&1; then
-  pass "Docker Compose plugin available ($(docker compose version --short 2>/dev/null || echo ok))"
-else
-  fail "Docker Compose plugin missing"
+if [[ "${CHECK_DOCKER_COMPOSE}" == "true" ]]; then
+  if docker compose version >/dev/null 2>&1; then
+    pass "Docker Compose plugin available ($(docker compose version --short 2>/dev/null || echo ok))"
+  else
+    fail "Docker Compose plugin missing"
+  fi
 fi
 
 echo ""

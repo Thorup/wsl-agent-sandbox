@@ -4,6 +4,7 @@ set -euo pipefail
 POLICY_FILE="/etc/wsl-agent-sandbox/policy.json"
 HOST_IPS_FILE="/etc/wsl-agent-sandbox/host_ips.txt"
 DOCKER_POLICY_FILE="/etc/wsl-agent-sandbox/docker-policy.json"
+VERIFY_POLICY_FILE="/etc/wsl-agent-sandbox/verify-policy.json"
 NFT_CONF_FILE="/etc/wsl-agent-sandbox/nftables.conf"
 BOX_ROOT="/run/box-root"
 PRIVATE_WSL_MNT="${BOX_ROOT}/mnt-wsl"
@@ -84,7 +85,7 @@ done
 
 # 2. Parse policy.json with Python 3 to apply shared folders, Docker bind mirrors,
 #    docker-policy.json, and per-UID nftables rules atomically.
-python3 - "${POLICY_FILE}" "${HOST_IPS_FILE}" "${DOCKER_POLICY_FILE}" "${NFT_CONF_FILE}" "${PRIVATE_WSL_MNT}" <<'PYEOF'
+python3 - "${POLICY_FILE}" "${HOST_IPS_FILE}" "${DOCKER_POLICY_FILE}" "${NFT_CONF_FILE}" "${PRIVATE_WSL_MNT}" "${VERIFY_POLICY_FILE}" <<'PYEOF'
 import ipaddress
 import json
 import os
@@ -92,7 +93,7 @@ import re
 import subprocess
 import sys
 
-policy_file, host_ips_file, docker_policy_file, nft_conf_file, private_wsl_mnt = sys.argv[1:6]
+policy_file, host_ips_file, docker_policy_file, nft_conf_file, private_wsl_mnt, verify_policy_file = sys.argv[1:7]
 
 with open(policy_file, "r", encoding="utf-8") as f:
     policy = json.load(f)
@@ -235,6 +236,50 @@ compiled_docker_policy = {
 with open(docker_policy_file, "w", encoding="utf-8") as f:
     json.dump(compiled_docker_policy, f, indent=2)
 os.chmod(docker_policy_file, 0o600)
+
+# --- B2. World-readable non-secret verify-policy.json for policy-aware verification ---
+pkgs = policy.get("packages", {})
+expected_tools = ["git", "python3"]
+if pkgs.get("installDockerCli", True):
+    expected_tools.append("docker")
+if pkgs.get("installUv", True):
+    expected_tools.append("uv")
+if pkgs.get("installNodeLts", True):
+    expected_tools.append("node")
+    if pkgs.get("installPnpm", True):
+        expected_tools.append("pnpm")
+    if pkgs.get("installGeminiCli", True):
+        expected_tools.append("gemini")
+    if pkgs.get("installClaudeCode", True):
+        expected_tools.append("claude")
+if pkgs.get("installKubectl", False):
+    expected_tools.append("kubectl")
+if pkgs.get("installAwsCli", False):
+    expected_tools.append("aws")
+if pkgs.get("installGcloudCli", False):
+    expected_tools.append("gcloud")
+if pkgs.get("installAzureCli", False) or pkgs.get("installAzureDevopsCli", False):
+    expected_tools.append("az")
+if pkgs.get("installGithubCli", False):
+    expected_tools.append("gh")
+if pkgs.get("installJiraCli", False):
+    expected_tools.append("jira")
+if pkgs.get("installUpctl", False):
+    expected_tools.append("upctl")
+if pkgs.get("installDotnetSdk", False):
+    expected_tools.append("dotnet")
+if pkgs.get("installRust", False):
+    expected_tools.extend(["rustc", "cargo", "rustup"])
+
+verify_policy = {
+    "dockerEnabled": bool(docker_cfg.get("enabled", True)),
+    "expectedTools": expected_tools,
+    "checkDockerCompose": bool(pkgs.get("installDockerCli", True)),
+    "checkAzureDevopsExt": bool(pkgs.get("installAzureDevopsCli", False)),
+}
+with open(verify_policy_file, "w", encoding="utf-8") as f:
+    json.dump(verify_policy, f, indent=2)
+os.chmod(verify_policy_file, 0o644)
 
 # --- C. Per-UID nftables firewall (table inet wsl_agent_sandbox) ---
 dns_v4, dns_v6 = set(), set()
