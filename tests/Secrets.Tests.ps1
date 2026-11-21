@@ -620,6 +620,43 @@ try {
     Assert-Throws "Rejects empty enabled git section" {
         Build-SeedSecretsPayload -ManifestPath $emptyGitManifest -AgentName 'agent'
     } 'specify at least one'
+
+    $proxyManifest = Join-Path $tmpDir 'proxy-inject.json'
+    [System.IO.File]::WriteAllText($proxyManifest, (@{
+        claude = @{ apiKey = 'sk-ant-real-secret-value'; oauthToken = 'oauth-real-secret-value'; proxyInject = $true }
+        gemini = @{ apiKey = 'AIza-real-secret-value'; proxyInject = $true }
+        github = @{ hostname = 'ghes.example.internal'; token = 'ghp_realsecret123456'; proxyInject = $true }
+        jira   = @{ server = 'https://jira.example.com'; login = 'alice@example.com'; apiToken = 'jira-real-tok'; authType = 'basic'; proxyInject = $true }
+    } | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding($false)))
+    $proxyBuilt = Build-SeedSecretsPayload -ManifestPath $proxyManifest -AgentName 'agent'
+    $proxyBuilt2 = Build-SeedSecretsPayload -ManifestPath $proxyManifest -AgentName 'agent'
+    $svcJson = ($proxyBuilt.Payload.services | ConvertTo-Json -Depth 8)
+    Assert-True "proxyInject replaces all real secrets (including claude oauthToken & jira apiToken) with random per-seed placeholders" (
+        $proxyBuilt.Payload.services.claude.apiKey -match '^sandbox-proxy-claude-[0-9a-f]{48}$' -and
+        $proxyBuilt.Payload.services.claude.oauthToken -match '^sandbox-proxy-claude-oauth-[0-9a-f]{48}$' -and
+        $proxyBuilt.Payload.services.claude.apiKey -ne $proxyBuilt2.Payload.services.claude.apiKey -and
+        $proxyBuilt.Payload.services.gemini.apiKey -match '^sandbox-proxy-gemini-[0-9a-f]{48}$' -and
+        $proxyBuilt.Payload.services.jira.server -eq 'http://127.0.0.1:3129/jira' -and
+        $svcJson -notmatch 'real-secret-value|ghp_realsecret123456|jira-real-tok'
+    )
+    Assert-True "proxyInject configures proxyBaseUrl, GHES /api/v3, expectedTokens, and real headers in root proxyRoutes" (
+        $proxyBuilt.Payload.services.claude.proxyBaseUrl -eq 'http://127.0.0.1:3129/claude' -and
+        $proxyBuilt.Payload.services.gemini.proxyBaseUrl -eq 'http://127.0.0.1:3129/gemini' -and
+        $proxyBuilt.Payload.services.github.proxyBaseUrl -eq 'http://127.0.0.1:3129/github' -and
+        $proxyBuilt.Payload.proxyRoutes.github.upstreamBaseUrl -eq 'https://ghes.example.internal/api/v3' -and
+        $proxyBuilt.Payload.proxyRoutes.claude.injectHeaders['x-api-key'] -eq 'sk-ant-real-secret-value' -and
+        $proxyBuilt.Payload.proxyRoutes.claude.injectHeaders['Authorization'] -eq 'Bearer oauth-real-secret-value' -and
+        $proxyBuilt.Payload.proxyRoutes.gemini.injectHeaders['x-goog-api-key'] -eq 'AIza-real-secret-value' -and
+        $proxyBuilt.Payload.proxyRoutes.jira.injectHeaders['Authorization'] -match '^Basic '
+    )
+
+    $badJiraMtlsManifest = Join-Path $tmpDir 'bad-jira-mtls.json'
+    [System.IO.File]::WriteAllText($badJiraMtlsManifest, (@{
+        jira = @{ server = 'https://jira.example.com'; login = 'alice@example.com'; apiToken = 'tok'; authType = 'mtls'; proxyInject = $true }
+    } | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding($false)))
+    Assert-Throws "Rejects jira.proxyInject with authType=mtls" {
+        Build-SeedSecretsPayload -ManifestPath $badJiraMtlsManifest -AgentName 'agent'
+    } 'mtls'
 } finally {
     [Environment]::SetEnvironmentVariable('WSL_AGENT_SANDBOX_SECRETS_PATH', $prevEnvManifest)
     [Environment]::SetEnvironmentVariable('TEST_SANDBOX_GH_TOKEN', $prevTestToken)
