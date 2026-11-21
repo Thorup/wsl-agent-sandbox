@@ -10,3 +10,5 @@ secrets.json
 *.secrets.json
 .secrets/
 box.local.json
+__pycache__/
+*.pyc

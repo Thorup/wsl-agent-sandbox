@@ -165,6 +165,8 @@ function Sync-AssetsToWsl {
     Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'scripts\linux\verify-isolation.sh') -RemotePath '/usr/local/bin/box-verify-isolation.sh' -Mode '0755' -NormalizeLF
     Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'systemd\box-hardening.service') -RemotePath '/etc/systemd/system/box-hardening.service' -Mode '0644' -NormalizeLF
     Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'systemd\docker-policy-proxy.service') -RemotePath '/etc/systemd/system/docker-policy-proxy.service' -Mode '0644' -NormalizeLF
+    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'scripts\linux\egress-proxy.py') -RemotePath '/usr/local/sbin/box-egress-proxy.py' -Mode '0755' -NormalizeLF
+    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'systemd\egress-proxy.service') -RemotePath '/etc/systemd/system/egress-proxy.service' -Mode '0644' -NormalizeLF
 
     if ($IncludeProxySource) {
         $proxyFiles = @('go.mod', 'main.go', 'policy.go', 'proxy.go', 'bind_pin.go', 'policy_test.go')

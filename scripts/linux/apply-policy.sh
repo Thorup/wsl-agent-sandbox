@@ -56,9 +56,35 @@ DOTNET_ROOT="/usr/local/share/dotnet"
 EOF
 
 DOCKER_ENABLED="$(python3 -c 'import json, sys; d=json.load(open(sys.argv[1])); print("1" if d["docker"].get("enabled", True) else "0")' "${POLICY_FILE}")"
+EGRESS_MODE="$(python3 -c 'import json, sys; d=json.load(open(sys.argv[1])); print(d.get("network", {}).get("egressMode", "open"))' "${POLICY_FILE}")"
+
+if [[ "${EGRESS_MODE}" == "allowlist" ]]; then
+  cat >>/etc/profile.d/99-agent-box.sh <<'EOF'
+export HTTP_PROXY="http://127.0.0.1:3128"
+export HTTPS_PROXY="http://127.0.0.1:3128"
+export http_proxy="http://127.0.0.1:3128"
+export https_proxy="http://127.0.0.1:3128"
+export NO_PROXY="localhost,127.0.0.1,::1"
+EOF
+  cat >>/etc/environment <<'EOF'
+HTTP_PROXY="http://127.0.0.1:3128"
+HTTPS_PROXY="http://127.0.0.1:3128"
+http_proxy="http://127.0.0.1:3128"
+https_proxy="http://127.0.0.1:3128"
+NO_PROXY="localhost,127.0.0.1,::1"
+EOF
+fi
 
 if pidof systemd >/dev/null 2>&1; then
   systemctl daemon-reload
+  if [[ "${EGRESS_MODE}" == "allowlist" ]] && [[ -f /etc/systemd/system/egress-proxy.service ]]; then
+    systemctl enable egress-proxy.service >/dev/null 2>&1 || true
+    systemctl restart egress-proxy.service
+    log "egress-proxy.service active (allowlist mode)."
+  else
+    systemctl stop egress-proxy.service 2>/dev/null || true
+    systemctl disable egress-proxy.service >/dev/null 2>&1 || true
+  fi
   if [[ "${DOCKER_ENABLED}" == "1" ]]; then
     systemctl enable docker-policy-proxy.service >/dev/null 2>&1 || true
     systemctl restart docker-policy-proxy.service
