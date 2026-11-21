@@ -380,19 +380,21 @@ if block_host_and_lan:
     # Block WSL2 mirrored-mode outbound connections to Windows 127.0.0.1/::1 ports
     # (Windows -> WSL localhost replies still pass via 'ct state established,related accept',
     # and WSL-internal localhost still passes via 'oifname "lo" accept').
-    lines.append('        oifname "loopback0" drop')
+    log_drops = bool(net_cfg.get("logDrops", True))
+    drop_prefix = 'limit rate 5/minute burst 10 packets log prefix "[wsl-agent-sandbox-drop] " ' if log_drops else ''
+    lines.append(f'        oifname "loopback0" {drop_prefix}drop')
     if host_v4:
         hosts = ", ".join(sorted(host_v4))
-        lines.append(f"        ip daddr {{ {hosts} }} drop")
+        lines.append(f"        ip daddr {{ {hosts} }} {drop_prefix}drop")
     if host_v6:
         hosts = ", ".join(sorted(host_v6))
-        lines.append(f"        ip6 daddr {{ {hosts} }} drop")
+        lines.append(f"        ip6 daddr {{ {hosts} }} {drop_prefix}drop")
     if blocked_v4:
         cidrs = ", ".join(sorted(set(blocked_v4)))
-        lines.append(f"        ip daddr {{ {cidrs} }} drop")
+        lines.append(f"        ip daddr {{ {cidrs} }} {drop_prefix}drop")
     if blocked_v6:
         cidrs = ", ".join(sorted(set(blocked_v6)))
-        lines.append(f"        ip6 daddr {{ {cidrs} }} drop")
+        lines.append(f"        ip6 daddr {{ {cidrs} }} {drop_prefix}drop")
 
 lines.extend([
     "    }",

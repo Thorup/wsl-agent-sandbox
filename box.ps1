@@ -18,7 +18,7 @@
 #Requires -Version 5.1
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('init', 'up', 'apply', 'upgrade', 'doctor', 'compact', 'seed-secrets', 'clear-secrets', 'register-terminal', 'shell', 'root-shell', 'status', 'verify', 'snapshot', 'restore', 'reset', 'destroy', 'help')]
+    [ValidateSet('init', 'up', 'apply', 'upgrade', 'doctor', 'compact', 'logs', 'audit', 'seed-secrets', 'clear-secrets', 'register-terminal', 'shell', 'root-shell', 'status', 'verify', 'snapshot', 'restore', 'reset', 'destroy', 'help')]
     [string]$Command = 'help',
 
     [Parameter(Position = 1)]
@@ -46,7 +46,14 @@ param(
 
     [switch]$Unregister,
 
-    [string[]]$Scope = @('all')
+    [string[]]$Scope = @('all'),
+
+    [ValidateSet('all', 'docker', 'network', 'hardening')]
+    [string]$Source = 'all',
+
+    [string]$Since = '1 hour ago',
+
+    [int]$Lines = 100
 )
 
 Set-StrictMode -Version Latest
@@ -81,6 +88,8 @@ Commands:
   doctor             Run Windows + WSL preflight diagnostics (WSL2, .wslconfig, Docker Desktop,
                      systemd health, VHDX disk size, image cache).
   compact            Trim free blocks inside WSL (fstrim) and compact the distro's ext4.vhdx.
+  logs / audit       View root-owned security events (nftables drops, docker-policy-proxy denials,
+                     box-hardening reloads) with optional -Source, -Since, -Lines.
   seed-secrets [path] Seed or rotate CLI tokens, service accounts, and Git/SSH credentials from a
                      central Windows manifest (default: %USERPROFILE%\.wsl-agent-sandbox\secrets.json)
                      independently of init/apply. Supports -SecretsPath, -Service <names>, -Prune, -DryRun.
@@ -771,6 +780,28 @@ function Invoke-Compact {
     Write-Host ("[compact] Done: {0:N2} GB -> {1:N2} GB (reclaimed {2:N1} MB)." -f ($beforeBytes / 1GB), ($afterBytes / 1GB), $savedMB)
 }
 
+function Invoke-AuditLogs {
+    param(
+        $Config,
+        [string]$Source = 'all',
+        [string]$Since = '1 hour ago',
+        [int]$Lines = 100
+    )
+    $distro = $Config.distroName
+    if (-not (Test-WslDistroExists -DistroName $distro)) {
+        throw "Distro '$distro' does not exist."
+    }
+    $safeSince = $Since -replace "'", ""
+    $cmd = switch ($Source) {
+        'docker'    { "journalctl -u docker-policy-proxy.service --since '$safeSince' -n $Lines --no-pager || true" }
+        'hardening' { "journalctl -u box-hardening.service --since '$safeSince' -n $Lines --no-pager || true" }
+        'network'   { "journalctl -k --grep='wsl-agent-sandbox-drop' --since '$safeSince' -n $Lines --no-pager || true" }
+        default     { "journalctl -u docker-policy-proxy.service -u box-hardening.service --since '$safeSince' -n $Lines --no-pager || true; echo '--- Kernel nftables drops ---'; journalctl -k --grep='wsl-agent-sandbox-drop' --since '$safeSince' -n $Lines --no-pager || true" }
+    }
+    Write-Host "=== Security Audit Logs: $distro (source=$Source, since='$safeSince') ==="
+    Invoke-WslRootBash -DistroName $distro -Script $cmd
+}
+
 function Invoke-Destroy {
     param(
         $Config,
@@ -832,6 +863,12 @@ switch ($Command) {
     }
     'compact' {
         Invoke-Compact -Config $cfg
+    }
+    'logs' {
+        Invoke-AuditLogs -Config $cfg -Source $Source -Since $Since -Lines $Lines
+    }
+    'audit' {
+        Invoke-AuditLogs -Config $cfg -Source $Source -Since $Since -Lines $Lines
     }
     'seed-secrets' {
         Invoke-SeedSecrets -Config $cfg -SecretsPath $SecretsPath -Service $Service -Prune:$Prune -DryRun:$DryRun
