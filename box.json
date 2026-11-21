@@ -81,6 +81,10 @@
     "installKubectl": true,
     "installAwsCli": true,
     "installGcloudCli": true,
+    "installAzureCli": true,
+    "installAzureDevopsCli": true,
+    "installGithubCli": true,
+    "installJiraCli": true,
     "installUpctl": true,
     "installDotnetSdk": true,
     "installRust": true

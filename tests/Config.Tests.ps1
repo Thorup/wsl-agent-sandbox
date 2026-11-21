@@ -47,6 +47,12 @@ $baseCfg = Read-BoxConfig -ConfigPath (Join-Path $RepoRoot 'box.json')
 Assert-True "Default box.json parses and validates cleanly" ($baseCfg.distroName -eq 'ubuntu-2604-agent')
 Assert-True "Default sharedFolders is empty (deny-all)" (@($baseCfg.sharedFolders).Count -eq 0)
 Assert-True "Default agentUser UID is in high isolated range (26040)" ($baseCfg.agentUser.uid -eq 26040)
+Assert-True "Default box.json enables GitHub, Azure, Azure DevOps, and Jira CLIs" (
+    [bool]$baseCfg.packages.installGithubCli -and
+    [bool]$baseCfg.packages.installAzureCli -and
+    [bool]$baseCfg.packages.installAzureDevopsCli -and
+    [bool]$baseCfg.packages.installJiraCli
+)
 
 # Reject root user
 Assert-Throws "Rejects agentUser.name = root" {

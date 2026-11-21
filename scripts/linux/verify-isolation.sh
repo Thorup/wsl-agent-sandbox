@@ -226,13 +226,20 @@ fi
 echo ""
 echo "[6/6] Pre-installed Developer & Gemini Agent Toolchain"
 
-for tool in git python3 uv node pnpm gemini claude docker kubectl aws gcloud upctl dotnet rustc cargo rustup; do
+for tool in git python3 uv node pnpm gemini claude docker kubectl aws gcloud az gh jira upctl dotnet rustc cargo rustup; do
   if command -v "${tool}" >/dev/null 2>&1; then
     pass "Tool available: ${tool} ($(command -v "${tool}"))"
   else
     fail "Expected tool missing: ${tool}"
   fi
 done
+
+if az extension show --name azure-devops >/dev/null 2>&1; then
+  AZ_DEVOPS_VER="$(az extension show --name azure-devops --query version -o tsv 2>/dev/null || echo ok)"
+  pass "Azure DevOps CLI extension available (azure-devops ${AZ_DEVOPS_VER})"
+else
+  fail "Azure DevOps CLI extension missing (azure-devops)"
+fi
 
 if docker compose version >/dev/null 2>&1; then
   pass "Docker Compose plugin available ($(docker compose version --short 2>/dev/null || echo ok))"
