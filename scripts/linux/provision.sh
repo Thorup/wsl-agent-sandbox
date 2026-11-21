@@ -112,6 +112,10 @@ unset DISPLAY WAYLAND_DISPLAY PULSE_SERVER WSL_INTEROP
 export DOCKER_HOST="unix:///run/docker-policy/docker.sock"
 export DOTNET_ROOT="/usr/local/share/dotnet"
 export PATH="$HOME/.cargo/bin:$HOME/.dotnet/tools:$HOME/.local/bin:$HOME/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+# Load seeded CLI service credentials (managed by box.ps1 seed-secrets)
+if [ -r "$HOME/.config/wsl-agent-sandbox/secrets.env" ]; then
+  . "$HOME/.config/wsl-agent-sandbox/secrets.env"
+fi
 EOF
 chmod 0644 /etc/profile.d/99-agent-box.sh
 

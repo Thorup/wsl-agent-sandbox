@@ -130,6 +130,19 @@ Assert-Throws "Rejects shell metacharacters in apt package names" {
     Assert-BoxConfigValid -Config $c
 } 'Invalid apt package'
 
+# Accept optional non-secret secrets.manifestPath pointer
+$withSecretsPtr = Clone-Config $baseCfg
+$withSecretsPtr | Add-Member -NotePropertyName 'secrets' -NotePropertyValue ([pscustomobject]@{ manifestPath = '%USERPROFILE%\.wsl-agent-sandbox\secrets.json' })
+Assert-BoxConfigValid -Config $withSecretsPtr
+Assert-True "Accepts optional non-secret secrets.manifestPath pointer" $true
+
+# Reject storing actual secret values inside box.json
+Assert-Throws "Rejects storing raw credential keys inside box.json secrets section" {
+    $c = Clone-Config $baseCfg
+    $c | Add-Member -NotePropertyName 'secrets' -NotePropertyValue ([pscustomobject]@{ github = @{ token = 'ghp_nope' } })
+    Assert-BoxConfigValid -Config $c
+} 'only allows non-secret pointer property'
+
 Write-Host ""
 Write-Host "=== Config.Tests.ps1 Summary: PASS=$script:Passed FAIL=$script:Failed ==="
 if ($script:Failed -gt 0) {

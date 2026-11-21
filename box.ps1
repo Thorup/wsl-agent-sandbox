@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Manage the hardened Ubuntu 26.04 LTS WSL2 Agent Sandbox (wsl-agent-sandbox).
 
@@ -9,19 +9,30 @@
 .EXAMPLE
     .\box.ps1 init
     .\box.ps1 apply
+    .\box.ps1 seed-secrets
+    .\box.ps1 seed-secrets -Service github,jira
+    .\box.ps1 clear-secrets
     .\box.ps1 verify
     .\box.ps1 shell
 #>
 #Requires -Version 5.1
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('init', 'up', 'apply', 'shell', 'root-shell', 'status', 'verify', 'snapshot', 'reset', 'destroy', 'help')]
+    [ValidateSet('init', 'up', 'apply', 'seed-secrets', 'clear-secrets', 'shell', 'root-shell', 'status', 'verify', 'snapshot', 'reset', 'destroy', 'help')]
     [string]$Command = 'help',
 
     [Parameter(Position = 1)]
     [string]$Argument = '',
 
     [string]$ConfigPath = '',
+
+    [string]$SecretsPath = '',
+
+    [string[]]$Service = @(),
+
+    [switch]$Prune,
+
+    [switch]$DryRun,
 
     [switch]$Force,
 
@@ -38,6 +49,7 @@ if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
 . (Join-Path $RepoRoot 'scripts\lib\Config.ps1')
 . (Join-Path $RepoRoot 'scripts\lib\Image.ps1')
 . (Join-Path $RepoRoot 'scripts\lib\Wsl.ps1')
+. (Join-Path $RepoRoot 'scripts\lib\Secrets.ps1')
 
 function Show-Usage {
     @"
@@ -53,9 +65,13 @@ Commands:
   apply              Push updated box.json (shared folders, allowed host ports, Docker policy,
                      apt packages, CLI/language toolchains) and reload hardening + proxy live
                      without rebuilding (use -RebuildProxy to rebuild docker-policy-proxy).
+  seed-secrets [path] Seed or rotate CLI machine account tokens & service account secrets from a
+                     central Windows manifest (default: %USERPROFILE%\.wsl-agent-sandbox\secrets.json)
+                     independently of init/apply. Supports -SecretsPath, -Service <names>, -Prune, -DryRun.
+  clear-secrets      Remove managed seeded CLI credentials inside WSL (optionally scoped via -Service).
   shell              Open an interactive shell inside the box as the non-root agent user.
   root-shell         Open an administrative root shell (Windows host control plane only).
-  status             Show distro state, systemd service health, active /shared mounts, and warnings.
+  status             Show distro state, systemd service health, active /shared mounts, seeded secrets, and warnings.
   verify             Run full red-team isolation audit + Windows<->WSL localhost web test +
                      blocked Windows host port test + Docker escape tests.
   snapshot [path]    Export the distro to a .tar backup (defaults to .cache\<distro>-<timestamp>.tar).
@@ -83,6 +99,7 @@ function Sync-AssetsToWsl {
     Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot 'scripts\linux\install-tools.sh') -RemotePath '/usr/local/sbin/box-install-tools.sh' -Mode '0755' -NormalizeLF
     Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot 'scripts\linux\provision.sh') -RemotePath '/usr/local/sbin/box-provision.sh' -Mode '0755' -NormalizeLF
     Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot 'scripts\linux\apply-policy.sh') -RemotePath '/usr/local/sbin/box-apply-policy.sh' -Mode '0755' -NormalizeLF
+    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot 'scripts\linux\box-seed-secrets.sh') -RemotePath '/usr/local/sbin/box-seed-secrets.sh' -Mode '0755' -NormalizeLF
     Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot 'scripts\linux\verify-isolation.sh') -RemotePath '/usr/local/bin/box-verify-isolation.sh' -Mode '0755' -NormalizeLF
     Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot 'systemd\box-hardening.service') -RemotePath '/etc/systemd/system/box-hardening.service' -Mode '0644' -NormalizeLF
     Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot 'systemd\docker-policy-proxy.service') -RemotePath '/etc/systemd/system/docker-policy-proxy.service' -Mode '0644' -NormalizeLF
@@ -184,6 +201,72 @@ mv -f /usr/local/libexec/docker-policy-proxy.new /usr/local/libexec/docker-polic
     }
 }
 
+function Invoke-SeedSecrets {
+    param($Config)
+    $distro = $Config.distroName
+    if (-not (Test-WslDistroExists -DistroName $distro)) {
+        throw "Distro '$distro' does not exist. Run '.\box.ps1 init' first."
+    }
+
+    $explicitPath = if (-not [string]::IsNullOrWhiteSpace($SecretsPath)) { $SecretsPath } else { $Argument }
+    $manifestPath = Resolve-SecretsManifestPath -ExplicitPath $explicitPath -Config $Config -RepoRoot $RepoRoot
+
+    $built = Build-SeedSecretsPayload -ManifestPath $manifestPath -AgentName $Config.agentUser.name -Services $Service -Prune:$Prune
+
+    $summaryLines = @($built.Summary)
+    $disabledLines = @($built.SkippedDisabled)
+
+    Write-Host "[seed-secrets] Manifest: $($built.ManifestPath)"
+    if ($summaryLines.Count -gt 0) {
+        Write-Host "[seed-secrets] Services to seed:"
+        foreach ($line in $summaryLines) {
+            Write-Host "  - $line"
+        }
+    } else {
+        Write-Host "[seed-secrets] No enabled services matched."
+    }
+    if ($disabledLines.Count -gt 0) {
+        Write-Host "[seed-secrets] Skipped disabled: $($disabledLines -join ', ')"
+    }
+
+    if ($DryRun) {
+        Write-Host "[seed-secrets] Dry run complete — no credentials were pushed to '$distro'."
+        return
+    }
+
+    if ($summaryLines.Count -eq 0 -and -not $Prune) {
+        Write-Host "[seed-secrets] Nothing to apply (pass -Prune to remove disabled/removed services)."
+        return
+    }
+
+    # Always sync the seeder script directly so seed-secrets works independently of init/apply
+    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot 'scripts\linux\box-seed-secrets.sh') -RemotePath '/usr/local/sbin/box-seed-secrets.sh' -Mode '0755' -NormalizeLF
+
+    $payloadJson = $built.Payload | ConvertTo-Json -Depth 10 -Compress
+    Write-Host "[seed-secrets] Pushing resolved credentials to '$distro' via root control plane (stdin only)..."
+    Invoke-WslRootStdinCommand -DistroName $distro -RemoteCommand '/usr/local/sbin/box-seed-secrets.sh --apply' -StdinText $payloadJson
+}
+
+function Invoke-ClearSecrets {
+    param($Config)
+    $distro = $Config.distroName
+    if (-not (Test-WslDistroExists -DistroName $distro)) {
+        throw "Distro '$distro' does not exist. Run '.\box.ps1 init' first."
+    }
+
+    $filterServices = @(Resolve-RequestedServiceFilter -Services $Service)
+    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot 'scripts\linux\box-seed-secrets.sh') -RemotePath '/usr/local/sbin/box-seed-secrets.sh' -Mode '0755' -NormalizeLF
+
+    if ($filterServices.Count -gt 0) {
+        $svcArg = $filterServices -join ','
+        Write-Host "[clear-secrets] Clearing managed credentials in '$distro' for: $svcArg..."
+        Invoke-WslRootStdinCommand -DistroName $distro -RemoteCommand "/usr/local/sbin/box-seed-secrets.sh --clear --services $svcArg"
+    } else {
+        Write-Host "[clear-secrets] Clearing all managed seeded credentials in '$distro'..."
+        Invoke-WslRootStdinCommand -DistroName $distro -RemoteCommand '/usr/local/sbin/box-seed-secrets.sh --clear'
+    }
+}
+
 function Invoke-Status {
     param($Config)
     $distro = $Config.distroName
@@ -204,6 +287,13 @@ if [ -n "$SHARES" ]; then
   echo "$SHARES"
 else
   echo "  (none - deny-all)"
+fi
+echo ""
+echo "Seeded CLI secrets:"
+if [ -x /usr/local/sbin/box-seed-secrets.sh ]; then
+  /usr/local/sbin/box-seed-secrets.sh --status 2>/dev/null || echo "  (unavailable)"
+else
+  echo "  (not initialized)"
 fi
 echo ""
 echo "Active nftables table inet wsl_agent_sandbox:"
@@ -388,6 +478,12 @@ switch ($Command) {
     }
     'apply' {
         Invoke-Apply -Config $cfg
+    }
+    'seed-secrets' {
+        Invoke-SeedSecrets -Config $cfg
+    }
+    'clear-secrets' {
+        Invoke-ClearSecrets -Config $cfg
     }
     'shell' {
         if ($cfg.docker.enabled) {

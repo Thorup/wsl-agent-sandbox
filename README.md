@@ -112,6 +112,71 @@ Because every containment boundary (non-root UID `26040`, no `sudo`, no `/mnt/c`
 
 ---
 
+## Seeding & Rotating CLI Service Secrets (from Windows)
+
+You can seed and rotate machine account tokens and service account credentials for your CLI tools directly from a **central Windows location** — completely outside `.\box.ps1 init` and `.\box.ps1 apply`, without navigating inside Linux or storing any secrets in `box.json` / git.
+
+### 1. Create Your Central Windows Secrets Manifest
+
+Create a folder outside the repository (default: `%USERPROFILE%\.wsl-agent-sandbox\`) and copy [examples/secrets.example.json](examples/secrets.example.json) into `%USERPROFILE%\.wsl-agent-sandbox\secrets.json` (plus any service account JSON keys, PEM certificates, kubeconfigs, or raw token files in subdirectories like `keys/` or `tokens/`):
+
+```powershell
+New-Item -ItemType Directory -Path "$env:USERPROFILE\.wsl-agent-sandbox" -Force | Out-Null
+Copy-Item .\examples\secrets.example.json "$env:USERPROFILE\.wsl-agent-sandbox\secrets.json"
+```
+
+Every secret field supports **three sources**:
+- **Inline value** (e.g., `"token": "..."`)
+- **Relative or absolute Windows file** (e.g., `"tokenFile": "tokens/github.txt"`, `"serviceAccountKeyFile": "keys/gcp-sa.json"` — relative paths resolve against the directory containing `secrets.json`, and `%ENVVAR%` expansion is supported)
+- **Windows environment variable** (e.g., `"tokenEnv": "SANDBOX_GH_TOKEN"`)
+
+Manifest path resolution priority:
+1. CLI argument: `.\box.ps1 seed-secrets "D:\vault\secrets.json"` or `-SecretsPath "D:\vault\secrets.json"`
+2. Windows environment variable: `$env:WSL_AGENT_SANDBOX_SECRETS_PATH`
+3. Optional non-secret pointer in `box.json`: `"secrets": { "manifestPath": "%USERPROFILE%\\.wsl-agent-sandbox\\secrets.json" }`
+4. Default: `%USERPROFILE%\.wsl-agent-sandbox\secrets.json`
+
+### 2. Seed, Rotate, or Revoke Secrets Independently of `init` / `apply`
+
+```powershell
+# Preview and validate without pushing any secrets:
+.\box.ps1 seed-secrets -DryRun
+
+# Seed all enabled services from %USERPROFILE%\.wsl-agent-sandbox\secrets.json:
+.\box.ps1 seed-secrets
+
+# Rotate only specific service(s) after updating tokens in your central Windows folder:
+.\box.ps1 seed-secrets -Service github,jira
+
+# Seed and prune credentials for any service you disabled or removed from secrets.json:
+.\box.ps1 seed-secrets -Prune
+
+# Revoke managed credentials inside WSL (all, or specific service(s)):
+.\box.ps1 clear-secrets
+.\box.ps1 clear-secrets -Service aws,gcloud
+```
+
+### Supported CLI Services (`secrets.schema.json`)
+
+| Service Key | CLI / Tool | Auth Mechanism & Linux Target |
+| :--- | :--- | :--- |
+| `github` | `gh` + `git` | Machine account / fine-grained PAT → `~/.config/gh/hosts.yml`, `gh auth setup-git`, optional `GH_TOKEN` / `GH_ENTERPRISE_TOKEN` (and optional `loginOnline: true`). |
+| `aws` | `aws` | IAM access keys / STS tokens (single or multi-profile) → `~/.aws/credentials`, `~/.aws/config`, optional `AWS_PROFILE`. |
+| `gcloud` | `gcloud` + GCP SDKs | Service Account JSON key → `~/.config/wsl-agent-sandbox/keys/gcloud-service-account.json`, `gcloud auth activate-service-account`, project/region/zone config, `GOOGLE_APPLICATION_CREDENTIALS`. |
+| `azure` | `az` + Azure SDKs | Entra ID Service Principal (client secret or PEM cert) → `az login --service-principal`, optional subscription, `AZURE_CLIENT_ID`/`AZURE_TENANT_ID`/`AZURE_CLIENT_SECRET` (or `AZURE_CLIENT_CERTIFICATE_PATH`). |
+| `azureDevops` | `az devops` | Personal Access Token → `AZURE_DEVOPS_EXT_PAT` + `az devops configure --defaults organization=... project=...`. |
+| `jira` | `jira` (`jira-cli`) | API token → `~/.config/.jira/.config.yml` + `JIRA_API_TOKEN`. |
+| `upcloud` | `upctl` | API token (or subaccount username/password) → `~/.config/upctl.yaml` + optional `UPCLOUD_TOKEN`. |
+| `kubectl` | `kubectl` | Dedicated kubeconfig file OR Service Account bearer token → `~/.kube/config` + optional context switch. |
+| `gemini` | `gemini` | `GEMINI_API_KEY` and/or Vertex AI variables (`GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION`, `GOOGLE_GENAI_USE_VERTEXAI`). |
+| `claude` | `claude` | `ANTHROPIC_API_KEY` and/or `CLAUDE_CODE_OAUTH_TOKEN`. |
+| `env` | Any CLI | Additional custom token environment variables exported into `~/.config/wsl-agent-sandbox/secrets.env` (protected system vars like `PATH`/`DOCKER_HOST`/`LD_PRELOAD` are rejected). |
+| `files` | Any CLI | Additional secret files (e.g., `~/.npmrc`, `~/.netrc`) copied atomically with `0600` strictly inside `/home/<agent>/`. |
+
+> **Security Guarantees**: Your central Windows secrets folder is **never** mounted into WSL (`/shared` or `/mnt/c`) and **never** written to `box.json` or `/etc/wsl-agent-sandbox/policy.json`. Windows resolves file/env references locally, pipes the payload strictly over `stdin` to the root control plane (`wsl -u root`), writes all files atomically with `0600` permissions owned by `agent:agent`, redacts secret strings from any error output, and automatically loads `~/.config/wsl-agent-sandbox/secrets.env` in agent shells.
+
+---
+
 ## Connecting Antigravity / VS Code Remote-WSL
 
 1. Launch Antigravity / VS Code **from Windows**.
@@ -133,8 +198,10 @@ Because every containment boundary (non-root UID `26040`, no `sudo`, no `/mnt/c`
 - `.\box.ps1 init` — Full download (with SHA256 verification), import, provision, harden, verify.
 - `.\box.ps1 up` — Ensure the distro is running and systemd hardening services are active (runs `init` if not installed).
 - `.\box.ps1 apply` — Hot-reload `box.json` changes (mounts, ports, Docker policy, `apt` packages, CLI/language toolchains); pass `-RebuildProxy` to rebuild `docker-policy-proxy`.
+- `.\box.ps1 seed-secrets [path]` — Seed or rotate CLI service tokens and service account credentials from a central Windows manifest (independently of `init`/`apply`); supports `-SecretsPath`, `-Service <names>`, `-Prune`, and `-DryRun`.
+- `.\box.ps1 clear-secrets` — Revoke managed seeded CLI credentials inside WSL (optionally scoped via `-Service <names>`).
 - `.\box.ps1 verify` — Run full red-team isolation audit + Windows ↔ WSL `localhost` web test.
-- `.\box.ps1 status` — Inspect systemd services, active `/shared` mounts, and `nftables` rules.
+- `.\box.ps1 status` — Inspect systemd services, active `/shared` mounts, seeded CLI secrets, and `nftables` rules.
 - `.\box.ps1 shell` / `.\box.ps1 root-shell` — Open agent shell or Windows-side admin root shell.
 - `.\box.ps1 snapshot [path]` — Export a `.tar` backup of the distro.
 - `.\box.ps1 reset` / `.\box.ps1 destroy` — Rebuild cleanly or remove the distro completely.

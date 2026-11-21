@@ -6,3 +6,6 @@
 *.log
 docker-policy-proxy/docker-policy-proxy
 docker-policy-proxy/docker-policy-proxy.exe
+secrets.json
+*.secrets.json
+.secrets/

@@ -197,6 +197,17 @@
         "installDotnetSdk": { "type": "boolean" },
         "installRust": { "type": "boolean" }
       }
+    },
+    "secrets": {
+      "type": "object",
+      "description": "Optional non-secret Windows path pointer for central CLI credential seeding via '.\\box.ps1 seed-secrets'. Never store secret values in box.json.",
+      "additionalProperties": false,
+      "properties": {
+        "manifestPath": {
+          "type": "string",
+          "description": "Path to the central Windows secrets manifest JSON file (supports %ENVVAR% expansion). Defaults to %USERPROFILE%\\.wsl-agent-sandbox\\secrets.json."
+        }
+      }
     }
   }
 }
