@@ -58,16 +58,39 @@ Edit `box.json` on Windows (invisible to the agent inside WSL), then run `.\box.
 ```
 After `.\box.ps1 apply`, the folder appears at `/shared/reference-docs` (mounted read-only, and if `allowDockerBind` is `true`, the Docker proxy forces `:ro` even if a container requests `:rw`).
 
-### Allow a Specific Windows Host Port (e.g., Local Ollama)
+### Allow a Specific Windows Host Port or Port-Forward (e.g., `kubectl port-forward`, SSH Tunnels, Local Ollama)
+
+By default (`network.blockHostAndLan: true`, `allowedHostPorts: []`), direct processes running as `agent` inside WSL **cannot** reach ports bound on your Windows host (including `kubectl port-forward` or SSH tunnels on Windows `127.0.0.1` or LAN IPs) in either `networkingMode=nat` or `networkingMode=mirrored`.
+
+#### Port-Forward Hardening Matrix
+
+Use this table to determine what can reach a port forwarded to your Windows client:
+
+| Configuration in `box.json` | Direct WSL Processes (`agent`) | Containers via Docker Desktop (`host.docker.internal`) | Effective Hardening Level |
+| :--- | :--- | :--- | :--- |
+| `blockHostAndLan: true`, `allowedHostPorts: []`, `docker.enabled: false` | **Blocked** (NAT & Mirrored) | **Disabled** (no Docker access) | **Strictest** — WSL box cannot reach any Windows host or port-forwarded service. |
+| `blockHostAndLan: true`, `allowedHostPorts: []`, `docker.enabled: true` *(default)* | **Blocked** (NAT & Mirrored) | **Reachable via `host.docker.internal:<port>`** (unless blocked by Windows Firewall) | **Standard** — Direct WSL egress is blocked, but Docker Desktop bridge containers can still reach Windows host ports. |
+| `blockHostAndLan: true`, `allowedHostPorts: [<port>]` | **Allowed on `<port>` only** | **Reachable** (if `docker.enabled: true`) | **Targeted Bridge** — Explicitly shares only the listed port(s) with WSL. |
+| `blockHostAndLan: false` | **Allowed** (all host & LAN ports) | **Reachable** (if `docker.enabled: true`) | **Open Host/LAN** — No host/LAN network isolation. |
+
+> **Security Tip:** If you run sensitive port-forwards on Windows (e.g., `kubectl port-forward` to a production cluster) while an untrusted agent runs in this box, set `"docker": { "enabled": false }` in `box.json` and run `.\box.ps1 apply` (or block Docker Desktop bridge traffic via Windows Firewall).
+
+#### How to Share a Windows Port-Forward with the WSL Box
+
+1. Add the port to `network.allowedHostPorts` in `box.json`:
 ```json
 "network": {
   "blockHostAndLan": true,
   "allowedHostPorts": [
+    { "port": 8080, "protocol": "tcp", "comment": "k8s port-forward on Windows" },
     { "port": 11434, "protocol": "tcp", "comment": "Local Ollama on Windows" }
   ]
 }
 ```
-Run `.\box.ps1 apply` to update `nftables` immediately.
+2. Run `.\box.ps1 apply` to live-reload `nftables` (and mirrored loopback policy routing) immediately.
+3. Connect based on your WSL2 `networkingMode` (in `%USERPROFILE%\.wslconfig`):
+   - **Mirrored mode (`networkingMode=mirrored`):** Standard `kubectl port-forward ... 8080:<target>` (bound to `127.0.0.1` on Windows) is reachable directly at `localhost:8080` from inside WSL.
+   - **NAT mode (default WSL2):** Windows `127.0.0.1` is not routed into WSL NAT, so bind the forward to your Windows host/WSL interface (e.g., `kubectl port-forward --address 0.0.0.0 ... 8080:<target>` or the `vEthernet (WSL)` IP), allow the port through Windows Firewall if prompted, and connect from WSL to the Windows host gateway IP (`ip route show default | awk '{print $3}'`).
 
 ### Add System `apt` Packages & Cloud/Agent/Language Toolchains
 Add package names to `packages.apt` or toggle built-in installers (`installKubectl`, `installAwsCli`, `installGcloudCli`, `installUpctl`, `installDotnetSdk`, `installRust`, `installGeminiCli`, `installClaudeCode`) in `box.json` and run `.\box.ps1 apply`. (User-space tools via `uv`, `pip`, `npm`, `pnpm`, `cargo`, `rustup`, and `dotnet tool install -g` can be installed freely by the agent inside `/home/agent` without `sudo`.)

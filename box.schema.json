@@ -100,13 +100,16 @@
     },
     "network": {
       "type": "object",
+      "description": "Per-UID nftables and mirrored-loopback isolation policy for the agent user.",
       "required": ["blockHostAndLan", "allowedHostPorts", "blockedCidrs"],
       "properties": {
         "blockHostAndLan": {
-          "type": "boolean"
+          "type": "boolean",
+          "description": "When true, blocks direct agent egress to Windows host ports (including mirrored localhost/loopback0 port-forwards) and blockedCidrs."
         },
         "allowedHostPorts": {
           "type": "array",
+          "description": "Explicit Windows host ports (e.g., kubectl port-forward, SSH tunnels, local Ollama) reachable by the agent user. Works directly on localhost in mirrored mode; in NAT mode bind the Windows listener to the vEthernet (WSL) IP or 0.0.0.0.",
           "items": {
             "type": "object",
             "required": ["port", "protocol"],
@@ -128,6 +131,7 @@
         },
         "blockedCidrs": {
           "type": "array",
+          "description": "IPv4/IPv6 CIDR ranges dropped for outbound agent traffic when blockHostAndLan is true.",
           "items": {
             "type": "string"
           }
@@ -139,7 +143,8 @@
       "required": ["enabled", "allowBindPrefixes", "allowBuildKit", "allowCapAdd"],
       "properties": {
         "enabled": {
-          "type": "boolean"
+          "type": "boolean",
+          "description": "Enable mediated Docker Desktop access via docker-policy-proxy. Note: Docker Desktop bridge containers can still reach Windows host/port-forwarded services via host.docker.internal unless disabled here or blocked by Windows Firewall."
         },
         "allowBindPrefixes": {
           "type": "array",
