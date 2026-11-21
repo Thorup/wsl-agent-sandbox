@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/banner.jpg" alt="wsl-agent-sandbox — Hardened Ubuntu 26.04 LTS WSL2 Sandbox for Autonomous AI Agents" width="760">
+</p>
+
 # `wsl-agent-sandbox` — Hardened Ubuntu 26.04 LTS WSL2 Sandbox for Autonomous AI Agents
 
 A declaratively configured, isolated **Ubuntu 26.04 LTS (Resolute Raccoon)** WSL2 distribution (`ubuntu-2604-agent`) where autonomous AI coding agents (**Gemini CLI**, **Claude Code**, **Codex**, **Antigravity / VS Code Remote-WSL**, or custom agents) can run freely inside Linux while being **strictly contained from accessing your underlying Windows host**, with explicit Windows-side control over every bridge.
