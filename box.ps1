@@ -18,7 +18,7 @@
 #Requires -Version 5.1
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('init', 'up', 'apply', 'seed-secrets', 'clear-secrets', 'register-terminal', 'shell', 'root-shell', 'status', 'verify', 'snapshot', 'restore', 'reset', 'destroy', 'help')]
+    [ValidateSet('init', 'up', 'apply', 'upgrade', 'doctor', 'seed-secrets', 'clear-secrets', 'register-terminal', 'shell', 'root-shell', 'status', 'verify', 'snapshot', 'restore', 'reset', 'destroy', 'help')]
     [string]$Command = 'help',
 
     [Parameter(Position = 1)]
@@ -44,7 +44,9 @@ param(
 
     [switch]$Full,
 
-    [switch]$Unregister
+    [switch]$Unregister,
+
+    [string[]]$Scope = @('all')
 )
 
 Set-StrictMode -Version Latest
@@ -74,6 +76,10 @@ Commands:
   apply              Push updated box.json (shared folders, allowed host ports, Docker policy,
                      apt packages, CLI/language toolchains) and reload hardening + proxy live
                      without rebuilding (use -RebuildProxy to rebuild docker-policy-proxy).
+  upgrade            Update installed apt packages, AI agents, and toolchains in place
+                     (optional -Scope apt,agents,toolchains).
+  doctor             Run Windows + WSL preflight diagnostics (WSL2, .wslconfig, Docker Desktop,
+                     systemd health, VHDX disk size, image cache).
   seed-secrets [path] Seed or rotate CLI tokens, service accounts, and Git/SSH credentials from a
                      central Windows manifest (default: %USERPROFILE%\.wsl-agent-sandbox\secrets.json)
                      independently of init/apply. Supports -SecretsPath, -Service <names>, -Prune, -DryRun.
@@ -563,6 +569,113 @@ function Invoke-Verify {
     Write-Host "[verify] ALL security containment and capability checks PASSED!"
 }
 
+function Invoke-Upgrade {
+    param(
+        $Config,
+        [string[]]$Scope = @('all')
+    )
+    $distro = $Config.distroName
+    if (-not (Test-WslDistroExists -DistroName $distro)) {
+        throw "Distro '$distro' does not exist. Run '.\box.ps1 init' first."
+    }
+    $validScopes = @('all', 'apt', 'agents', 'toolchains')
+    $normalized = New-Object System.Collections.Generic.List[string]
+    foreach ($s in @($Scope)) {
+        foreach ($part in ($s -split ',')) {
+            $clean = $part.Trim().ToLowerInvariant()
+            if (-not $clean) { continue }
+            if ($clean -notin $validScopes) {
+                throw "Invalid -Scope '$clean'. Valid values: $($validScopes -join ', ')"
+            }
+            $normalized.Add($clean)
+        }
+    }
+    $scopeArg = if ($normalized.Count -gt 0) { $normalized -join ',' } else { 'all' }
+    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot 'scripts\linux\upgrade-tools.sh') -RemotePath '/usr/local/sbin/box-upgrade-tools.sh' -Mode '0755' -NormalizeLF
+    Write-Host "[upgrade] Running in-place upgrade in '$distro' (scope=$scopeArg)..."
+    & wsl.exe -d $distro -u root -- /usr/local/sbin/box-upgrade-tools.sh $scopeArg
+    if ($LASTEXITCODE -ne 0) {
+        throw "upgrade-tools.sh failed with exit code $LASTEXITCODE."
+    }
+}
+
+function Invoke-Doctor {
+    param($Config)
+    Write-Host "=== wsl-agent-sandbox Doctor ==="
+    $hasFail = $false
+
+    # 1. WSL2 availability
+    $null = & wsl.exe --status 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "  [PASS] WSL2 CLI reachable (wsl.exe --status)"
+    } else {
+        Write-Host "  [FAIL] wsl.exe --status failed. Ensure WSL2 is installed and enabled."
+        $hasFail = $true
+    }
+
+    # 2. Global .wslconfig checks
+    $warnings = @(Get-GlobalWslConfigWarnings)
+    if ($warnings.Count -eq 0) {
+        Write-Host "  [PASS] Global .wslconfig has no blocking warnings"
+    } else {
+        foreach ($w in $warnings) {
+            Write-Host "  [WARN] $w"
+        }
+    }
+
+    # 3. Distro & systemd checks
+    $distro = $Config.distroName
+    if (Test-WslDistroExists -DistroName $distro) {
+        Write-Host "  [PASS] Distro '$distro' is registered"
+        $sysState = (& wsl.exe -d $distro -u root -- sh -c "systemctl is-system-running 2>/dev/null || echo inactive" | Out-String).Trim()
+        if ($sysState -eq 'running' -or $sysState -eq 'degraded') {
+            Write-Host "  [PASS] systemd state: $sysState"
+        } else {
+            Write-Host "  [WARN] systemd state: $sysState (try '.\box.ps1 up')"
+        }
+        $hardenState = (& wsl.exe -d $distro -u root -- sh -c "systemctl is-active box-hardening.service 2>/dev/null || echo inactive" | Out-String).Trim()
+        if ($hardenState -eq 'active') {
+            Write-Host "  [PASS] box-hardening.service is active"
+        } else {
+            Write-Host "  [FAIL] box-hardening.service is $hardenState (run '.\box.ps1 apply')"
+            $hasFail = $true
+        }
+    } else {
+        Write-Host "  [WARN] Distro '$distro' is not installed yet (run '.\box.ps1 init')"
+    }
+
+    # 4. Docker Desktop bridge check
+    if ($Config.docker.enabled) {
+        $pipes = @(Get-ChildItem '\\.\pipe\' -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'docker_engine' })
+        if ($pipes.Count -gt 0) {
+            Write-Host "  [PASS] Docker Desktop named pipe (docker_engine) is active"
+        } else {
+            Write-Host "  [WARN] Docker Desktop is not running (docker.enabled=true). Start Docker Desktop on Windows."
+        }
+    } else {
+        Write-Host "  [PASS] Docker integration disabled per policy (docker.enabled=false)"
+    }
+
+    # 5. VHDX disk size & image cache
+    $installDir = Expand-BoxPath -RawPath $Config.installDir -BaseDir $RepoRoot
+    $vhdx = Join-Path $installDir 'ext4.vhdx'
+    if (Test-Path -LiteralPath $vhdx -PathType Leaf) {
+        $sizeGB = [Math]::Round(((Get-Item -LiteralPath $vhdx).Length / 1GB), 2)
+        Write-Host "  [PASS] VHDX footprint: ${sizeGB} GB ($vhdx)"
+    }
+    $cacheDir = Expand-BoxPath -RawPath $Config.image.cacheDir -BaseDir $RepoRoot
+    $cachedImages = @(Get-ChildItem -Path $cacheDir -Filter 'ubuntu-*.wsl' -ErrorAction SilentlyContinue)
+    if ($cachedImages.Count -gt 0) {
+        Write-Host "  [PASS] Cached Ubuntu WSL image(s): $($cachedImages.Name -join ', ')"
+    } else {
+        Write-Host "  [WARN] No cached Ubuntu .wsl image in '$cacheDir' (will download on init)"
+    }
+
+    if ($hasFail) {
+        throw "Doctor found one or more failing checks."
+    }
+}
+
 function Invoke-Destroy {
     param(
         $Config,
@@ -615,6 +728,12 @@ switch ($Command) {
     }
     'apply' {
         Invoke-Apply -Config $cfg -RebuildProxy:$RebuildProxy
+    }
+    'upgrade' {
+        Invoke-Upgrade -Config $cfg -Scope $Scope
+    }
+    'doctor' {
+        Invoke-Doctor -Config $cfg
     }
     'seed-secrets' {
         Invoke-SeedSecrets -Config $cfg -SecretsPath $SecretsPath -Service $Service -Prune:$Prune -DryRun:$DryRun
