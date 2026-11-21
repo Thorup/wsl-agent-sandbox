@@ -46,11 +46,11 @@ Write-Host "=== Running Secrets.ps1 Automated Tests ==="
 # Validate JSON schema & example manifest parse cleanly
 $schemaRaw = Get-Content -LiteralPath (Join-Path $RepoRoot 'secrets.schema.json') -Raw -Encoding UTF8
 $schemaObj = $schemaRaw | ConvertFrom-Json
-Assert-True "secrets.schema.json parses as valid JSON" ($null -ne $schemaObj.properties.github -and $null -ne $schemaObj.properties.gcloud -and $null -ne $schemaObj.properties.ssh)
+Assert-True "secrets.schema.json parses as valid JSON" ($null -ne $schemaObj.properties.github -and $null -ne $schemaObj.properties.git -and $null -ne $schemaObj.properties.gcloud -and $null -ne $schemaObj.properties.ssh)
 
 $exampleRaw = Get-Content -LiteralPath (Join-Path $RepoRoot 'examples\secrets.example.json') -Raw -Encoding UTF8
 $exampleObj = $exampleRaw | ConvertFrom-Json
-Assert-True "examples/secrets.example.json parses as valid JSON" ($null -ne $exampleObj.github -and $null -ne $exampleObj.jira -and $null -ne $exampleObj.ssh)
+Assert-True "examples/secrets.example.json parses as valid JSON" ($null -ne $exampleObj.github -and $null -ne $exampleObj.git -and $null -ne $exampleObj.jira -and $null -ne $exampleObj.ssh)
 
 # Create isolated temp directory for manifest/file fixture tests
 $tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ("wsl-box-secrets-test-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
@@ -98,6 +98,11 @@ try {
     [System.IO.File]::WriteAllText((Join-Path $tmpDir 'keys\ssh_deploy-cert.pub'), "ssh-ed25519-cert-v01@openssh.com AAAAHHNzaC1lZDI1NTE5LWNlcnQtbW9jaw== agent@sandbox`r`n", (New-Object System.Text.UTF8Encoding($false)))
     [System.IO.File]::WriteAllText((Join-Path $tmpDir 'keys\ssh_host_inline'), "-----BEGIN OPENSSH PRIVATE KEY-----`nMOCKINLINEHOSTKEYBODY67890`n-----END OPENSSH PRIVATE KEY-----`n", (New-Object System.Text.UTF8Encoding($false)))
     [System.IO.File]::WriteAllText((Join-Path $tmpDir 'keys\known_hosts'), "# pinned hosts`r`nbastion.example.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBASTIONHOSTKEY`r`n", (New-Object System.Text.UTF8Encoding($false)))
+    [System.IO.File]::WriteAllText((Join-Path $tmpDir 'keys\git_github'), "-----BEGIN OPENSSH PRIVATE KEY-----`r`nMOCKGITGITHUBKEYBODY11111`r`n-----END OPENSSH PRIVATE KEY-----", (New-Object System.Text.UTF8Encoding($false)))
+    [System.IO.File]::WriteAllText((Join-Path $tmpDir 'keys\git_github.pub'), "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMOCKGITPUBKEY bot@sandbox`r`n", (New-Object System.Text.UTF8Encoding($false)))
+    [System.IO.File]::WriteAllText((Join-Path $tmpDir 'keys\git_signing'), "-----BEGIN OPENSSH PRIVATE KEY-----`nMOCKGITSIGNINGKEYBODY22222`n-----END OPENSSH PRIVATE KEY-----`n", (New-Object System.Text.UTF8Encoding($false)))
+    [System.IO.File]::WriteAllText((Join-Path $tmpDir 'keys\git_deploy_repo'), "-----BEGIN OPENSSH PRIVATE KEY-----`nMOCKGITDEPLOYKEYBODY33333`n-----END OPENSSH PRIVATE KEY-----`n", (New-Object System.Text.UTF8Encoding($false)))
+    [System.IO.File]::WriteAllText((Join-Path $tmpDir 'keys\allowed_signers'), "bot@example.com namespaces=`"git`" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMOCKSIGNERKEY`r`n", (New-Object System.Text.UTF8Encoding($false)))
 
     [Environment]::SetEnvironmentVariable('TEST_SANDBOX_GH_TOKEN', 'ghp_from_env_999')
     [Environment]::SetEnvironmentVariable('TEST_SANDBOX_GEMINI_KEY', 'AIza_from_env_888')
@@ -113,6 +118,38 @@ try {
             gitProtocol = 'https'
             setupGit    = $true
             exportEnv   = $true
+        }
+        git = [ordered]@{
+            enabled   = $true
+            userName  = 'Sandbox Bot'
+            userEmail = 'sandbox-bot@example.com'
+            keys      = @(
+                [ordered]@{
+                    name           = 'github-git'
+                    privateKeyFile = 'keys\git_github'
+                    publicKeyFile  = 'keys\git_github.pub'
+                }
+            )
+            hosts     = @(
+                [ordered]@{
+                    name              = 'github.com'
+                    key               = 'github-git'
+                    knownHost         = 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl'
+                    rewriteHttpsToSsh = $true
+                },
+                [ordered]@{
+                    name           = 'github-repo-a'
+                    hostName       = 'github.com'
+                    privateKeyFile = 'keys\git_deploy_repo'
+                }
+            )
+            signing   = [ordered]@{
+                enabled            = $true
+                privateKeyFile     = 'keys\git_signing'
+                signCommits        = $true
+                signTags           = $true
+                allowedSignersFile = 'keys\allowed_signers'
+            }
         }
         aws = [ordered]@{
             enabled        = $true
@@ -235,8 +272,26 @@ try {
 
     $res = Build-SeedSecretsPayload -ManifestPath $fullManifestPath -AgentName 'agent' -Prune
     $svcs = $res.Payload.services
-    Assert-True "Builds full payload with all 13 service types" ($svcs.Count -eq 13)
+    Assert-True "Builds full payload with all 14 service types" ($svcs.Count -eq 14)
     Assert-True "Resolves github token from Windows env var" ($svcs['github'].token -eq 'ghp_from_env_999')
+    Assert-True "Resolves git SSH keys, hosts (default hostName/user + deploy alias), signing, and allowedSigners" (
+        $svcs['git'].userName -eq 'Sandbox Bot' -and
+        $svcs['git'].userEmail -eq 'sandbox-bot@example.com' -and
+        $svcs['git'].keys.Count -eq 3 -and
+        $svcs['git'].hosts.Count -eq 2 -and
+        $svcs['git'].hosts[0].hostName -eq 'github.com' -and
+        $svcs['git'].hosts[0].user -eq 'git' -and
+        $svcs['git'].hosts[0].rewriteHttpsToSsh -eq $true -and
+        $svcs['git'].hosts[0].hasPinnedKnownHost -eq $true -and
+        $svcs['git'].hosts[1].key -eq 'host-github-repo-a' -and
+        $svcs['git'].hosts[1].hasPinnedKnownHost -eq $false -and
+        $svcs['git'].signing.key -eq 'signing' -and
+        $svcs['git'].signing.signCommits -eq $true -and
+        $svcs['git'].signing.signTags -eq $true -and
+        $svcs['git'].signing.allowedSigners.Count -eq 1 -and
+        $svcs['git'].knownHosts.Count -eq 1 -and
+        $svcs['git'].batchMode -eq $true
+    )
     Assert-True "Resolves multi-profile AWS credentials" ($svcs['aws'].profiles.Count -eq 2 -and $svcs['aws'].defaultProfile -eq 'dev')
     Assert-True "Infers gcloud project from service account JSON key" ($svcs['gcloud'].project -eq 'sandbox-gcp-proj' -and $svcs['gcloud'].clientEmail -eq 'bot@sandbox-gcp-proj.iam.gserviceaccount.com')
     Assert-True "Resolves azure PEM certificate with LF normalization" ($svcs['azure'].certificatePem.Contains('MOCKCERT') -and -not $svcs['azure'].certificatePem.Contains("`r"))
@@ -253,11 +308,38 @@ try {
         $svcs['ssh'].hosts[1].key -eq 'host-staging-web'
     )
     Assert-True "Expands ~/ in files targetPath to /home/agent/..." ($svcs['files'][0].targetPath -eq '/home/agent/.npmrc')
-    Assert-True "Summary contains zero secret values" (-not (($res.Summary -join ' ') -match 'ghp_from_env_999|SECRET_DEFAULT|ado_pat_from_file_123|ATATT_MOCK_123|ucat_mock_456|AIza_from_env_888|sk-ant-from-file-456|MOCKSSHDEPLOYKEYBODY12345|MOCKINLINEHOSTKEYBODY67890|MOCKENVSSHKEYBODY54321'))
+    Assert-True "Summary contains zero secret values" (-not (($res.Summary -join ' ') -match 'ghp_from_env_999|SECRET_DEFAULT|ado_pat_from_file_123|ATATT_MOCK_123|ucat_mock_456|AIza_from_env_888|sk-ant-from-file-456|MOCKSSHDEPLOYKEYBODY12345|MOCKINLINEHOSTKEYBODY67890|MOCKENVSSHKEYBODY54321|MOCKGITGITHUBKEYBODY11111|MOCKGITSIGNINGKEYBODY22222|MOCKGITDEPLOYKEYBODY33333'))
 
     # 3. Selective service filtering (including comma-separated & case-insensitive)
-    $filtered = Build-SeedSecretsPayload -ManifestPath $fullManifestPath -AgentName 'agent' -Services @('GitHub,jira,SSH')
-    Assert-True "Selective -Services filters to only github, jira, and ssh" ($filtered.Payload.services.Count -eq 3 -and $filtered.Payload.services.Contains('github') -and $filtered.Payload.services.Contains('jira') -and $filtered.Payload.services.Contains('ssh'))
+    $filtered = Build-SeedSecretsPayload -ManifestPath $fullManifestPath -AgentName 'agent' -Services @('GitHub,GIT,jira,SSH')
+    Assert-True "Selective -Services filters to only github, git, jira, and ssh" ($filtered.Payload.services.Count -eq 4 -and $filtered.Payload.services.Contains('github') -and $filtered.Payload.services.Contains('git') -and $filtered.Payload.services.Contains('jira') -and $filtered.Payload.services.Contains('ssh'))
+
+    # 3b. Shorthand single-host git mode
+    $gitShortManifest = Join-Path $tmpDir 'git-shorthand.json'
+    [System.IO.File]::WriteAllText($gitShortManifest, (@{
+        git = @{
+            host           = 'gitlab.com'
+            port           = 2222
+            privateKeyFile = 'keys\git_github'
+            publicKeyFile  = 'keys\git_github.pub'
+            userName       = 'Shorthand Bot'
+            userEmail      = 'short@example.com'
+            signing        = @{ enabled = $true }
+        }
+    } | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
+    $gitShortRes = Build-SeedSecretsPayload -ManifestPath $gitShortManifest -AgentName 'agent'
+    $gs = $gitShortRes.Payload.services['git']
+    Assert-True "Builds shorthand single-host git payload cleanly (inherits default key for host & signing)" (
+        $gs.keys.Count -eq 1 -and
+        $gs.keys[0].name -eq 'default' -and
+        $gs.hosts.Count -eq 1 -and
+        $gs.hosts[0].name -eq 'gitlab.com' -and
+        $gs.hosts[0].hostName -eq 'gitlab.com' -and
+        $gs.hosts[0].user -eq 'git' -and
+        $gs.hosts[0].port -eq 2222 -and
+        $gs.hosts[0].key -eq 'default' -and
+        $gs.signing.key -eq 'default'
+    )
 
     # 4. kubectl service-account token mode
     $kcTokenManifest = Join-Path $tmpDir 'kc-token.json'
@@ -420,6 +502,123 @@ try {
     } | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
     Assert-Throws "Rejects empty enabled ssh section" {
         Build-SeedSecretsPayload -ManifestPath $emptySshManifest -AgentName 'agent'
+    } 'specify at least one'
+
+    # 8. Git SSH-specific security & validation tests
+    $badGitKeyManifest = Join-Path $tmpDir 'bad-git-key.json'
+    [System.IO.File]::WriteAllText($badGitKeyManifest, (@{
+        git = @{
+            privateKey = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGITSECRETPUBNOTPRIV'
+        }
+    } | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
+    Assert-Throws "Rejects public key passed as git privateKey without leaking material" {
+        Build-SeedSecretsPayload -ManifestPath $badGitKeyManifest -AgentName 'agent'
+    } 'invalid SSH private key format' 'AAAAIGITSECRETPUBNOTPRIV'
+
+    $bothGitKeysManifest = Join-Path $tmpDir 'both-git-keys.json'
+    [System.IO.File]::WriteAllText($bothGitKeysManifest, (@{
+        git = @{
+            privateKeyFile = 'keys\git_github'
+            keys           = @(@{ name = 'gh'; privateKeyFile = 'keys\git_github' })
+        }
+    } | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
+    Assert-Throws "Rejects specifying both top-level git privateKeyFile and keys" {
+        Build-SeedSecretsPayload -ManifestPath $bothGitKeysManifest -AgentName 'agent'
+    } 'not both'
+
+    $bothGitHostsManifest = Join-Path $tmpDir 'both-git-hosts.json'
+    [System.IO.File]::WriteAllText($bothGitHostsManifest, (@{
+        git = @{
+            host  = 'github.com'
+            hosts = @(@{ name = 'gitlab.com'; privateKeyFile = 'keys\git_github' })
+        }
+    } | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
+    Assert-Throws "Rejects specifying both top-level git host and hosts" {
+        Build-SeedSecretsPayload -ManifestPath $bothGitHostsManifest -AgentName 'agent'
+    } 'not both'
+
+    $reservedGitKeyManifest = Join-Path $tmpDir 'reserved-git-key.json'
+    [System.IO.File]::WriteAllText($reservedGitKeyManifest, (@{
+        git = @{
+            keys = @(@{ name = 'allowed_signers'; privateKeyFile = 'keys\git_github' })
+        }
+    } | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
+    Assert-Throws "Rejects reserved key name 'allowed_signers' in git.keys" {
+        Build-SeedSecretsPayload -ManifestPath $reservedGitKeyManifest -AgentName 'agent'
+    } 'reserved'
+
+    $wildcardGitHostManifest = Join-Path $tmpDir 'wildcard-git-host.json'
+    [System.IO.File]::WriteAllText($wildcardGitHostManifest, (@{
+        git = @{
+            hosts = @(@{ name = '*'; hostName = 'github.com' })
+        }
+    } | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
+    Assert-Throws "Rejects wildcard '*' as git.hosts entry name" {
+        Build-SeedSecretsPayload -ManifestPath $wildcardGitHostManifest -AgentName 'agent'
+    } "cannot be '\*'"
+
+    $wildcardRewriteManifest = Join-Path $tmpDir 'wildcard-rewrite.json'
+    [System.IO.File]::WriteAllText($wildcardRewriteManifest, (@{
+        git = @{
+            hosts = @(@{ name = '*.github.com'; hostName = 'github.com'; rewriteHttpsToSsh = $true })
+        }
+    } | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
+    Assert-Throws "Rejects rewriteHttpsToSsh on wildcard git host alias" {
+        Build-SeedSecretsPayload -ManifestPath $wildcardRewriteManifest -AgentName 'agent'
+    } 'wildcard host patterns'
+
+    $badGitIdentityManifest = Join-Path $tmpDir 'bad-git-identity.json'
+    [System.IO.File]::WriteAllText($badGitIdentityManifest, (@{
+        git = @{
+            userName = "Bot`n[core]`nsshCommand = id"
+        }
+    } | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
+    Assert-Throws "Rejects newline/config injection in git.userName" {
+        Build-SeedSecretsPayload -ManifestPath $badGitIdentityManifest -AgentName 'agent'
+    } 'invalid newline or control characters'
+
+    $badAllowedSignerManifest = Join-Path $tmpDir 'bad-allowed-signer.json'
+    [System.IO.File]::WriteAllText($badAllowedSignerManifest, (@{
+        git = @{
+            privateKeyFile = 'keys\git_github'
+            signing        = @{
+                enabled        = $true
+                allowedSigners = @('-----BEGIN OPENSSH PRIVATE KEY-----')
+            }
+        }
+    } | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
+    Assert-Throws "Rejects private key passed in git.signing.allowedSigners" {
+        Build-SeedSecretsPayload -ManifestPath $badAllowedSignerManifest -AgentName 'agent'
+    } 'private key'
+
+    $badSigningBothManifest = Join-Path $tmpDir 'bad-signing-both.json'
+    [System.IO.File]::WriteAllText($badSigningBothManifest, (@{
+        git = @{
+            keys    = @(@{ name = 'gh'; privateKeyFile = 'keys\git_github' })
+            signing = @{ key = 'gh'; privateKeyFile = 'keys\git_signing' }
+        }
+    } | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
+    Assert-Throws "Rejects git.signing specifying both key and privateKeyFile" {
+        Build-SeedSecretsPayload -ManifestPath $badSigningBothManifest -AgentName 'agent'
+    } 'not both'
+
+    $badSigningUnknownManifest = Join-Path $tmpDir 'bad-signing-unknown.json'
+    [System.IO.File]::WriteAllText($badSigningUnknownManifest, (@{
+        git = @{
+            keys    = @(@{ name = 'gh'; privateKeyFile = 'keys\git_github' })
+            signing = @{ key = 'nonexistent' }
+        }
+    } | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
+    Assert-Throws "Rejects git.signing.key referencing unknown key" {
+        Build-SeedSecretsPayload -ManifestPath $badSigningUnknownManifest -AgentName 'agent'
+    } 'does not match any key'
+
+    $emptyGitManifest = Join-Path $tmpDir 'empty-git.json'
+    [System.IO.File]::WriteAllText($emptyGitManifest, (@{
+        git = @{ enabled = $true }
+    } | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
+    Assert-Throws "Rejects empty enabled git section" {
+        Build-SeedSecretsPayload -ManifestPath $emptyGitManifest -AgentName 'agent'
     } 'specify at least one'
 } finally {
     [Environment]::SetEnvironmentVariable('WSL_AGENT_SANDBOX_SECRETS_PATH', $prevEnvManifest)

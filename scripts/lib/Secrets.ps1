@@ -3,6 +3,7 @@ Set-StrictMode -Version Latest
 
 $script:SupportedSecretServices = @(
     'github',
+    'git',
     'aws',
     'gcloud',
     'azure',
@@ -337,6 +338,46 @@ function Add-ValidatedKnownHostLines {
     }
 }
 
+function Assert-SafeGitConfigValue {
+    param(
+        [Parameter(Mandatory)][string]$Value,
+        [Parameter(Mandatory)][string]$Context
+    )
+    if ($Value -match '[\x00-\x1F\x7F]') {
+        throw "${Context}: contains invalid newline or control characters."
+    }
+}
+
+function Add-ValidatedAllowedSignerLines {
+    param(
+        [Parameter(Mandatory)][string]$RawText,
+        [Parameter(Mandatory)][string]$Context,
+        [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.List[string]]$TargetList,
+        [Parameter(Mandatory)][hashtable]$SeenSet
+    )
+    $norm = ($RawText -replace "`r`n", "`n") -replace "`r", "`n"
+    foreach ($line in ($norm -split "`n")) {
+        $trimmed = $line.Trim()
+        if ([string]::IsNullOrWhiteSpace($trimmed) -or $trimmed.StartsWith('#')) {
+            continue
+        }
+        if ($trimmed -match '[\x00-\x08\x0B-\x1F\x7F]') {
+            throw "${Context}: allowed_signers entry contains invalid control characters."
+        }
+        if ($trimmed -match 'PRIVATE KEY-----') {
+            throw "${Context}: allowed_signers entry appears to contain a private key."
+        }
+        $parts = @($trimmed -split '\s+' | Where-Object { $_ -ne '' })
+        if ($parts.Count -lt 3) {
+            throw "${Context}: invalid allowed_signers entry (expected '<principal> [options] <key-type> <base64-key>')."
+        }
+        if (-not $SeenSet.ContainsKey($trimmed)) {
+            $SeenSet[$trimmed] = $true
+            $TargetList.Add($trimmed)
+        }
+    }
+}
+
 function Build-SeedSecretsPayload {
     param(
         [Parameter(Mandatory)][string]$ManifestPath,
@@ -422,6 +463,475 @@ function Build-SeedSecretsPayload {
                     loginOnline = $loginOnline
                 }
                 $summary.Add("github (host=$hostname, setupGit=$setupGit, exportEnv=$exportEnv)")
+            }
+
+            'git' {
+                $keysOut = New-Object System.Collections.Generic.List[object]
+                $seenKeys = @{}
+                $hostsOut = New-Object System.Collections.Generic.List[object]
+                $seenHosts = @{}
+                $knownHostsList = New-Object System.Collections.Generic.List[string]
+                $seenKnownHosts = @{}
+
+                $userName = [string](Get-ObjectProperty -Object $entry -Name 'userName' -Default '')
+                if (-not [string]::IsNullOrWhiteSpace($userName)) {
+                    Assert-SafeGitConfigValue -Value $userName -Context 'git.userName'
+                }
+                $userEmail = [string](Get-ObjectProperty -Object $entry -Name 'userEmail' -Default '')
+                if (-not [string]::IsNullOrWhiteSpace($userEmail)) {
+                    Assert-SafeGitConfigValue -Value $userEmail -Context 'git.userEmail'
+                }
+
+                $defaultUser = [string](Get-ObjectProperty -Object $entry -Name 'user' -Default 'git')
+                if ([string]::IsNullOrWhiteSpace($defaultUser)) {
+                    $defaultUser = 'git'
+                }
+                Assert-SafeSshConfigValue -Value $defaultUser -Pattern '^[A-Za-z0-9._@+-]+$' -Context 'git.user'
+
+                $globalRewriteHttps = [bool](Get-ObjectProperty -Object $entry -Name 'rewriteHttpsToSsh' -Default $false)
+                $strictHostKeyChecking = [string](Get-ObjectProperty -Object $entry -Name 'strictHostKeyChecking' -Default '')
+                if (-not [string]::IsNullOrWhiteSpace($strictHostKeyChecking) -and $strictHostKeyChecking -notin @('yes', 'accept-new', 'no')) {
+                    throw "git.strictHostKeyChecking '$strictHostKeyChecking' must be 'yes', 'accept-new', or 'no'."
+                }
+                $identitiesOnly = [bool](Get-ObjectProperty -Object $entry -Name 'identitiesOnly' -Default $true)
+                $forwardAgent = [bool](Get-ObjectProperty -Object $entry -Name 'forwardAgent' -Default $false)
+
+                $serverAliveInterval = Get-ObjectProperty -Object $entry -Name 'serverAliveInterval' -Default $null
+                if ($null -ne $serverAliveInterval) {
+                    $aliveVal = [int]$serverAliveInterval
+                    if ($aliveVal -lt 0 -or $aliveVal -gt 3600) {
+                        throw "git.serverAliveInterval ($aliveVal) must be between 0 and 3600."
+                    }
+                    $serverAliveInterval = $aliveVal
+                }
+
+                $connectTimeout = Get-ObjectProperty -Object $entry -Name 'connectTimeout' -Default $null
+                if ($null -ne $connectTimeout) {
+                    $toVal = [int]$connectTimeout
+                    if ($toVal -lt 1 -or $toVal -gt 600) {
+                        throw "git.connectTimeout ($toVal) must be between 1 and 600."
+                    }
+                    $connectTimeout = $toVal
+                }
+
+                $batchMode = $true
+                if (Test-ObjectHasProperty -Object $entry -Name 'batchMode') {
+                    $bmRaw = Get-ObjectProperty -Object $entry -Name 'batchMode' -Default $null
+                    if ($null -ne $bmRaw) {
+                        $batchMode = [bool]$bmRaw
+                    }
+                }
+
+                # 1. Top-level shorthand key vs named keys[]
+                $topPriv = Resolve-SshPrivateKey -Object $entry -BaseDir $baseDir -Context 'git'
+                $topPub = Resolve-SshPublicMaterial -Object $entry -BaseName 'publicKey' -BaseDir $baseDir -Context 'git'
+                $topCert = Resolve-SshPublicMaterial -Object $entry -BaseName 'certificate' -BaseDir $baseDir -Context 'git'
+                $hasTopPriv = -not [string]::IsNullOrWhiteSpace($topPriv)
+
+                if ((-not $hasTopPriv) -and ((-not [string]::IsNullOrWhiteSpace($topPub)) -or (-not [string]::IsNullOrWhiteSpace($topCert)))) {
+                    throw "git: top-level 'publicKey*' and 'certificate*' require top-level 'privateKey*' (or configure them on a key in git.keys)."
+                }
+
+                $rawKeys = Get-ObjectProperty -Object $entry -Name 'keys' -Default $null
+                $hasRawKeys = ($null -ne $rawKeys -and @($rawKeys).Count -gt 0)
+                if ($hasTopPriv -and $hasRawKeys) {
+                    throw "git: specify either top-level 'privateKey*' shorthand or 'keys', not both."
+                }
+
+                $defaultKey = [string](Get-ObjectProperty -Object $entry -Name 'defaultKey' -Default '')
+                if ($hasTopPriv) {
+                    if (-not [string]::IsNullOrWhiteSpace($defaultKey)) {
+                        throw "git: cannot specify both top-level 'privateKey*' shorthand and 'defaultKey'."
+                    }
+                    $seenKeys['default'] = 'default'
+                    $keysOut.Add([ordered]@{
+                        name        = 'default'
+                        privateKey  = $topPriv
+                        publicKey   = $topPub
+                        certificate = $topCert
+                    })
+                    $defaultKey = 'default'
+                } elseif ($null -ne $rawKeys) {
+                    foreach ($k in @($rawKeys)) {
+                        if ($null -eq $k) { continue }
+                        $kName = [string](Get-ObjectProperty -Object $k -Name 'name' -Default '')
+                        if ($kName -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$') {
+                            throw "git.keys entry has invalid name '$kName'."
+                        }
+                        if ($kName -in @('known_hosts', 'config', 'allowed_signers')) {
+                            throw "git.keys entry name '$kName' is reserved."
+                        }
+                        if ($seenKeys.ContainsKey($kName.ToLowerInvariant())) {
+                            throw "git.keys contains duplicate key name '$kName'."
+                        }
+                        $seenKeys[$kName.ToLowerInvariant()] = $kName
+                        $privKey = Resolve-SshPrivateKey -Object $k -BaseDir $baseDir -Context "git.keys[$kName]" -Required
+                        $pubKey = Resolve-SshPublicMaterial -Object $k -BaseName 'publicKey' -BaseDir $baseDir -Context "git.keys[$kName]"
+                        $cert = Resolve-SshPublicMaterial -Object $k -BaseName 'certificate' -BaseDir $baseDir -Context "git.keys[$kName]"
+                        $keysOut.Add([ordered]@{
+                            name        = $kName
+                            privateKey  = $privKey
+                            publicKey   = $pubKey
+                            certificate = $cert
+                        })
+                    }
+                    if (-not [string]::IsNullOrWhiteSpace($defaultKey)) {
+                        if (-not $seenKeys.ContainsKey($defaultKey.ToLowerInvariant())) {
+                            throw "git.defaultKey '$defaultKey' does not match any key defined in git.keys."
+                        }
+                        $defaultKey = $seenKeys[$defaultKey.ToLowerInvariant()]
+                    }
+                } elseif (-not [string]::IsNullOrWhiteSpace($defaultKey)) {
+                    throw "git.defaultKey '$defaultKey' does not match any key defined in git.keys."
+                }
+
+                # 2. Top-level knownHosts & knownHostsFile
+                $rawKnownHosts = Get-ObjectProperty -Object $entry -Name 'knownHosts' -Default $null
+                if ($null -ne $rawKnownHosts) {
+                    foreach ($kh in @($rawKnownHosts)) {
+                        if ($null -eq $kh) { continue }
+                        Add-ValidatedKnownHostLines -RawText ([string]$kh) -Context 'git.knownHosts' -TargetList $knownHostsList -SeenSet $seenKnownHosts
+                    }
+                }
+                $knownHostsFile = [string](Get-ObjectProperty -Object $entry -Name 'knownHostsFile' -Default '')
+                if (-not [string]::IsNullOrWhiteSpace($knownHostsFile)) {
+                    $khContent = Resolve-SecretFileContent -RawPath $knownHostsFile -BaseDir $baseDir -Context 'git.knownHostsFile'
+                    Add-ValidatedKnownHostLines -RawText $khContent -Context 'git.knownHostsFile' -TargetList $knownHostsList -SeenSet $seenKnownHosts
+                }
+
+                # 3. Git SSH hosts (shorthand host + privateKey* OR structured hosts[])
+                $hasExplicitHost = Test-ObjectHasProperty -Object $entry -Name 'host'
+                $hasExplicitPort = Test-ObjectHasProperty -Object $entry -Name 'port'
+                $rawHosts = Get-ObjectProperty -Object $entry -Name 'hosts' -Default $null
+                $hasRawHosts = ($null -ne $rawHosts -and @($rawHosts).Count -gt 0)
+
+                if ($hasExplicitHost -and $hasRawHosts) {
+                    throw "git: specify either top-level 'host' shorthand or 'hosts', not both."
+                }
+                if ($hasExplicitPort -and $hasRawHosts) {
+                    throw "git: specify either top-level 'port' shorthand or 'hosts', not both."
+                }
+
+                if ($hasRawHosts) {
+                    foreach ($h in @($rawHosts)) {
+                        if ($null -eq $h) { continue }
+                        $hName = [string](Get-ObjectProperty -Object $h -Name 'name' -Default '')
+                        if ([string]::IsNullOrWhiteSpace($hName)) {
+                            throw "git.hosts entry is missing required 'name'."
+                        }
+                        Assert-SafeSshConfigValue -Value $hName -Pattern '^[A-Za-z0-9._*?@:-]+$' -Context "git.hosts[$hName].name"
+                        if ($hName -eq '*') {
+                            throw "git.hosts entry name cannot be '*' (specify explicit Git hostnames or aliases such as 'github.com')."
+                        }
+                        if ($seenHosts.ContainsKey($hName.ToLowerInvariant())) {
+                            throw "git.hosts contains duplicate host name '$hName'."
+                        }
+                        $seenHosts[$hName.ToLowerInvariant()] = $true
+
+                        $hostName = [string](Get-ObjectProperty -Object $h -Name 'hostName' -Default '')
+                        if ([string]::IsNullOrWhiteSpace($hostName)) {
+                            $hostName = $hName
+                        }
+                        Assert-SafeSshConfigValue -Value $hostName -Pattern '^[A-Za-z0-9._:%\[\]-]+$' -Context "git.hosts[$hName].hostName"
+
+                        $hUser = [string](Get-ObjectProperty -Object $h -Name 'user' -Default '')
+                        if ([string]::IsNullOrWhiteSpace($hUser)) {
+                            $hUser = $defaultUser
+                        }
+                        Assert-SafeSshConfigValue -Value $hUser -Pattern '^[A-Za-z0-9._@+-]+$' -Context "git.hosts[$hName].user"
+
+                        $hPort = $null
+                        if (Test-ObjectHasProperty -Object $h -Name 'port') {
+                            $pRaw = Get-ObjectProperty -Object $h -Name 'port' -Default $null
+                            if ($null -ne $pRaw) {
+                                $pInt = [int]$pRaw
+                                if ($pInt -lt 1 -or $pInt -gt 65535) {
+                                    throw "git.hosts[$hName].port ($pInt) must be between 1 and 65535."
+                                }
+                                $hPort = $pInt
+                            }
+                        }
+
+                        $hKeyRef = [string](Get-ObjectProperty -Object $h -Name 'key' -Default '')
+                        $hInlinePriv = Resolve-SshPrivateKey -Object $h -BaseDir $baseDir -Context "git.hosts[$hName]"
+                        $hInlinePub = Resolve-SshPublicMaterial -Object $h -BaseName 'publicKey' -BaseDir $baseDir -Context "git.hosts[$hName]"
+                        $hInlineCert = Resolve-SshPublicMaterial -Object $h -BaseName 'certificate' -BaseDir $baseDir -Context "git.hosts[$hName]"
+
+                        $hasKeyRef = -not [string]::IsNullOrWhiteSpace($hKeyRef)
+                        $hasInlinePriv = -not [string]::IsNullOrWhiteSpace($hInlinePriv)
+
+                        if ($hasKeyRef -and $hasInlinePriv) {
+                            throw "git.hosts[$hName]: specify either 'key' or 'privateKey*', not both."
+                        }
+                        if ((-not $hasInlinePriv) -and ((-not [string]::IsNullOrWhiteSpace($hInlinePub)) -or (-not [string]::IsNullOrWhiteSpace($hInlineCert)))) {
+                            throw "git.hosts[$hName]: 'publicKey*' and 'certificate*' on a host require an inline 'privateKey*' (or configure them on the named key in git.keys)."
+                        }
+
+                        $resolvedKeyName = ''
+                        if ($hasKeyRef) {
+                            if (-not $seenKeys.ContainsKey($hKeyRef.ToLowerInvariant())) {
+                                throw "git.hosts[$hName].key '$hKeyRef' does not match any key defined in git.keys."
+                            }
+                            $resolvedKeyName = $seenKeys[$hKeyRef.ToLowerInvariant()]
+                        } elseif ($hasInlinePriv) {
+                            $safeBase = 'host-' + (($hName -replace '[^A-Za-z0-9._-]', '_').Trim('_'))
+                            if ($safeBase.Length -gt 55) {
+                                $safeBase = $safeBase.Substring(0, 55)
+                            }
+                            $candidate = $safeBase
+                            $suffix = 2
+                            while ($seenKeys.ContainsKey($candidate.ToLowerInvariant())) {
+                                $candidate = "${safeBase}-${suffix}"
+                                $suffix++
+                            }
+                            $seenKeys[$candidate.ToLowerInvariant()] = $candidate
+                            $keysOut.Add([ordered]@{
+                                name        = $candidate
+                                privateKey  = $hInlinePriv
+                                publicKey   = $hInlinePub
+                                certificate = $hInlineCert
+                            })
+                            $resolvedKeyName = $candidate
+                        } elseif (-not [string]::IsNullOrWhiteSpace($defaultKey)) {
+                            $resolvedKeyName = $defaultKey
+                        }
+
+                        $hProxyJump = [string](Get-ObjectProperty -Object $h -Name 'proxyJump' -Default '')
+                        if (-not [string]::IsNullOrWhiteSpace($hProxyJump)) {
+                            Assert-SafeSshConfigValue -Value $hProxyJump -Pattern '^[A-Za-z0-9._@:%\[\],-]+$' -Context "git.hosts[$hName].proxyJump"
+                        }
+
+                        $hShkc = [string](Get-ObjectProperty -Object $h -Name 'strictHostKeyChecking' -Default '')
+                        if (-not [string]::IsNullOrWhiteSpace($hShkc) -and $hShkc -notin @('yes', 'accept-new', 'no')) {
+                            throw "git.hosts[$hName].strictHostKeyChecking '$hShkc' must be 'yes', 'accept-new', or 'no'."
+                        }
+
+                        $hIdentitiesOnly = $null
+                        if (Test-ObjectHasProperty -Object $h -Name 'identitiesOnly') {
+                            $v = Get-ObjectProperty -Object $h -Name 'identitiesOnly' -Default $null
+                            if ($null -ne $v) { $hIdentitiesOnly = [bool]$v }
+                        }
+
+                        $hForwardAgent = $null
+                        if (Test-ObjectHasProperty -Object $h -Name 'forwardAgent') {
+                            $v = Get-ObjectProperty -Object $h -Name 'forwardAgent' -Default $null
+                            if ($null -ne $v) { $hForwardAgent = [bool]$v }
+                        }
+
+                        $hAlive = $null
+                        if (Test-ObjectHasProperty -Object $h -Name 'serverAliveInterval') {
+                            $v = Get-ObjectProperty -Object $h -Name 'serverAliveInterval' -Default $null
+                            if ($null -ne $v) {
+                                $aInt = [int]$v
+                                if ($aInt -lt 0 -or $aInt -gt 3600) {
+                                    throw "git.hosts[$hName].serverAliveInterval ($aInt) must be between 0 and 3600."
+                                }
+                                $hAlive = $aInt
+                            }
+                        }
+
+                        $hTimeout = $null
+                        if (Test-ObjectHasProperty -Object $h -Name 'connectTimeout') {
+                            $v = Get-ObjectProperty -Object $h -Name 'connectTimeout' -Default $null
+                            if ($null -ne $v) {
+                                $tInt = [int]$v
+                                if ($tInt -lt 1 -or $tInt -gt 600) {
+                                    throw "git.hosts[$hName].connectTimeout ($tInt) must be between 1 and 600."
+                                }
+                                $hTimeout = $tInt
+                            }
+                        }
+
+                        $hBatch = $null
+                        if (Test-ObjectHasProperty -Object $h -Name 'batchMode') {
+                            $v = Get-ObjectProperty -Object $h -Name 'batchMode' -Default $null
+                            if ($null -ne $v) { $hBatch = [bool]$v }
+                        }
+
+                        $hRewrite = $globalRewriteHttps
+                        if (Test-ObjectHasProperty -Object $h -Name 'rewriteHttpsToSsh') {
+                            $v = Get-ObjectProperty -Object $h -Name 'rewriteHttpsToSsh' -Default $null
+                            if ($null -ne $v) { $hRewrite = [bool]$v }
+                        }
+                        if ($hRewrite -and ($hName.Contains('*') -or $hName.Contains('?'))) {
+                            throw "git.hosts[$hName]: 'rewriteHttpsToSsh' cannot be used with wildcard host patterns."
+                        }
+
+                        $hHasPinnedKh = $false
+                        $hKnownHost = [string](Get-ObjectProperty -Object $h -Name 'knownHost' -Default '')
+                        if (-not [string]::IsNullOrWhiteSpace($hKnownHost)) {
+                            Add-ValidatedKnownHostLines -RawText $hKnownHost -Context "git.hosts[$hName].knownHost" -TargetList $knownHostsList -SeenSet $seenKnownHosts
+                            $hHasPinnedKh = $true
+                        }
+                        $hKnownHostFile = [string](Get-ObjectProperty -Object $h -Name 'knownHostFile' -Default '')
+                        if (-not [string]::IsNullOrWhiteSpace($hKnownHostFile)) {
+                            $hkhContent = Resolve-SecretFileContent -RawPath $hKnownHostFile -BaseDir $baseDir -Context "git.hosts[$hName].knownHostFile"
+                            Add-ValidatedKnownHostLines -RawText $hkhContent -Context "git.hosts[$hName].knownHostFile" -TargetList $knownHostsList -SeenSet $seenKnownHosts
+                            $hHasPinnedKh = $true
+                        }
+
+                        $hostsOut.Add([ordered]@{
+                            name                  = $hName
+                            hostName              = $hostName
+                            user                  = $hUser
+                            port                  = $hPort
+                            key                   = $resolvedKeyName
+                            proxyJump             = $hProxyJump
+                            identitiesOnly        = $hIdentitiesOnly
+                            forwardAgent          = $hForwardAgent
+                            strictHostKeyChecking = $hShkc
+                            serverAliveInterval   = $hAlive
+                            connectTimeout        = $hTimeout
+                            batchMode             = $hBatch
+                            rewriteHttpsToSsh     = $hRewrite
+                            hasPinnedKnownHost    = $hHasPinnedKh
+                        })
+                    }
+                } elseif ($hasTopPriv -or $hasExplicitHost) {
+                    $shorthandHost = [string](Get-ObjectProperty -Object $entry -Name 'host' -Default 'github.com')
+                    if ([string]::IsNullOrWhiteSpace($shorthandHost)) {
+                        $shorthandHost = 'github.com'
+                    }
+                    Assert-SafeSshConfigValue -Value $shorthandHost -Pattern '^[A-Za-z0-9._-]+$' -Context 'git.host'
+                    $shorthandPort = $null
+                    if ($hasExplicitPort) {
+                        $pRaw = Get-ObjectProperty -Object $entry -Name 'port' -Default $null
+                        if ($null -ne $pRaw) {
+                            $pInt = [int]$pRaw
+                            if ($pInt -lt 1 -or $pInt -gt 65535) {
+                                throw "git.port ($pInt) must be between 1 and 65535."
+                            }
+                            $shorthandPort = $pInt
+                        }
+                    }
+                    $hostsOut.Add([ordered]@{
+                        name                  = $shorthandHost
+                        hostName              = $shorthandHost
+                        user                  = $defaultUser
+                        port                  = $shorthandPort
+                        key                   = $defaultKey
+                        proxyJump             = ''
+                        identitiesOnly        = $null
+                        forwardAgent          = $null
+                        strictHostKeyChecking = ''
+                        serverAliveInterval   = $null
+                        connectTimeout        = $null
+                        batchMode             = $null
+                        rewriteHttpsToSsh     = $globalRewriteHttps
+                        hasPinnedKnownHost    = $false
+                    })
+                }
+
+                # 4. Optional SSH commit/tag signing
+                $signingOut = $null
+                if (Test-ObjectHasProperty -Object $entry -Name 'signing') {
+                    $sObj = Get-ObjectProperty -Object $entry -Name 'signing' -Default $null
+                    if ($null -ne $sObj) {
+                        $sEnabled = [bool](Get-ObjectProperty -Object $sObj -Name 'enabled' -Default $true)
+                        if ($sEnabled) {
+                            $sKeyRef = [string](Get-ObjectProperty -Object $sObj -Name 'key' -Default '')
+                            $sInlinePriv = Resolve-SshPrivateKey -Object $sObj -BaseDir $baseDir -Context 'git.signing'
+                            $sInlinePub = Resolve-SshPublicMaterial -Object $sObj -BaseName 'publicKey' -BaseDir $baseDir -Context 'git.signing'
+                            $hasSKeyRef = -not [string]::IsNullOrWhiteSpace($sKeyRef)
+                            $hasSInlinePriv = -not [string]::IsNullOrWhiteSpace($sInlinePriv)
+
+                            if ($hasSKeyRef -and $hasSInlinePriv) {
+                                throw "git.signing: specify either 'key' or 'privateKey*', not both."
+                            }
+                            if ((-not $hasSInlinePriv) -and (-not [string]::IsNullOrWhiteSpace($sInlinePub))) {
+                                throw "git.signing: 'publicKey*' requires an inline 'privateKey*' (or configure it on the referenced key in git.keys)."
+                            }
+
+                            $resolvedSigningKey = ''
+                            if ($hasSKeyRef) {
+                                if (-not $seenKeys.ContainsKey($sKeyRef.ToLowerInvariant())) {
+                                    throw "git.signing.key '$sKeyRef' does not match any key defined in git.keys."
+                                }
+                                $resolvedSigningKey = $seenKeys[$sKeyRef.ToLowerInvariant()]
+                            } elseif ($hasSInlinePriv) {
+                                $candidate = 'signing'
+                                $suffix = 2
+                                while ($seenKeys.ContainsKey($candidate.ToLowerInvariant())) {
+                                    $candidate = "signing-${suffix}"
+                                    $suffix++
+                                }
+                                $seenKeys[$candidate.ToLowerInvariant()] = $candidate
+                                $keysOut.Add([ordered]@{
+                                    name        = $candidate
+                                    privateKey  = $sInlinePriv
+                                    publicKey   = $sInlinePub
+                                    certificate = ''
+                                })
+                                $resolvedSigningKey = $candidate
+                            } elseif (-not [string]::IsNullOrWhiteSpace($defaultKey)) {
+                                $resolvedSigningKey = $defaultKey
+                            } else {
+                                throw "git.signing: specify 'key' (referencing git.keys) or 'privateKey*'."
+                            }
+
+                            $allowedSignersList = New-Object System.Collections.Generic.List[string]
+                            $seenSigners = @{}
+                            $rawSigners = Get-ObjectProperty -Object $sObj -Name 'allowedSigners' -Default $null
+                            if ($null -ne $rawSigners) {
+                                foreach ($as in @($rawSigners)) {
+                                    if ($null -eq $as) { continue }
+                                    Add-ValidatedAllowedSignerLines -RawText ([string]$as) -Context 'git.signing.allowedSigners' -TargetList $allowedSignersList -SeenSet $seenSigners
+                                }
+                            }
+                            $allowedSignersFile = [string](Get-ObjectProperty -Object $sObj -Name 'allowedSignersFile' -Default '')
+                            if (-not [string]::IsNullOrWhiteSpace($allowedSignersFile)) {
+                                $asContent = Resolve-SecretFileContent -RawPath $allowedSignersFile -BaseDir $baseDir -Context 'git.signing.allowedSignersFile'
+                                Add-ValidatedAllowedSignerLines -RawText $asContent -Context 'git.signing.allowedSignersFile' -TargetList $allowedSignersList -SeenSet $seenSigners
+                            }
+
+                            $signingOut = [ordered]@{
+                                key            = $resolvedSigningKey
+                                signCommits    = [bool](Get-ObjectProperty -Object $sObj -Name 'signCommits' -Default $true)
+                                signTags       = [bool](Get-ObjectProperty -Object $sObj -Name 'signTags' -Default $false)
+                                allowedSigners = @($allowedSignersList.ToArray())
+                            }
+                        }
+                    }
+                }
+
+                if ($keysOut.Count -eq 0 -and $hostsOut.Count -eq 0 -and $knownHostsList.Count -eq 0 -and $null -eq $signingOut -and [string]::IsNullOrWhiteSpace($userName) -and [string]::IsNullOrWhiteSpace($userEmail)) {
+                    throw "git: specify at least one of 'privateKey*', 'keys', 'hosts', 'knownHosts', 'signing', 'userName', or 'userEmail'."
+                }
+
+                $resolvedServices['git'] = [ordered]@{
+                    userName              = $userName
+                    userEmail             = $userEmail
+                    keys                  = @($keysOut.ToArray())
+                    hosts                 = @($hostsOut.ToArray())
+                    knownHosts            = @($knownHostsList.ToArray())
+                    strictHostKeyChecking = $strictHostKeyChecking
+                    identitiesOnly        = $identitiesOnly
+                    forwardAgent          = $forwardAgent
+                    serverAliveInterval   = $serverAliveInterval
+                    connectTimeout        = $connectTimeout
+                    batchMode             = $batchMode
+                    signing               = $signingOut
+                }
+
+                $sumParts = New-Object System.Collections.Generic.List[string]
+                if ($keysOut.Count -gt 0) {
+                    $kNames = ($keysOut | ForEach-Object { $_.name }) -join ', '
+                    $sumParts.Add("keys=$kNames")
+                }
+                if ($hostsOut.Count -gt 0) {
+                    $hNames = ($hostsOut | ForEach-Object { $_.name }) -join ', '
+                    $sumParts.Add("hosts=$hNames")
+                }
+                if ($knownHostsList.Count -gt 0) {
+                    $sumParts.Add("knownHosts=$($knownHostsList.Count)")
+                }
+                if ($null -ne $signingOut) {
+                    $sumParts.Add("signing=$($signingOut.key)")
+                }
+                if (-not [string]::IsNullOrWhiteSpace($userEmail)) {
+                    $sumParts.Add("email=$userEmail")
+                }
+                $summary.Add("git ($($sumParts -join '; '))")
             }
 
             'aws' {

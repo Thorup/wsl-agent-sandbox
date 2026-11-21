@@ -792,10 +792,21 @@ SSH_MANAGED_DIR = os.path.join(SSH_DIR, "wsl-agent-sandbox")
 SSH_CONFIG_FILE = os.path.join(SSH_DIR, "config")
 SSH_KNOWN_HOSTS_FILE = os.path.join(SSH_MANAGED_DIR, "known_hosts")
 
+GIT_SSH_MANAGED_DIR = os.path.join(SSH_DIR, "wsl-agent-sandbox-git")
+GIT_KNOWN_HOSTS_FILE = os.path.join(GIT_SSH_MANAGED_DIR, "known_hosts")
+GIT_ALLOWED_SIGNERS_FILE = os.path.join(GIT_SSH_MANAGED_DIR, "allowed_signers")
+GIT_MANAGED_CONFIG_FILE = os.path.join(STATE_DIR, "gitconfig")
+GIT_USER_CONFIG_FILE = os.path.join(AGENT_HOME, ".gitconfig")
+
+GIT_SSH_HOSTS_START = "# >>> wsl-agent-sandbox managed git ssh hosts (DO NOT EDIT) >>>"
+GIT_SSH_HOSTS_END = "# <<< wsl-agent-sandbox managed git ssh hosts <<<"
 SSH_HOSTS_START = "# >>> wsl-agent-sandbox managed ssh hosts (DO NOT EDIT) >>>"
 SSH_HOSTS_END = "# <<< wsl-agent-sandbox managed ssh hosts <<<"
 SSH_DEFAULTS_START = "# >>> wsl-agent-sandbox managed ssh defaults (DO NOT EDIT) >>>"
 SSH_DEFAULTS_END = "# <<< wsl-agent-sandbox managed ssh defaults <<<"
+
+GIT_CONFIG_INCLUDE_START = "# >>> wsl-agent-sandbox managed git config (DO NOT EDIT) >>>"
+GIT_CONFIG_INCLUDE_END = "# <<< wsl-agent-sandbox managed git config <<<"
 
 def register_ssh_private_key(pem_text):
     if not pem_text:
@@ -821,28 +832,356 @@ def strip_managed_block(text, start_marker, end_marker):
         out.append(line)
     return "\n".join(out)
 
-def merge_ssh_config(hosts_block, defaults_block):
+def extract_managed_block(text, start_marker, end_marker):
+    out = []
+    capturing = False
+    for line in text.splitlines():
+        s = line.strip()
+        if s == start_marker:
+            capturing = True
+            out.append(line)
+            continue
+        if capturing:
+            out.append(line)
+            if s == end_marker:
+                capturing = False
+    return "\n".join(out).strip("\n")
+
+def update_ssh_config(git_hosts_block=None, ssh_hosts_block=None, ssh_defaults_block=None):
     existing = ""
     if os.path.isfile(SSH_CONFIG_FILE):
         with open(SSH_CONFIG_FILE, "r", encoding="utf-8") as f:
             existing = f.read()
-    user_body = strip_managed_block(existing, SSH_HOSTS_START, SSH_HOSTS_END)
+
+    eff_git_hosts = (
+        extract_managed_block(existing, GIT_SSH_HOSTS_START, GIT_SSH_HOSTS_END)
+        if git_hosts_block is None
+        else git_hosts_block.strip("\n")
+    )
+    eff_ssh_hosts = (
+        extract_managed_block(existing, SSH_HOSTS_START, SSH_HOSTS_END)
+        if ssh_hosts_block is None
+        else ssh_hosts_block.strip("\n")
+    )
+    eff_ssh_defaults = (
+        extract_managed_block(existing, SSH_DEFAULTS_START, SSH_DEFAULTS_END)
+        if ssh_defaults_block is None
+        else ssh_defaults_block.strip("\n")
+    )
+
+    user_body = strip_managed_block(existing, GIT_SSH_HOSTS_START, GIT_SSH_HOSTS_END)
+    user_body = strip_managed_block(user_body, SSH_HOSTS_START, SSH_HOSTS_END)
     user_body = strip_managed_block(user_body, SSH_DEFAULTS_START, SSH_DEFAULTS_END)
     user_body = user_body.strip("\n")
 
     sections = []
-    if hosts_block:
-        sections.append(hosts_block.strip("\n"))
+    if eff_git_hosts:
+        sections.append(eff_git_hosts)
+    if eff_ssh_hosts:
+        sections.append(eff_ssh_hosts)
     if user_body.strip():
         sections.append(user_body)
-    if defaults_block:
-        sections.append(defaults_block.strip("\n"))
+    if eff_ssh_defaults:
+        sections.append(eff_ssh_defaults)
 
     if sections:
         ensure_agent_dir(SSH_DIR, mode=0o700)
         write_agent_file(SSH_CONFIG_FILE, "\n\n".join(sections) + "\n", mode=0o600, dir_mode=0o700)
     else:
         remove_file_quiet(SSH_CONFIG_FILE)
+
+def merge_ssh_config(hosts_block, defaults_block):
+    update_ssh_config(ssh_hosts_block=hosts_block, ssh_defaults_block=defaults_block)
+
+def gitconfig_quote(val):
+    s = str(val).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{s}"'
+
+def known_hosts_covers_host(known_hosts_lines, hostname, port=None):
+    targets = {hostname.lower()}
+    if port is not None and int(port) != 22:
+        targets.add(f"[{hostname.lower()}]:{int(port)}")
+    for line in known_hosts_lines:
+        parts = line.split()
+        if not parts:
+            continue
+        host_field = parts[0]
+        if host_field.startswith("@"):
+            if len(parts) < 2:
+                continue
+            host_field = parts[1]
+        for token in host_field.split(","):
+            if token.strip().lower() in targets:
+                return True
+    return False
+
+def update_gitconfig_include(enable_include):
+    existing = ""
+    if os.path.isfile(GIT_USER_CONFIG_FILE):
+        with open(GIT_USER_CONFIG_FILE, "r", encoding="utf-8") as f:
+            existing = f.read()
+    user_body = strip_managed_block(existing, GIT_CONFIG_INCLUDE_START, GIT_CONFIG_INCLUDE_END).strip("\n")
+
+    sections = []
+    if user_body.strip():
+        sections.append(user_body)
+    if enable_include:
+        include_block = "\n".join([
+            GIT_CONFIG_INCLUDE_START,
+            "[include]",
+            f"\tpath = {GIT_MANAGED_CONFIG_FILE}",
+            GIT_CONFIG_INCLUDE_END,
+        ])
+        sections.append(include_block)
+
+    if sections:
+        write_agent_file(GIT_USER_CONFIG_FILE, "\n\n".join(sections) + "\n", mode=0o644, dir_mode=0o755)
+    else:
+        remove_file_quiet(GIT_USER_CONFIG_FILE)
+
+def derive_public_key_line(priv_path):
+    if not shutil.which("ssh-keygen"):
+        return ""
+    res = run_as_agent(["ssh-keygen", "-y", "-f", priv_path], check=False)
+    if res.returncode == 0 and res.stdout.strip():
+        return res.stdout.strip().splitlines()[0].strip()
+    return ""
+
+def seed_git(cfg, prev_meta):
+    ensure_agent_dir(SSH_DIR, mode=0o700)
+    ensure_agent_dir(GIT_SSH_MANAGED_DIR, mode=0o700)
+
+    keys_raw = cfg.get("keys") or []
+    if isinstance(keys_raw, dict):
+        keys_raw = [keys_raw]
+    hosts_raw = cfg.get("hosts") or []
+    if isinstance(hosts_raw, dict):
+        hosts_raw = [hosts_raw]
+    known_hosts_raw = cfg.get("knownHosts") or []
+    if isinstance(known_hosts_raw, str):
+        known_hosts_raw = [known_hosts_raw]
+
+    expected_basenames = set()
+    key_paths = {}
+    pub_keys = {}
+    cert_paths = {}
+    key_names = []
+
+    for k in keys_raw:
+        k_name = k["name"]
+        if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$", k_name) or k_name in ("known_hosts", "config", "allowed_signers"):
+            raise ValueError(f"Invalid Git SSH key name: {k_name}")
+        priv_raw = k["privateKey"].replace("\r\n", "\n").replace("\r", "\n").rstrip("\n") + "\n"
+        register_ssh_private_key(priv_raw)
+
+        priv_path = os.path.join(GIT_SSH_MANAGED_DIR, k_name)
+        write_agent_file(priv_path, priv_raw, mode=0o600, dir_mode=0o700)
+        expected_basenames.add(k_name)
+        key_paths[k_name] = priv_path
+        key_names.append(k_name)
+
+        pub_raw = k.get("publicKey") or ""
+        if pub_raw.strip():
+            pub_norm = pub_raw.replace("\r\n", "\n").replace("\r", "\n").strip()
+            pub_basename = f"{k_name}.pub"
+            write_agent_file(
+                os.path.join(GIT_SSH_MANAGED_DIR, pub_basename),
+                pub_norm + "\n",
+                mode=0o644,
+                dir_mode=0o700,
+            )
+            expected_basenames.add(pub_basename)
+            pub_keys[k_name] = pub_norm
+
+        cert_raw = k.get("certificate") or ""
+        if cert_raw.strip():
+            cert_basename = f"{k_name}-cert.pub"
+            cert_path = os.path.join(GIT_SSH_MANAGED_DIR, cert_basename)
+            write_agent_file(
+                cert_path,
+                cert_raw.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n") + "\n",
+                mode=0o644,
+                dir_mode=0o700,
+            )
+            expected_basenames.add(cert_basename)
+            cert_paths[k_name] = cert_path
+
+    has_known_hosts = False
+    cleaned_kh = [line.strip() for line in known_hosts_raw if isinstance(line, str) and line.strip()]
+    if cleaned_kh:
+        write_agent_file(GIT_KNOWN_HOSTS_FILE, "\n".join(cleaned_kh) + "\n", mode=0o600, dir_mode=0o700)
+        expected_basenames.add("known_hosts")
+        has_known_hosts = True
+
+    user_name = (cfg.get("userName") or "").strip()
+    user_email = (cfg.get("userEmail") or "").strip()
+
+    signing_cfg = cfg.get("signing")
+    signing_key_name = ""
+    allowed_signers_lines = []
+    if isinstance(signing_cfg, dict) and signing_cfg.get("key"):
+        s_key = signing_cfg["key"]
+        if s_key not in key_paths:
+            raise ValueError(f"git.signing key '{s_key}' was not materialized.")
+        signing_key_name = s_key
+        raw_as = signing_cfg.get("allowedSigners") or []
+        if isinstance(raw_as, str):
+            raw_as = [raw_as]
+        for line in raw_as:
+            if isinstance(line, str) and line.strip():
+                allowed_signers_lines.append(line.strip())
+        if user_email:
+            pub_line = pub_keys.get(s_key) or derive_public_key_line(key_paths[s_key])
+            if pub_line:
+                pub_parts = pub_line.split()
+                if len(pub_parts) >= 2:
+                    auto_signer = f'{user_email} namespaces="git" {pub_parts[0]} {pub_parts[1]}'
+                    if auto_signer not in allowed_signers_lines:
+                        allowed_signers_lines.append(auto_signer)
+        if allowed_signers_lines:
+            write_agent_file(
+                GIT_ALLOWED_SIGNERS_FILE,
+                "\n".join(allowed_signers_lines) + "\n",
+                mode=0o644,
+                dir_mode=0o700,
+            )
+            expected_basenames.add("allowed_signers")
+
+    # Prune any stale managed files inside GIT_SSH_MANAGED_DIR
+    real_home = os.path.realpath(AGENT_HOME)
+    real_managed = os.path.realpath(GIT_SSH_MANAGED_DIR)
+    if real_managed.startswith(real_home + os.sep) and os.path.isdir(real_managed):
+        for entry in os.listdir(real_managed):
+            if entry not in expected_basenames:
+                remove_file_quiet(os.path.join(real_managed, entry))
+
+    global_shkc = cfg.get("strictHostKeyChecking") or ""
+    global_identities_only = bool(cfg.get("identitiesOnly", True))
+    global_forward_agent = bool(cfg.get("forwardAgent", False))
+    global_alive = cfg.get("serverAliveInterval", None)
+    global_timeout = cfg.get("connectTimeout", None)
+    global_batch = cfg.get("batchMode", True)
+
+    user_known_hosts_value = f"{os.path.join(SSH_DIR, 'known_hosts')} {GIT_KNOWN_HOSTS_FILE}"
+
+    host_names = []
+    hosts_lines = []
+    url_rewrites = []
+    for h in hosts_raw:
+        h_name = h["name"]
+        h_hostname = h["hostName"]
+        h_user = h.get("user") or "git"
+        host_names.append(h_name)
+        hosts_lines.append(f"Host {h_name}")
+        hosts_lines.append(f"  HostName {h_hostname}")
+        hosts_lines.append(f"  User {h_user}")
+        if h.get("port") is not None:
+            hosts_lines.append(f"  Port {int(h['port'])}")
+        h_key = h.get("key") or ""
+        if h_key and h_key in key_paths:
+            hosts_lines.append(f"  IdentityFile {key_paths[h_key]}")
+            if h_key in cert_paths:
+                hosts_lines.append(f"  CertificateFile {cert_paths[h_key]}")
+        if h.get("proxyJump"):
+            hosts_lines.append(f"  ProxyJump {h['proxyJump']}")
+
+        h_io = h.get("identitiesOnly")
+        eff_io = global_identities_only if h_io is None else bool(h_io)
+        hosts_lines.append(f"  IdentitiesOnly {'yes' if eff_io else 'no'}")
+
+        h_fa = h.get("forwardAgent")
+        eff_fa = global_forward_agent if h_fa is None else bool(h_fa)
+        hosts_lines.append(f"  ForwardAgent {'yes' if eff_fa else 'no'}")
+
+        host_pinned = bool(h.get("hasPinnedKnownHost")) or known_hosts_covers_host(cleaned_kh, h_hostname, h.get("port"))
+        eff_shkc = h.get("strictHostKeyChecking") or global_shkc or ("yes" if host_pinned else "accept-new")
+        hosts_lines.append(f"  StrictHostKeyChecking {eff_shkc}")
+
+        if has_known_hosts:
+            hosts_lines.append(f"  UserKnownHostsFile {user_known_hosts_value}")
+
+        eff_alive = h.get("serverAliveInterval") if h.get("serverAliveInterval") is not None else global_alive
+        if eff_alive is not None:
+            hosts_lines.append(f"  ServerAliveInterval {int(eff_alive)}")
+
+        eff_timeout = h.get("connectTimeout") if h.get("connectTimeout") is not None else global_timeout
+        if eff_timeout is not None:
+            hosts_lines.append(f"  ConnectTimeout {int(eff_timeout)}")
+
+        eff_batch = h.get("batchMode") if h.get("batchMode") is not None else global_batch
+        if eff_batch is not None:
+            hosts_lines.append(f"  BatchMode {'yes' if eff_batch else 'no'}")
+        hosts_lines.append("")
+
+        if h.get("rewriteHttpsToSsh"):
+            url_rewrites.append((h_user, h_name, h_hostname))
+
+    git_hosts_block = ""
+    if hosts_lines:
+        git_hosts_block = "\n".join([GIT_SSH_HOSTS_START] + hosts_lines[:-1] + [GIT_SSH_HOSTS_END])
+
+    update_ssh_config(git_hosts_block=git_hosts_block)
+
+    # Render managed gitconfig if any identity, signing, or URL rewrites are configured
+    gc_lines = []
+    if user_name or user_email or signing_key_name:
+        gc_lines.append("[user]")
+        if user_name:
+            gc_lines.append(f"\tname = {gitconfig_quote(user_name)}")
+        if user_email:
+            gc_lines.append(f"\temail = {gitconfig_quote(user_email)}")
+        if signing_key_name:
+            gc_lines.append(f"\tsigningkey = {gitconfig_quote(key_paths[signing_key_name])}")
+
+    if signing_key_name:
+        gc_lines.append("[gpg]")
+        gc_lines.append("\tformat = ssh")
+        if allowed_signers_lines:
+            gc_lines.append('[gpg "ssh"]')
+            gc_lines.append(f"\tallowedSignersFile = {gitconfig_quote(GIT_ALLOWED_SIGNERS_FILE)}")
+        if bool(signing_cfg.get("signCommits", True)):
+            gc_lines.append("[commit]")
+            gc_lines.append("\tgpgsign = true")
+        if bool(signing_cfg.get("signTags", False)):
+            gc_lines.append("[tag]")
+            gc_lines.append("\tgpgsign = true")
+
+    for r_user, r_alias, r_hostname in url_rewrites:
+        gc_lines.append(f'[url "ssh://{r_user}@{r_alias}/"]')
+        gc_lines.append(f"\tinsteadOf = https://{r_hostname}/")
+
+    if gc_lines:
+        gc_content = "# Auto-generated by box.ps1 seed-secrets (git) — DO NOT EDIT\n" + "\n".join(gc_lines) + "\n"
+        write_agent_file(GIT_MANAGED_CONFIG_FILE, gc_content, mode=0o600, dir_mode=0o700)
+        update_gitconfig_include(True)
+    else:
+        remove_file_quiet(GIT_MANAGED_CONFIG_FILE)
+        update_gitconfig_include(False)
+
+    return {
+        "keys": key_names,
+        "hosts": host_names,
+        "knownHostsCount": len(cleaned_kh),
+        "signingKey": signing_key_name,
+        "userEmail": user_email,
+        "managedDir": GIT_SSH_MANAGED_DIR,
+        "updatedAt": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+def clear_git(prev_meta):
+    update_ssh_config(git_hosts_block="")
+    remove_file_quiet(GIT_MANAGED_CONFIG_FILE)
+    update_gitconfig_include(False)
+    real_home = os.path.realpath(AGENT_HOME)
+    if os.path.isdir(GIT_SSH_MANAGED_DIR):
+        real_managed = os.path.realpath(GIT_SSH_MANAGED_DIR)
+        if real_managed.startswith(real_home + os.sep):
+            for entry in os.listdir(real_managed):
+                remove_file_quiet(os.path.join(real_managed, entry))
+            try:
+                os.rmdir(real_managed)
+            except OSError:
+                pass
 
 def seed_ssh(cfg, prev_meta):
     ensure_agent_dir(SSH_DIR, mode=0o700)
@@ -1066,6 +1405,7 @@ def clear_files(prev_meta):
 
 SEEDERS = {
     "github": seed_github,
+    "git": seed_git,
     "aws": seed_aws,
     "gcloud": seed_gcloud,
     "azure": seed_azure,
@@ -1082,6 +1422,7 @@ SEEDERS = {
 
 CLEARERS = {
     "github": clear_github,
+    "git": clear_git,
     "aws": clear_aws,
     "gcloud": clear_gcloud,
     "azure": clear_azure,
@@ -1119,6 +1460,10 @@ if args.status:
                 extras.append("hosts=" + ",".join(meta["hosts"]))
             if meta.get("knownHostsCount"):
                 extras.append("knownHosts=" + str(meta["knownHostsCount"]))
+            if meta.get("signingKey"):
+                extras.append("signing=" + meta["signingKey"])
+            if meta.get("userEmail"):
+                extras.append("email=" + meta["userEmail"])
             if meta.get("clientEmail"):
                 extras.append("account=" + meta["clientEmail"])
             if meta.get("server"):
