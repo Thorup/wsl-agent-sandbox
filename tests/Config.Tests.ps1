@@ -4,6 +4,7 @@ $ErrorActionPreference = 'Stop'
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $RepoRoot 'scripts\lib\Config.ps1')
+. (Join-Path $RepoRoot 'scripts\lib\Terminal.ps1')
 
 $script:Passed = 0
 $script:Failed = 0
@@ -209,6 +210,39 @@ try {
 } finally {
     if (Test-Path -LiteralPath $tmpCfgDir) {
         Remove-Item -LiteralPath $tmpCfgDir -Recurse -Force
+    }
+}
+
+# Windows Terminal profile registration tests
+$tmpWtDir = Join-Path ([System.IO.Path]::GetTempPath()) ("wsl-box-wt-test-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Path $tmpWtDir -Force | Out-Null
+try {
+    $wtSettings = Join-Path $tmpWtDir 'settings.json'
+    $initialWt = @{
+        defaultProfile = '{00000000-0000-0000-0000-000000000001}'
+        profiles = @{
+            list = @(
+                @{ guid = '{00000000-0000-0000-0000-000000000001}'; name = 'PowerShell' }
+            )
+        }
+    }
+    [System.IO.File]::WriteAllText($wtSettings, ($initialWt | ConvertTo-Json -Depth 10), (New-Object System.Text.UTF8Encoding($false)))
+
+    [void](Register-WindowsTerminalProfile -Config $baseCfg -SettingsPaths @($wtSettings))
+    [void](Register-WindowsTerminalProfile -Config $baseCfg -SettingsPaths @($wtSettings))
+    $afterAdd = Get-Content -LiteralPath $wtSettings -Raw | ConvertFrom-Json
+    $expectedGuid = Get-DeterministicTerminalProfileGuid -DistroName $baseCfg.distroName
+    $matching = @($afterAdd.profiles.list | Where-Object { $_.guid -eq $expectedGuid })
+    Assert-True "Register-WindowsTerminalProfile is idempotent (no duplicate profiles)" ($matching.Count -eq 1 -and @($afterAdd.profiles.list).Count -eq 2)
+    Assert-True "Register-WindowsTerminalProfile sets wsl.exe commandline" ($matching[0].commandline -eq "wsl.exe -d $($baseCfg.distroName) -u $($baseCfg.agentUser.name) --cd ~")
+    Assert-True "Register-WindowsTerminalProfile creates timestamped backup" (@(Get-ChildItem -Path $tmpWtDir -Filter 'settings.json.bak-*').Count -ge 1)
+
+    [void](Register-WindowsTerminalProfile -Config $baseCfg -SettingsPaths @($wtSettings) -Unregister)
+    $afterRemove = Get-Content -LiteralPath $wtSettings -Raw | ConvertFrom-Json
+    Assert-True "Register-WindowsTerminalProfile -Unregister removes managed profile cleanly" (@($afterRemove.profiles.list).Count -eq 1 -and $afterRemove.profiles.list[0].name -eq 'PowerShell')
+} finally {
+    if (Test-Path -LiteralPath $tmpWtDir) {
+        Remove-Item -LiteralPath $tmpWtDir -Recurse -Force
     }
 }
 

@@ -18,7 +18,7 @@
 #Requires -Version 5.1
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('init', 'up', 'apply', 'seed-secrets', 'clear-secrets', 'shell', 'root-shell', 'status', 'verify', 'snapshot', 'restore', 'reset', 'destroy', 'help')]
+    [ValidateSet('init', 'up', 'apply', 'seed-secrets', 'clear-secrets', 'register-terminal', 'shell', 'root-shell', 'status', 'verify', 'snapshot', 'restore', 'reset', 'destroy', 'help')]
     [string]$Command = 'help',
 
     [Parameter(Position = 1)]
@@ -42,7 +42,9 @@ param(
 
     [switch]$SaveGolden,
 
-    [switch]$Full
+    [switch]$Full,
+
+    [switch]$Unregister
 )
 
 Set-StrictMode -Version Latest
@@ -56,6 +58,7 @@ if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
 . (Join-Path $RepoRoot 'scripts\lib\Image.ps1')
 . (Join-Path $RepoRoot 'scripts\lib\Wsl.ps1')
 . (Join-Path $RepoRoot 'scripts\lib\Secrets.ps1')
+. (Join-Path $RepoRoot 'scripts\lib\Terminal.ps1')
 
 function Show-Usage {
     @"
@@ -75,6 +78,8 @@ Commands:
                      central Windows manifest (default: %USERPROFILE%\.wsl-agent-sandbox\secrets.json)
                      independently of init/apply. Supports -SecretsPath, -Service <names>, -Prune, -DryRun.
   clear-secrets      Remove managed seeded CLI credentials inside WSL (optionally scoped via -Service).
+  register-terminal  Add or update a dedicated Windows Terminal profile for this sandbox
+                     (pass -Unregister to remove it).
   shell              Open an interactive shell inside the box as the non-root agent user.
   root-shell         Open an administrative root shell (Windows host control plane only).
   status             Show distro state, systemd service health, active /shared mounts, seeded secrets, and warnings.
@@ -616,6 +621,9 @@ switch ($Command) {
     }
     'clear-secrets' {
         Invoke-ClearSecrets -Config $cfg -Service $Service
+    }
+    'register-terminal' {
+        [void](Register-WindowsTerminalProfile -Config $cfg -Unregister:$Unregister)
     }
     'shell' {
         if ($cfg.docker.enabled) {
