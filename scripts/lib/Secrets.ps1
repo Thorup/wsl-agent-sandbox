@@ -12,6 +12,7 @@ $script:SupportedSecretServices = @(
     'kubectl',
     'gemini',
     'claude',
+    'ssh',
     'env',
     'files'
 )
@@ -254,6 +255,86 @@ function Assert-SafeAgentTargetPath {
         throw "${Context}: targetPath '$TargetPath' must point to a file, not a directory."
     }
     return $normalized
+}
+
+function Resolve-SshPrivateKey {
+    param(
+        [Parameter(Mandatory)]$Object,
+        [Parameter(Mandatory)][string]$BaseDir,
+        [Parameter(Mandatory)][string]$Context,
+        [switch]$Required
+    )
+    $raw = Resolve-SecretValue -Object $Object -BaseName 'privateKey' -BaseDir $BaseDir -Context $Context -Required:$Required
+    if ([string]::IsNullOrEmpty($raw)) {
+        return ''
+    }
+    $norm = (($raw -replace "`r`n", "`n") -replace "`r", "`n").Trim("`n", "`r", ' ', "`t") + "`n"
+    if ($norm -notmatch '(?s)^-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----\n.+\n-----END [A-Z0-9 ]*PRIVATE KEY-----\n$') {
+        throw "${Context}: invalid SSH private key format (expected PEM or OpenSSH private key block starting with '-----BEGIN ... PRIVATE KEY-----')."
+    }
+    return $norm
+}
+
+function Resolve-SshPublicMaterial {
+    param(
+        [Parameter(Mandatory)]$Object,
+        [Parameter(Mandatory)][string]$BaseName,
+        [Parameter(Mandatory)][string]$BaseDir,
+        [Parameter(Mandatory)][string]$Context
+    )
+    $raw = Resolve-SecretValue -Object $Object -BaseName $BaseName -BaseDir $BaseDir -Context $Context
+    if ([string]::IsNullOrEmpty($raw)) {
+        return ''
+    }
+    $norm = (($raw -replace "`r`n", "`n") -replace "`r", "`n").Trim()
+    if ($norm -match 'PRIVATE KEY-----') {
+        throw "${Context}: '$BaseName' appears to contain a private key; use 'privateKey*' instead."
+    }
+    if ($norm.Contains("`n")) {
+        throw "${Context}: '$BaseName' must be a single-line OpenSSH public key or certificate."
+    }
+    return ($norm + "`n")
+}
+
+function Assert-SafeSshConfigValue {
+    param(
+        [Parameter(Mandatory)][string]$Value,
+        [Parameter(Mandatory)][string]$Pattern,
+        [Parameter(Mandatory)][string]$Context
+    )
+    if ($Value.Contains("`0") -or $Value.Contains("`n") -or $Value.Contains("`r")) {
+        throw "${Context}: contains invalid newline or control characters."
+    }
+    if ($Value -notmatch $Pattern) {
+        throw "${Context}: value '$Value' contains unsupported characters."
+    }
+}
+
+function Add-ValidatedKnownHostLines {
+    param(
+        [Parameter(Mandatory)][string]$RawText,
+        [Parameter(Mandatory)][string]$Context,
+        [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.List[string]]$TargetList,
+        [Parameter(Mandatory)][hashtable]$SeenSet
+    )
+    $norm = ($RawText -replace "`r`n", "`n") -replace "`r", "`n"
+    foreach ($line in ($norm -split "`n")) {
+        $trimmed = $line.Trim()
+        if ([string]::IsNullOrWhiteSpace($trimmed) -or $trimmed.StartsWith('#')) {
+            continue
+        }
+        if ($trimmed -match '[\x00-\x08\x0B-\x1F\x7F]') {
+            throw "${Context}: known_hosts entry contains invalid control characters."
+        }
+        $parts = @($trimmed -split '\s+' | Where-Object { $_ -ne '' })
+        if ($parts.Count -lt 3) {
+            throw "${Context}: invalid known_hosts entry (expected '<host> <key-type> <base64-key>')."
+        }
+        if (-not $SeenSet.ContainsKey($trimmed)) {
+            $SeenSet[$trimmed] = $true
+            $TargetList.Add($trimmed)
+        }
+    }
 }
 
 function Build-SeedSecretsPayload {
@@ -662,6 +743,293 @@ function Build-SeedSecretsPayload {
                     oauthToken = $oauthToken
                 }
                 $summary.Add("claude (apiKey=$(-not [string]::IsNullOrWhiteSpace($apiKey)), oauthToken=$(-not [string]::IsNullOrWhiteSpace($oauthToken)))")
+            }
+
+            'ssh' {
+                $keysOut = New-Object System.Collections.Generic.List[object]
+                $seenKeys = @{}
+                $hostsOut = New-Object System.Collections.Generic.List[object]
+                $seenHosts = @{}
+                $knownHostsList = New-Object System.Collections.Generic.List[string]
+                $seenKnownHosts = @{}
+
+                # 1. Named SSH keys
+                $rawKeys = Get-ObjectProperty -Object $entry -Name 'keys' -Default $null
+                if ($null -ne $rawKeys) {
+                    foreach ($k in @($rawKeys)) {
+                        if ($null -eq $k) { continue }
+                        $kName = [string](Get-ObjectProperty -Object $k -Name 'name' -Default '')
+                        if ($kName -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$') {
+                            throw "ssh.keys entry has invalid name '$kName'."
+                        }
+                        if ($kName -in @('known_hosts', 'config')) {
+                            throw "ssh.keys entry name '$kName' is reserved."
+                        }
+                        if ($seenKeys.ContainsKey($kName.ToLowerInvariant())) {
+                            throw "ssh.keys contains duplicate key name '$kName'."
+                        }
+                        $seenKeys[$kName.ToLowerInvariant()] = $kName
+                        $privKey = Resolve-SshPrivateKey -Object $k -BaseDir $baseDir -Context "ssh.keys[$kName]" -Required
+                        $pubKey = Resolve-SshPublicMaterial -Object $k -BaseName 'publicKey' -BaseDir $baseDir -Context "ssh.keys[$kName]"
+                        $cert = Resolve-SshPublicMaterial -Object $k -BaseName 'certificate' -BaseDir $baseDir -Context "ssh.keys[$kName]"
+                        $keysOut.Add([ordered]@{
+                            name        = $kName
+                            privateKey  = $privKey
+                            publicKey   = $pubKey
+                            certificate = $cert
+                        })
+                    }
+                }
+
+                # 2. Top-level defaults & validation
+                $defaultKey = [string](Get-ObjectProperty -Object $entry -Name 'defaultKey' -Default '')
+                if (-not [string]::IsNullOrWhiteSpace($defaultKey)) {
+                    if (-not $seenKeys.ContainsKey($defaultKey.ToLowerInvariant())) {
+                        throw "ssh.defaultKey '$defaultKey' does not match any key defined in ssh.keys."
+                    }
+                    $defaultKey = $seenKeys[$defaultKey.ToLowerInvariant()]
+                }
+
+                $strictHostKeyChecking = [string](Get-ObjectProperty -Object $entry -Name 'strictHostKeyChecking' -Default '')
+                if (-not [string]::IsNullOrWhiteSpace($strictHostKeyChecking) -and $strictHostKeyChecking -notin @('yes', 'accept-new', 'no')) {
+                    throw "ssh.strictHostKeyChecking '$strictHostKeyChecking' must be 'yes', 'accept-new', or 'no'."
+                }
+
+                $identitiesOnly = [bool](Get-ObjectProperty -Object $entry -Name 'identitiesOnly' -Default $true)
+                $forwardAgent = [bool](Get-ObjectProperty -Object $entry -Name 'forwardAgent' -Default $false)
+
+                $serverAliveInterval = Get-ObjectProperty -Object $entry -Name 'serverAliveInterval' -Default $null
+                if ($null -ne $serverAliveInterval) {
+                    $aliveVal = [int]$serverAliveInterval
+                    if ($aliveVal -lt 0 -or $aliveVal -gt 3600) {
+                        throw "ssh.serverAliveInterval ($aliveVal) must be between 0 and 3600."
+                    }
+                    $serverAliveInterval = $aliveVal
+                }
+
+                $connectTimeout = Get-ObjectProperty -Object $entry -Name 'connectTimeout' -Default $null
+                if ($null -ne $connectTimeout) {
+                    $toVal = [int]$connectTimeout
+                    if ($toVal -lt 1 -or $toVal -gt 600) {
+                        throw "ssh.connectTimeout ($toVal) must be between 1 and 600."
+                    }
+                    $connectTimeout = $toVal
+                }
+
+                $batchMode = $null
+                if (Test-ObjectHasProperty -Object $entry -Name 'batchMode') {
+                    $bmRaw = Get-ObjectProperty -Object $entry -Name 'batchMode' -Default $null
+                    if ($null -ne $bmRaw) {
+                        $batchMode = [bool]$bmRaw
+                    }
+                }
+
+                # 3. Top-level knownHosts & knownHostsFile
+                $rawKnownHosts = Get-ObjectProperty -Object $entry -Name 'knownHosts' -Default $null
+                if ($null -ne $rawKnownHosts) {
+                    foreach ($kh in @($rawKnownHosts)) {
+                        if ($null -eq $kh) { continue }
+                        Add-ValidatedKnownHostLines -RawText ([string]$kh) -Context 'ssh.knownHosts' -TargetList $knownHostsList -SeenSet $seenKnownHosts
+                    }
+                }
+                $knownHostsFile = [string](Get-ObjectProperty -Object $entry -Name 'knownHostsFile' -Default '')
+                if (-not [string]::IsNullOrWhiteSpace($knownHostsFile)) {
+                    $khContent = Resolve-SecretFileContent -RawPath $knownHostsFile -BaseDir $baseDir -Context 'ssh.knownHostsFile'
+                    Add-ValidatedKnownHostLines -RawText $khContent -Context 'ssh.knownHostsFile' -TargetList $knownHostsList -SeenSet $seenKnownHosts
+                }
+
+                # 4. Remote server Host entries
+                $rawHosts = Get-ObjectProperty -Object $entry -Name 'hosts' -Default $null
+                if ($null -ne $rawHosts) {
+                    foreach ($h in @($rawHosts)) {
+                        if ($null -eq $h) { continue }
+                        $hName = [string](Get-ObjectProperty -Object $h -Name 'name' -Default '')
+                        if ([string]::IsNullOrWhiteSpace($hName)) {
+                            throw "ssh.hosts entry is missing required 'name'."
+                        }
+                        Assert-SafeSshConfigValue -Value $hName -Pattern '^[A-Za-z0-9._*?@:-]+$' -Context "ssh.hosts[$hName].name"
+                        if ($hName -eq '*') {
+                            throw "ssh.hosts entry name cannot be '*' (use top-level ssh.defaultKey and ssh defaults instead)."
+                        }
+                        if ($seenHosts.ContainsKey($hName.ToLowerInvariant())) {
+                            throw "ssh.hosts contains duplicate host name '$hName'."
+                        }
+                        $seenHosts[$hName.ToLowerInvariant()] = $true
+
+                        $hostName = [string](Get-ObjectProperty -Object $h -Name 'hostName' -Default '')
+                        if ([string]::IsNullOrWhiteSpace($hostName)) {
+                            throw "ssh.hosts[$hName].hostName is required."
+                        }
+                        Assert-SafeSshConfigValue -Value $hostName -Pattern '^[A-Za-z0-9._:%\[\]-]+$' -Context "ssh.hosts[$hName].hostName"
+
+                        $hUser = [string](Get-ObjectProperty -Object $h -Name 'user' -Default '')
+                        if (-not [string]::IsNullOrWhiteSpace($hUser)) {
+                            Assert-SafeSshConfigValue -Value $hUser -Pattern '^[A-Za-z0-9._@+-]+$' -Context "ssh.hosts[$hName].user"
+                        }
+
+                        $hPort = $null
+                        if (Test-ObjectHasProperty -Object $h -Name 'port') {
+                            $pRaw = Get-ObjectProperty -Object $h -Name 'port' -Default $null
+                            if ($null -ne $pRaw) {
+                                $pInt = [int]$pRaw
+                                if ($pInt -lt 1 -or $pInt -gt 65535) {
+                                    throw "ssh.hosts[$hName].port ($pInt) must be between 1 and 65535."
+                                }
+                                $hPort = $pInt
+                            }
+                        }
+
+                        $hKeyRef = [string](Get-ObjectProperty -Object $h -Name 'key' -Default '')
+                        $hInlinePriv = Resolve-SshPrivateKey -Object $h -BaseDir $baseDir -Context "ssh.hosts[$hName]"
+                        $hInlinePub = Resolve-SshPublicMaterial -Object $h -BaseName 'publicKey' -BaseDir $baseDir -Context "ssh.hosts[$hName]"
+                        $hInlineCert = Resolve-SshPublicMaterial -Object $h -BaseName 'certificate' -BaseDir $baseDir -Context "ssh.hosts[$hName]"
+
+                        $hasKeyRef = -not [string]::IsNullOrWhiteSpace($hKeyRef)
+                        $hasInlinePriv = -not [string]::IsNullOrWhiteSpace($hInlinePriv)
+
+                        if ($hasKeyRef -and $hasInlinePriv) {
+                            throw "ssh.hosts[$hName]: specify either 'key' or 'privateKey*', not both."
+                        }
+                        if ((-not $hasInlinePriv) -and ((-not [string]::IsNullOrWhiteSpace($hInlinePub)) -or (-not [string]::IsNullOrWhiteSpace($hInlineCert)))) {
+                            throw "ssh.hosts[$hName]: 'publicKey*' and 'certificate*' on a host require an inline 'privateKey*' (or configure them on the named key in ssh.keys)."
+                        }
+
+                        $resolvedKeyName = ''
+                        if ($hasKeyRef) {
+                            if (-not $seenKeys.ContainsKey($hKeyRef.ToLowerInvariant())) {
+                                throw "ssh.hosts[$hName].key '$hKeyRef' does not match any key defined in ssh.keys."
+                            }
+                            $resolvedKeyName = $seenKeys[$hKeyRef.ToLowerInvariant()]
+                        } elseif ($hasInlinePriv) {
+                            $safeBase = 'host-' + (($hName -replace '[^A-Za-z0-9._-]', '_').Trim('_'))
+                            if ($safeBase.Length -gt 55) {
+                                $safeBase = $safeBase.Substring(0, 55)
+                            }
+                            $candidate = $safeBase
+                            $suffix = 2
+                            while ($seenKeys.ContainsKey($candidate.ToLowerInvariant())) {
+                                $candidate = "${safeBase}-${suffix}"
+                                $suffix++
+                            }
+                            $seenKeys[$candidate.ToLowerInvariant()] = $candidate
+                            $keysOut.Add([ordered]@{
+                                name        = $candidate
+                                privateKey  = $hInlinePriv
+                                publicKey   = $hInlinePub
+                                certificate = $hInlineCert
+                            })
+                            $resolvedKeyName = $candidate
+                        }
+
+                        $hProxyJump = [string](Get-ObjectProperty -Object $h -Name 'proxyJump' -Default '')
+                        if (-not [string]::IsNullOrWhiteSpace($hProxyJump)) {
+                            Assert-SafeSshConfigValue -Value $hProxyJump -Pattern '^[A-Za-z0-9._@:%\[\],-]+$' -Context "ssh.hosts[$hName].proxyJump"
+                        }
+
+                        $hShkc = [string](Get-ObjectProperty -Object $h -Name 'strictHostKeyChecking' -Default '')
+                        if (-not [string]::IsNullOrWhiteSpace($hShkc) -and $hShkc -notin @('yes', 'accept-new', 'no')) {
+                            throw "ssh.hosts[$hName].strictHostKeyChecking '$hShkc' must be 'yes', 'accept-new', or 'no'."
+                        }
+
+                        $hIdentitiesOnly = $null
+                        if (Test-ObjectHasProperty -Object $h -Name 'identitiesOnly') {
+                            $v = Get-ObjectProperty -Object $h -Name 'identitiesOnly' -Default $null
+                            if ($null -ne $v) { $hIdentitiesOnly = [bool]$v }
+                        }
+
+                        $hForwardAgent = $null
+                        if (Test-ObjectHasProperty -Object $h -Name 'forwardAgent') {
+                            $v = Get-ObjectProperty -Object $h -Name 'forwardAgent' -Default $null
+                            if ($null -ne $v) { $hForwardAgent = [bool]$v }
+                        }
+
+                        $hAlive = $null
+                        if (Test-ObjectHasProperty -Object $h -Name 'serverAliveInterval') {
+                            $v = Get-ObjectProperty -Object $h -Name 'serverAliveInterval' -Default $null
+                            if ($null -ne $v) {
+                                $aInt = [int]$v
+                                if ($aInt -lt 0 -or $aInt -gt 3600) {
+                                    throw "ssh.hosts[$hName].serverAliveInterval ($aInt) must be between 0 and 3600."
+                                }
+                                $hAlive = $aInt
+                            }
+                        }
+
+                        $hTimeout = $null
+                        if (Test-ObjectHasProperty -Object $h -Name 'connectTimeout') {
+                            $v = Get-ObjectProperty -Object $h -Name 'connectTimeout' -Default $null
+                            if ($null -ne $v) {
+                                $tInt = [int]$v
+                                if ($tInt -lt 1 -or $tInt -gt 600) {
+                                    throw "ssh.hosts[$hName].connectTimeout ($tInt) must be between 1 and 600."
+                                }
+                                $hTimeout = $tInt
+                            }
+                        }
+
+                        $hBatch = $null
+                        if (Test-ObjectHasProperty -Object $h -Name 'batchMode') {
+                            $v = Get-ObjectProperty -Object $h -Name 'batchMode' -Default $null
+                            if ($null -ne $v) { $hBatch = [bool]$v }
+                        }
+
+                        $hKnownHost = [string](Get-ObjectProperty -Object $h -Name 'knownHost' -Default '')
+                        if (-not [string]::IsNullOrWhiteSpace($hKnownHost)) {
+                            Add-ValidatedKnownHostLines -RawText $hKnownHost -Context "ssh.hosts[$hName].knownHost" -TargetList $knownHostsList -SeenSet $seenKnownHosts
+                        }
+                        $hKnownHostFile = [string](Get-ObjectProperty -Object $h -Name 'knownHostFile' -Default '')
+                        if (-not [string]::IsNullOrWhiteSpace($hKnownHostFile)) {
+                            $hkhContent = Resolve-SecretFileContent -RawPath $hKnownHostFile -BaseDir $baseDir -Context "ssh.hosts[$hName].knownHostFile"
+                            Add-ValidatedKnownHostLines -RawText $hkhContent -Context "ssh.hosts[$hName].knownHostFile" -TargetList $knownHostsList -SeenSet $seenKnownHosts
+                        }
+
+                        $hostsOut.Add([ordered]@{
+                            name                  = $hName
+                            hostName              = $hostName
+                            user                  = $hUser
+                            port                  = $hPort
+                            key                   = $resolvedKeyName
+                            proxyJump             = $hProxyJump
+                            identitiesOnly        = $hIdentitiesOnly
+                            forwardAgent          = $hForwardAgent
+                            strictHostKeyChecking = $hShkc
+                            serverAliveInterval   = $hAlive
+                            connectTimeout        = $hTimeout
+                            batchMode             = $hBatch
+                        })
+                    }
+                }
+
+                if ($keysOut.Count -eq 0 -and $hostsOut.Count -eq 0 -and $knownHostsList.Count -eq 0) {
+                    throw "ssh: specify at least one of 'keys', 'hosts', 'knownHosts', or 'knownHostsFile'."
+                }
+
+                $resolvedServices['ssh'] = [ordered]@{
+                    keys                  = @($keysOut.ToArray())
+                    hosts                 = @($hostsOut.ToArray())
+                    knownHosts            = @($knownHostsList.ToArray())
+                    defaultKey            = $defaultKey
+                    strictHostKeyChecking = $strictHostKeyChecking
+                    identitiesOnly        = $identitiesOnly
+                    forwardAgent          = $forwardAgent
+                    serverAliveInterval   = $serverAliveInterval
+                    connectTimeout        = $connectTimeout
+                    batchMode             = $batchMode
+                }
+
+                $sumParts = New-Object System.Collections.Generic.List[string]
+                if ($keysOut.Count -gt 0) {
+                    $kNames = ($keysOut | ForEach-Object { $_.name }) -join ', '
+                    $sumParts.Add("keys=$kNames")
+                }
+                if ($hostsOut.Count -gt 0) {
+                    $hNames = ($hostsOut | ForEach-Object { $_.name }) -join ', '
+                    $sumParts.Add("hosts=$hNames")
+                }
+                if ($knownHostsList.Count -gt 0) {
+                    $sumParts.Add("knownHosts=$($knownHostsList.Count)")
+                }
+                $summary.Add("ssh ($($sumParts -join '; '))")
             }
 
             'env' {

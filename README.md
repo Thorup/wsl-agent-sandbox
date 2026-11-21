@@ -170,8 +170,14 @@ Manifest path resolution priority:
 | `kubectl` | `kubectl` | Dedicated kubeconfig file OR Service Account bearer token → `~/.kube/config` + optional context switch. |
 | `gemini` | `gemini` | `GEMINI_API_KEY` and/or Vertex AI variables (`GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION`, `GOOGLE_GENAI_USE_VERTEXAI`). |
 | `claude` | `claude` | `ANTHROPIC_API_KEY` and/or `CLAUDE_CODE_OAUTH_TOKEN`. |
+| `ssh` | `ssh` / `scp` / `sftp` / `git` | Named SSH private keys (plus optional `.pub` & OpenSSH user `-cert.pub` certificates) → `~/.ssh/wsl-agent-sandbox/` (`0600`), marker-delimited `Host` stanzas & optional `defaultKey` in `~/.ssh/config`, and pinned `known_hosts`. |
 | `env` | Any CLI | Additional custom token environment variables exported into `~/.config/wsl-agent-sandbox/secrets.env` (protected system vars like `PATH`/`DOCKER_HOST`/`LD_PRELOAD` are rejected). |
 | `files` | Any CLI | Additional secret files (e.g., `~/.npmrc`, `~/.netrc`) copied atomically with `0600` strictly inside `/home/<agent>/`. |
+
+> **SSH Remote Server Access Notes**:
+> - Rotate or revoke agent SSH keys at any time with `.\box.ps1 seed-secrets -Service ssh` or `.\box.ps1 clear-secrets -Service ssh`. Managed keys live strictly in `~/.ssh/wsl-agent-sandbox/` and `~/.ssh/config` uses marker-delimited blocks, so manual user keys and custom `~/.ssh/config` entries are never overwritten; stale managed keys are automatically pruned on rotation.
+> - Use dedicated, least-privilege remote accounts and passphrase-less deploy keys (or short-lived OpenSSH user certificates via `certificate`/`certificateFile`) with pinned `knownHosts` / `knownHost` entries. `StrictHostKeyChecking` defaults to `yes` when pinned known hosts are provided, or `accept-new` otherwise.
+> - `seed-secrets` never weakens `box.json` network isolation: public remote SSH servers work out of the box, while RFC1918 / LAN / Tailscale targets (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10`) remain governed by `network.blockHostAndLan` and `network.blockedCidrs` in `box.json` (or reachable via a public `proxyJump` bastion / `allowedHostPorts` tunnel).
 
 > **Security Guarantees**: Your central Windows secrets folder is **never** mounted into WSL (`/shared` or `/mnt/c`) and **never** written to `box.json` or `/etc/wsl-agent-sandbox/policy.json`. Windows resolves file/env references locally, pipes the payload strictly over `stdin` to the root control plane (`wsl -u root`), writes all files atomically with `0600` permissions owned by `agent:agent`, redacts secret strings from any error output, and automatically loads `~/.config/wsl-agent-sandbox/secrets.env` in agent shells.
 
