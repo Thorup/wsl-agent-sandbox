@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "Ubuntu 26.04 WSL Agent Box Configuration",
+  "title": "wsl-agent-sandbox Configuration (Hardened Ubuntu 26.04 LTS WSL2 Sandbox)",
   "type": "object",
   "required": [
     "distroName",

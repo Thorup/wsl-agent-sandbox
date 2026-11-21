@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-POLICY_FILE="/etc/ubuntu-agent-box/policy.json"
+POLICY_FILE="/etc/wsl-agent-sandbox/policy.json"
 
 log() {
   echo "[install-tools] $*"

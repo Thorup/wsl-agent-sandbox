@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-POLICY_FILE="/etc/ubuntu-agent-box/policy.json"
+POLICY_FILE="/etc/wsl-agent-sandbox/policy.json"
 PROXY_SRC_DIR="/usr/local/src/docker-policy-proxy"
 PROXY_BIN="/usr/local/libexec/docker-policy-proxy"
 
@@ -26,9 +26,9 @@ apt-get update -y
 apt-get install -y --no-install-recommends python3 jq ca-certificates curl gnupg
 
 # Read config values via python3
-AGENT_NAME="$(python3 -c 'import json; d=json.load(open("/etc/ubuntu-agent-box/policy.json")); print(d["agentUser"]["name"])')"
-AGENT_UID="$(python3 -c 'import json; d=json.load(open("/etc/ubuntu-agent-box/policy.json")); print(d["agentUser"]["uid"])')"
-AGENT_GID="$(python3 -c 'import json; d=json.load(open("/etc/ubuntu-agent-box/policy.json")); print(d["agentUser"]["gid"])')"
+AGENT_NAME="$(python3 -c 'import json; d=json.load(open("/etc/wsl-agent-sandbox/policy.json")); print(d["agentUser"]["name"])')"
+AGENT_UID="$(python3 -c 'import json; d=json.load(open("/etc/wsl-agent-sandbox/policy.json")); print(d["agentUser"]["uid"])')"
+AGENT_GID="$(python3 -c 'import json; d=json.load(open("/etc/wsl-agent-sandbox/policy.json")); print(d["agentUser"]["gid"])')"
 
 log "Configuring /etc/wsl.conf (automount=false, interop=false, systemd=true, default=${AGENT_NAME})..."
 cat >/etc/wsl.conf <<EOF
@@ -79,7 +79,7 @@ if [[ -f /usr/bin/sudo ]]; then
 fi
 
 log "Installing configured apt packages..."
-mapfile -t APT_PKGS < <(python3 -c 'import json; d=json.load(open("/etc/ubuntu-agent-box/policy.json")); print("\n".join(d["packages"].get("apt", [])))')
+mapfile -t APT_PKGS < <(python3 -c 'import json; d=json.load(open("/etc/wsl-agent-sandbox/policy.json")); print("\n".join(d["packages"].get("apt", [])))')
 if [[ "${#APT_PKGS[@]}" -gt 0 ]]; then
   apt-get install -y --no-install-recommends "${APT_PKGS[@]}"
 fi
@@ -107,7 +107,7 @@ fi
 
 # Configure agent shell environment (strip WSLg/interop vars, point DOCKER_HOST to policy proxy)
 cat >/etc/profile.d/99-agent-box.sh <<'EOF'
-# Hardened Ubuntu WSL Agent Box environment
+# wsl-agent-sandbox environment
 unset DISPLAY WAYLAND_DISPLAY PULSE_SERVER WSL_INTEROP
 export DOCKER_HOST="unix:///run/docker-policy/docker.sock"
 export DOTNET_ROOT="/usr/local/share/dotnet"
@@ -120,7 +120,7 @@ AGENT_BASHRC="/home/${AGENT_NAME}/.bashrc"
 if ! grep -q "99-agent-box.sh" "${AGENT_BASHRC}" 2>/dev/null; then
   cat >>"${AGENT_BASHRC}" <<'EOF'
 
-# Source agent box environment
+# Source wsl-agent-sandbox environment
 if [ -f /etc/profile.d/99-agent-box.sh ]; then
   . /etc/profile.d/99-agent-box.sh
 fi

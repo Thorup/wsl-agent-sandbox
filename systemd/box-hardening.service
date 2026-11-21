@@ -1,5 +1,5 @@
 [Unit]
-Description=Ubuntu WSL Agent Box Per-Distro Hardening, Mounts, and Firewall
+Description=wsl-agent-sandbox Per-Distro Hardening, Mounts, and Firewall
 DefaultDependencies=no
 After=local-fs.target network-online.target
 Before=systemd-user-sessions.service docker-policy-proxy.service

@@ -140,7 +140,7 @@ function Sync-DockerDesktopSocketBridge {
     .SYNOPSIS
         Bridges Docker Desktop's Linux Engine socket (/tmp/docker-desktop-root/run/docker.sock)
         into the root-only 0700 shared path /mnt/host/wsl/box-binds/dd-upstream.sock so
-        docker-policy-proxy inside ubuntu-2604-agent can connect without enabling Docker Desktop
+        docker-policy-proxy inside wsl-agent-sandbox can connect without enabling Docker Desktop
         WSL Integration on the agent distro.
     #>
     if (-not (Test-WslDistroExists -DistroName 'docker-desktop')) {
@@ -160,8 +160,8 @@ function Sync-DockerDesktopSocketBridge {
         $dockerExe = Get-Command docker.exe -ErrorAction SilentlyContinue
         if ($dockerExe) {
             Write-Host "[docker-bridge] Waking Docker Desktop Linux engine from Resource Saver mode..."
-            & $dockerExe.Source network create __ubuntu_box_wake 2>$null | Out-Null
-            & $dockerExe.Source network rm __ubuntu_box_wake 2>$null | Out-Null
+            & $dockerExe.Source network create __wsl_agent_sandbox_wake 2>$null | Out-Null
+            & $dockerExe.Source network rm __wsl_agent_sandbox_wake 2>$null | Out-Null
             Start-Sleep -Seconds 1
         }
         $hasSock = (& wsl.exe -d docker-desktop -- sh -c '[ -S /tmp/docker-desktop-root/run/docker.sock ] && echo YES || echo NO' 2>$null | Out-String).Trim()

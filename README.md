@@ -4,7 +4,7 @@
 
 # `wsl-agent-sandbox` — Hardened Ubuntu 26.04 LTS WSL2 Sandbox for Autonomous AI Agents
 
-A declaratively configured, isolated **Ubuntu 26.04 LTS (Resolute Raccoon)** WSL2 distribution (`ubuntu-2604-agent`) where autonomous AI coding agents (**Gemini CLI**, **Claude Code**, **Codex**, **Antigravity / VS Code Remote-WSL**, or custom agents) can run freely inside Linux while being **strictly contained from accessing your underlying Windows host**, with explicit Windows-side control over every bridge.
+A declaratively configured, isolated **Ubuntu 26.04 LTS (Resolute Raccoon)** WSL2 distribution (`wsl-agent-sandbox`) where autonomous AI coding agents (**Gemini CLI**, **Claude Code**, **Codex**, **Antigravity / VS Code Remote-WSL**, or custom agents) can run freely inside Linux while being **strictly contained from accessing your underlying Windows host**, with explicit Windows-side control over every bridge.
 
 ---
 
@@ -108,21 +108,21 @@ Because every containment boundary (non-root UID `26040`, no `sudo`, no `/mnt/c`
 - **Claude Code** (`claude` — pre-installed by default; toggle `installClaudeCode` in `box.json`)
 - **OpenAI Codex CLI**, **Aider**, **OpenCode**, or custom agents (installable via `npm`/`uv` in user-space or via `box.json`)
 
-> **Cloud Credentials Note**: Any credentials you configure inside `/home/agent` (`~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.config/gh`, `~/.config/.jira`, `~/.kube/config`) are accessible to autonomous agents running in this box. Use dedicated, least-privilege sandbox accounts/clusters or short-lived tokens rather than production admin credentials.
+> **Cloud Credentials Note**: Any credentials you configure inside `/home/agent` (`~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.config/gh`, `~/.config/.jira`, `~/.config/upctl.yaml`, `~/.kube/config`) are accessible to autonomous agents running in this box. Use dedicated, least-privilege sandbox accounts/clusters or short-lived tokens rather than production admin credentials.
 
 ---
 
 ## Connecting Antigravity / VS Code Remote-WSL
 
 1. Launch Antigravity / VS Code **from Windows**.
-2. Connect via **Remote - WSL** to distro `ubuntu-2604-agent`.
+2. Connect via **Remote - WSL** to distro `wsl-agent-sandbox`.
 3. Modern Remote-WSL uses script-less startup and works cleanly with `[interop] enabled=false` and `[automount] enabled=false`.
 
 ---
 
 ## Important Security Notes
 
-1. **Keep Docker Desktop "WSL Integration" OFF for `ubuntu-2604-agent`**: Do not toggle `ubuntu-2604-agent` on in Docker Desktop's WSL Integration settings. Our root-owned `docker-policy-proxy` already connects to Docker Desktop cleanly while preventing raw socket exposure.
+1. **Keep Docker Desktop "WSL Integration" OFF for `wsl-agent-sandbox`**: Do not toggle `wsl-agent-sandbox` on in Docker Desktop's WSL Integration settings. Our root-owned `docker-policy-proxy` already connects to Docker Desktop cleanly while preventing raw socket exposure.
 2. **Docker Desktop Container Bridge Egress**: While direct WSL processes (`agent` UID `26040`) are blocked from reaching Windows host ports by `nftables`, and containers cannot use `--network=host` or `--add-host=...:host-gateway`, containers running inside Docker Desktop's own bridge network can still resolve `host.docker.internal` unless restricted via Windows Firewall. Filesystem and privilege escapes via Docker are fully blocked by `docker-policy-proxy`.
 3. **Global `.wslconfig` (`networkingMode`)**: `wsl-agent-sandbox` works cleanly in **both** `networkingMode=nat` and `networkingMode=mirrored` without modifying your global `%USERPROFILE%\.wslconfig`. In `networkingMode=mirrored`, `box-hardening.sh` installs per-UID (`uidrange 26040-26040`) policy routing + `nftables` `ct mark 0x2604` rules on `loopback0` so `agent` is blocked from reaching Windows `127.0.0.1` ports while Windows → WSL `localhost` web browsing and WSL-internal `127.0.0.1` services continue working seamlessly.
 
@@ -131,7 +131,8 @@ Because every containment boundary (non-root UID `26040`, no `sudo`, no `/mnt/c`
 ## Lifecycle Commands
 
 - `.\box.ps1 init` — Full download (with SHA256 verification), import, provision, harden, verify.
-- `.\box.ps1 apply` — Hot-reload `box.json` changes (mounts, ports, Docker policy, `apt` packages).
+- `.\box.ps1 up` — Ensure the distro is running and systemd hardening services are active (runs `init` if not installed).
+- `.\box.ps1 apply` — Hot-reload `box.json` changes (mounts, ports, Docker policy, `apt` packages, CLI/language toolchains); pass `-RebuildProxy` to rebuild `docker-policy-proxy`.
 - `.\box.ps1 verify` — Run full red-team isolation audit + Windows ↔ WSL `localhost` web test.
 - `.\box.ps1 status` — Inspect systemd services, active `/shared` mounts, and `nftables` rules.
 - `.\box.ps1 shell` / `.\box.ps1 root-shell` — Open agent shell or Windows-side admin root shell.

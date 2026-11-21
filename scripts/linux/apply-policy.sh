@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-POLICY_FILE="/etc/ubuntu-agent-box/policy.json"
+POLICY_FILE="/etc/wsl-agent-sandbox/policy.json"
 
 log() {
   echo "[apply-policy] $*"
@@ -16,7 +16,7 @@ log "Re-applying mounts, Docker bind mirrors, docker-policy.json, and nftables..
 /usr/local/sbin/box-hardening.sh
 
 # Install any newly added apt packages from policy.json
-mapfile -t APT_PKGS < <(python3 -c 'import json; d=json.load(open("/etc/ubuntu-agent-box/policy.json")); print("\n".join(d["packages"].get("apt", [])))')
+mapfile -t APT_PKGS < <(python3 -c 'import json; d=json.load(open("/etc/wsl-agent-sandbox/policy.json")); print("\n".join(d["packages"].get("apt", [])))')
 MISSING=()
 for pkg in "${APT_PKGS[@]}"; do
   if ! dpkg -s "${pkg}" >/dev/null 2>&1; then
@@ -37,7 +37,7 @@ fi
 
 # Keep shell profile and /etc/environment in sync
 cat >/etc/profile.d/99-agent-box.sh <<'EOF'
-# Hardened Ubuntu WSL Agent Box environment
+# wsl-agent-sandbox environment
 unset DISPLAY WAYLAND_DISPLAY PULSE_SERVER WSL_INTEROP
 export DOCKER_HOST="unix:///run/docker-policy/docker.sock"
 export DOTNET_ROOT="/usr/local/share/dotnet"
@@ -51,7 +51,7 @@ DOCKER_HOST="unix:///run/docker-policy/docker.sock"
 DOTNET_ROOT="/usr/local/share/dotnet"
 EOF
 
-DOCKER_ENABLED="$(python3 -c 'import json; d=json.load(open("/etc/ubuntu-agent-box/policy.json")); print("1" if d["docker"].get("enabled", True) else "0")')"
+DOCKER_ENABLED="$(python3 -c 'import json; d=json.load(open("/etc/wsl-agent-sandbox/policy.json")); print("1" if d["docker"].get("enabled", True) else "0")')"
 
 if pidof systemd >/dev/null 2>&1; then
   systemctl daemon-reload

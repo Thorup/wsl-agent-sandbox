@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-POLICY_FILE="/etc/ubuntu-agent-box/policy.json"
-HOST_IPS_FILE="/etc/ubuntu-agent-box/host_ips.txt"
-DOCKER_POLICY_FILE="/etc/ubuntu-agent-box/docker-policy.json"
-NFT_CONF_FILE="/etc/ubuntu-agent-box/nftables.conf"
+POLICY_FILE="/etc/wsl-agent-sandbox/policy.json"
+HOST_IPS_FILE="/etc/wsl-agent-sandbox/host_ips.txt"
+DOCKER_POLICY_FILE="/etc/wsl-agent-sandbox/docker-policy.json"
+NFT_CONF_FILE="/etc/wsl-agent-sandbox/nftables.conf"
 BOX_ROOT="/run/box-root"
 PRIVATE_WSL_MNT="${BOX_ROOT}/mnt-wsl"
 
@@ -236,7 +236,7 @@ with open(docker_policy_file, "w", encoding="utf-8") as f:
     json.dump(compiled_docker_policy, f, indent=2)
 os.chmod(docker_policy_file, 0o600)
 
-# --- C. Per-UID nftables firewall (table inet ubuntu_agent_box) ---
+# --- C. Per-UID nftables firewall (table inet wsl_agent_sandbox) ---
 dns_v4, dns_v6 = set(), set()
 if os.path.isfile("/etc/resolv.conf"):
     with open("/etc/resolv.conf", "r", encoding="utf-8") as f:
@@ -321,7 +321,7 @@ def sync_mirrored_ip_rules(enable):
 sync_mirrored_ip_rules(has_loopback0 and block_host_and_lan)
 
 lines = [
-    "table inet ubuntu_agent_box {",
+    "table inet wsl_agent_sandbox {",
 ]
 
 if has_loopback0 and block_host_and_lan:
@@ -405,11 +405,12 @@ with open(nft_conf_file, "w", encoding="utf-8") as f:
 os.chmod(nft_conf_file, 0o600)
 
 # Replace ONLY our table so Docker / other distros are never disrupted.
+run(["nft", "delete", "table", "inet", "wsl_agent_sandbox"], check=False)
 run(["nft", "delete", "table", "inet", "ubuntu_agent_box"], check=False)
 res = run(["nft", "-f", nft_conf_file], check=False)
 if res.returncode != 0:
     print(f"[box-hardening] ERROR loading nftables: {res.stderr}", file=sys.stderr)
     sys.exit(1)
 
-print(f"[box-hardening] Loaded nftables table inet ubuntu_agent_box for UID {agent_uid} (blockHostAndLan={block_host_and_lan}).")
+print(f"[box-hardening] Loaded nftables table inet wsl_agent_sandbox for UID {agent_uid} (blockHostAndLan={block_host_and_lan}).")
 PYEOF
