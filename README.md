@@ -93,7 +93,7 @@ Use this table to determine what can reach a port forwarded to your Windows clie
    - **NAT mode (default WSL2):** Windows `127.0.0.1` is not routed into WSL NAT, so bind the forward to your Windows host/WSL interface (e.g., `kubectl port-forward --address 0.0.0.0 ... 8080:<target>` or the `vEthernet (WSL)` IP), allow the port through Windows Firewall if prompted, and connect from WSL to the Windows host gateway IP (`ip route show default | awk '{print $3}'`).
 
 ### Add System `apt` Packages & Cloud/Agent/Language Toolchains
-Add package names to `packages.apt` or toggle built-in installers (`installKubectl`, `installAwsCli`, `installGcloudCli`, `installUpctl`, `installDotnetSdk`, `installRust`, `installGeminiCli`, `installClaudeCode`) in `box.json` and run `.\box.ps1 apply`. (User-space tools via `uv`, `pip`, `npm`, `pnpm`, `cargo`, `rustup`, and `dotnet tool install -g` can be installed freely by the agent inside `/home/agent` without `sudo`.)
+Add package names to `packages.apt` or toggle built-in installers (`installKubectl`, `installAwsCli`, `installGcloudCli`, `installAzureCli`, `installAzureDevopsCli`, `installGithubCli`, `installJiraCli`, `installUpctl`, `installDotnetSdk`, `installRust`, `installGeminiCli`, `installClaudeCode`) in `box.json` and run `.\box.ps1 apply`. (User-space tools via `uv`, `pip`, `npm`, `pnpm`, `cargo`, `rustup`, and `dotnet tool install -g` can be installed freely by the agent inside `/home/agent` without `sudo`.)
 
 ---
 
@@ -104,7 +104,7 @@ Because every containment boundary (non-root UID `26040`, no `sudo`, no `/mnt/c`
 - **Claude Code** (`claude` — pre-installed by default; toggle `installClaudeCode` in `box.json`)
 - **OpenAI Codex CLI**, **Aider**, **OpenCode**, or custom agents (installable via `npm`/`uv` in user-space or via `box.json`)
 
-> **Cloud Credentials Note**: Any credentials you configure inside `/home/agent` (`~/.aws`, `~/.config/gcloud`, `~/.kube/config`) are accessible to autonomous agents running in this box. Use dedicated, least-privilege sandbox accounts/clusters or short-lived tokens rather than production admin credentials.
+> **Cloud Credentials Note**: Any credentials you configure inside `/home/agent` (`~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.config/gh`, `~/.config/.jira`, `~/.kube/config`) are accessible to autonomous agents running in this box. Use dedicated, least-privilege sandbox accounts/clusters or short-lived tokens rather than production admin credentials.
 
 ---
 

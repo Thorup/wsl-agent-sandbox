@@ -189,6 +189,10 @@
         "installKubectl": { "type": "boolean" },
         "installAwsCli": { "type": "boolean" },
         "installGcloudCli": { "type": "boolean" },
+        "installAzureCli": { "type": "boolean" },
+        "installAzureDevopsCli": { "type": "boolean" },
+        "installGithubCli": { "type": "boolean" },
+        "installJiraCli": { "type": "boolean" },
         "installUpctl": { "type": "boolean" },
         "installDotnetSdk": { "type": "boolean" },
         "installRust": { "type": "boolean" }

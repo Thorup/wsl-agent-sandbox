@@ -29,6 +29,10 @@ INSTALL_CLAUDE="$(flag installClaudeCode True)"
 INSTALL_KUBECTL="$(flag installKubectl False)"
 INSTALL_AWS="$(flag installAwsCli False)"
 INSTALL_GCLOUD="$(flag installGcloudCli False)"
+INSTALL_AZURE="$(flag installAzureCli False)"
+INSTALL_AZURE_DEVOPS="$(flag installAzureDevopsCli False)"
+INSTALL_GH="$(flag installGithubCli False)"
+INSTALL_JIRA="$(flag installJiraCli False)"
 INSTALL_UPCTL="$(flag installUpctl False)"
 INSTALL_DOTNET="$(flag installDotnetSdk False)"
 INSTALL_RUST="$(flag installRust False)"
@@ -175,4 +179,75 @@ if [[ "${INSTALL_UPCTL}" == "1" ]] && ! command -v upctl >/dev/null 2>&1; then
   rm -rf "${TMP_DIR}"
   trap - EXIT
   log "Installed $(/usr/local/bin/upctl version 2>&1 | head -n 1)."
+fi
+
+# 10. GitHub CLI (gh) from official GitHub APT repository
+if [[ "${INSTALL_GH}" == "1" ]] && ! command -v gh >/dev/null 2>&1; then
+  log "Installing GitHub CLI (gh)..."
+  install -m 0755 -d /etc/apt/keyrings
+  if [[ ! -f /etc/apt/keyrings/githubcli-archive-keyring.gpg ]]; then
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /etc/apt/keyrings/githubcli-archive-keyring.gpg
+    chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+  fi
+  cat >/etc/apt/sources.list.d/github-cli.list <<EOF
+deb [arch=${ARCH} signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main
+EOF
+  apt-get update -y
+  apt-get install -y --no-install-recommends gh
+  log "Installed $(gh --version 2>&1 | head -n 1)."
+fi
+
+# 11. Microsoft Azure CLI (az) from official Microsoft APT repository
+if [[ "${INSTALL_AZURE}" == "1" || "${INSTALL_AZURE_DEVOPS}" == "1" ]] && ! command -v az >/dev/null 2>&1; then
+  log "Installing Microsoft Azure CLI (az)..."
+  install -m 0755 -d /etc/apt/keyrings
+  if [[ ! -f /etc/apt/keyrings/microsoft.gpg ]]; then
+    curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor --yes -o /etc/apt/keyrings/microsoft.gpg
+    chmod a+r /etc/apt/keyrings/microsoft.gpg
+  fi
+  CODENAME="$(. /etc/os-release && echo "${VERSION_CODENAME:-resolute}")"
+  AZ_SUITE="${CODENAME}"
+  if ! curl -fsI "https://packages.microsoft.com/repos/azure-cli/dists/${AZ_SUITE}/Release" >/dev/null 2>&1; then
+    log "Azure CLI apt suite '${AZ_SUITE}' not published yet; falling back to 'noble'."
+    AZ_SUITE="noble"
+  fi
+  cat >/etc/apt/sources.list.d/azure-cli.list <<EOF
+deb [arch=${ARCH} signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/azure-cli/ ${AZ_SUITE} main
+EOF
+  apt-get update -y
+  apt-get install -y --no-install-recommends azure-cli
+  log "Installed $(az version --output json 2>/dev/null | jq -r '"azure-cli " + (."azure-cli" // "")' || echo 'azure-cli')."
+fi
+
+# 12. Azure DevOps CLI (azure-devops extension for az) installed for agent user
+if [[ "${INSTALL_AZURE_DEVOPS}" == "1" ]] && command -v az >/dev/null 2>&1; then
+  if ! su -s /bin/bash - "${AGENT_NAME}" -c 'az extension show --name azure-devops >/dev/null 2>&1'; then
+    log "Installing Azure DevOps CLI extension (azure-devops) for user '${AGENT_NAME}'..."
+    su -s /bin/bash - "${AGENT_NAME}" -c 'az extension add --name azure-devops --yes'
+    log "Installed Azure DevOps CLI extension ($(su -s /bin/bash - "${AGENT_NAME}" -c 'az extension show --name azure-devops --query version -o tsv' 2>/dev/null || echo 'azure-devops'))."
+  fi
+fi
+
+# 13. Jira CLI (jira, ankitpokhrel/jira-cli) from official GitHub releases with SHA256 verification
+if [[ "${INSTALL_JIRA}" == "1" ]] && ! command -v jira >/dev/null 2>&1; then
+  JIRA_ARCH="x86_64"
+  if [[ "${ARCH}" == "arm64" ]]; then
+    JIRA_ARCH="arm64"
+  fi
+  log "Installing Jira CLI (jira, ${JIRA_ARCH}) with SHA256 verification..."
+  TMP_DIR="$(mktemp -d)"
+  trap 'rm -rf "${TMP_DIR}"' EXIT
+  RELEASE_JSON="$(curl -fsSL -H 'Accept: application/vnd.github+json' https://api.github.com/repos/ankitpokhrel/jira-cli/releases/latest)"
+  ASSET_URL="$(printf '%s' "${RELEASE_JSON}" | python3 -c "import json,sys; r=json.load(sys.stdin); print(next(a['browser_download_url'] for a in r['assets'] if a['name'].endswith('_linux_${JIRA_ARCH}.tar.gz')))")"
+  CHECKSUMS_URL="$(printf '%s' "${RELEASE_JSON}" | python3 -c "import json,sys; r=json.load(sys.stdin); print(next(a['browser_download_url'] for a in r['assets'] if a['name'].endswith('checksums.txt')))")"
+  ASSET_NAME="$(basename "${ASSET_URL}")"
+  curl -fsSL "${ASSET_URL}" -o "${TMP_DIR}/${ASSET_NAME}"
+  curl -fsSL "${CHECKSUMS_URL}" -o "${TMP_DIR}/checksums.txt"
+  (cd "${TMP_DIR}" && sha256sum -c --ignore-missing checksums.txt)
+  tar -xzf "${TMP_DIR}/${ASSET_NAME}" -C "${TMP_DIR}"
+  JIRA_BIN="$(find "${TMP_DIR}" -maxdepth 3 -type f -name jira | head -n 1)"
+  install -o root -g root -m 0755 "${JIRA_BIN}" /usr/local/bin/jira
+  rm -rf "${TMP_DIR}"
+  trap - EXIT
+  log "Installed $(/usr/local/bin/jira version 2>&1 | head -n 1)."
 fi
