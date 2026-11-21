@@ -1,0 +1,16 @@
+[Unit]
+Description=Ubuntu WSL Agent Box Per-Distro Hardening, Mounts, and Firewall
+DefaultDependencies=no
+After=local-fs.target network-online.target
+Before=systemd-user-sessions.service docker-policy-proxy.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/box-hardening.sh
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

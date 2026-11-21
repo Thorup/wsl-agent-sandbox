@@ -1,0 +1,8 @@
+.cache/
+*.vhdx
+*.tar
+*.tar.gz
+*.wsl
+*.log
+docker-policy-proxy/docker-policy-proxy
+docker-policy-proxy/docker-policy-proxy.exe

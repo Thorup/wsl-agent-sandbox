@@ -1,0 +1,193 @@
+#Requires -Version 5.1
+Set-StrictMode -Version Latest
+
+function Get-WslDistroList {
+    $prevEnc = [Console]::OutputEncoding
+    try {
+        # wsl.exe emits UTF-16LE when stdout is redirected
+        [Console]::OutputEncoding = [System.Text.Encoding]::Unicode
+        $raw = & wsl.exe --list --quiet 2>&1
+    } finally {
+        [Console]::OutputEncoding = $prevEnc
+    }
+    $names = @()
+    foreach ($line in @($raw)) {
+        $clean = ("$line" -replace "`0", '').Trim()
+        if (-not [string]::IsNullOrWhiteSpace($clean)) {
+            $names += $clean
+        }
+    }
+    return $names
+}
+
+function Test-WslDistroExists {
+    param([Parameter(Mandatory)][string]$DistroName)
+    $list = Get-WslDistroList
+    return ($list -contains $DistroName)
+}
+
+function Invoke-WslRootBash {
+    param(
+        [Parameter(Mandatory)][string]$DistroName,
+        [Parameter(Mandatory)][string]$Script,
+        [switch]$PassThru
+    )
+    $lfScript = ($Script -replace "`r`n", "`n") -replace "`r", "`n"
+    $b64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($lfScript))
+    $cmd = "echo '$b64' | base64 -d | bash -s"
+    if ($PassThru) {
+        $out = & wsl.exe -d $DistroName -u root -- sh -c $cmd
+        if ($LASTEXITCODE -ne 0) {
+            throw "WSL root bash command failed with exit code $LASTEXITCODE."
+        }
+        return $out
+    } else {
+        & wsl.exe -d $DistroName -u root -- sh -c $cmd
+        if ($LASTEXITCODE -ne 0) {
+            throw "WSL root bash command failed with exit code $LASTEXITCODE."
+        }
+    }
+}
+
+function Copy-FileToWsl {
+    param(
+        [Parameter(Mandatory)][string]$DistroName,
+        [Parameter(Mandatory)][string]$LocalPath,
+        [Parameter(Mandatory)][string]$RemotePath,
+        [string]$Mode = '0644',
+        [switch]$NormalizeLF
+    )
+    if (-not (Test-Path -LiteralPath $LocalPath -PathType Leaf)) {
+        throw "Local file not found: $LocalPath"
+    }
+    if ($NormalizeLF) {
+        $text = Get-Content -LiteralPath $LocalPath -Raw -Encoding UTF8
+        $text = ($text -replace "`r`n", "`n") -replace "`r", "`n"
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($text)
+    } else {
+        $bytes = [System.IO.File]::ReadAllBytes($LocalPath)
+    }
+
+    $b64 = [Convert]::ToBase64String($bytes)
+    $remoteDir = ($RemotePath -replace '/[^/]+$', '')
+    # Pipe via stdin to handle arbitrarily large files without Windows command-line length limits
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'wsl.exe'
+    $psi.Arguments = "-d $DistroName -u root -- sh -c ""mkdir -p '$remoteDir' && base64 -d > '$RemotePath' && chown root:root '$RemotePath' && chmod $Mode '$RemotePath'"""
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardError = $true
+    $psi.RedirectStandardOutput = $true
+
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $proc.StandardInput.Write($b64)
+    $proc.StandardInput.Close()
+    $stderr = $proc.StandardError.ReadToEnd()
+    $proc.WaitForExit()
+    if ($proc.ExitCode -ne 0) {
+        throw "Failed copying '$LocalPath' -> '${DistroName}:${RemotePath}' (exit $($proc.ExitCode)): $stderr"
+    }
+}
+
+function Copy-TextToWsl {
+    param(
+        [Parameter(Mandatory)][string]$DistroName,
+        [Parameter(Mandatory)][string]$Content,
+        [Parameter(Mandatory)][string]$RemotePath,
+        [string]$Mode = '0600'
+    )
+    $lf = ($Content -replace "`r`n", "`n") -replace "`r", "`n"
+    $b64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($lf))
+    $remoteDir = ($RemotePath -replace '/[^/]+$', '')
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'wsl.exe'
+    $psi.Arguments = "-d $DistroName -u root -- sh -c ""mkdir -p '$remoteDir' && base64 -d > '$RemotePath' && chown root:root '$RemotePath' && chmod $Mode '$RemotePath'"""
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardError = $true
+    $psi.RedirectStandardOutput = $true
+
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $proc.StandardInput.Write($b64)
+    $proc.StandardInput.Close()
+    $stderr = $proc.StandardError.ReadToEnd()
+    $proc.WaitForExit()
+    if ($proc.ExitCode -ne 0) {
+        throw "Failed writing text -> '${DistroName}:${RemotePath}' (exit $($proc.ExitCode)): $stderr"
+    }
+}
+
+function Wait-WslSystemdReady {
+    param(
+        [Parameter(Mandatory)][string]$DistroName,
+        [int]$TimeoutSeconds = 45
+    )
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        $state = (& wsl.exe -d $DistroName -u root -- sh -c "systemctl is-system-running 2>/dev/null || true" | Out-String).Trim()
+        $harden = (& wsl.exe -d $DistroName -u root -- sh -c "systemctl is-active box-hardening.service 2>/dev/null || true" | Out-String).Trim()
+        if (($state -eq 'running' -or $state -eq 'degraded') -and $harden -eq 'active') {
+            return $true
+        }
+        Start-Sleep -Seconds 1
+    }
+    return $false
+}
+
+function Sync-DockerDesktopSocketBridge {
+    <#
+    .SYNOPSIS
+        Bridges Docker Desktop's Linux Engine socket (/tmp/docker-desktop-root/run/docker.sock)
+        into the root-only 0700 shared path /mnt/host/wsl/box-binds/dd-upstream.sock so
+        docker-policy-proxy inside ubuntu-2604-agent can connect without enabling Docker Desktop
+        WSL Integration on the agent distro.
+    #>
+    if (-not (Test-WslDistroExists -DistroName 'docker-desktop')) {
+        return $false
+    }
+
+    # Check if Docker Desktop engine is running on Windows (named pipe exists)
+    $pipes = @(Get-ChildItem '\\.\pipe\' -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'docker_engine' })
+    if ($pipes.Count -eq 0) {
+        return $false
+    }
+
+    # Verify socket exists inside docker-desktop; if Docker Desktop is paused in Resource Saver
+    # mode, wake the Linux engine cleanly using a zero-image write call (network create/rm).
+    $hasSock = (& wsl.exe -d docker-desktop -- sh -c '[ -S /tmp/docker-desktop-root/run/docker.sock ] && echo YES || echo NO' 2>$null | Out-String).Trim()
+    if ($hasSock -ne 'YES') {
+        $dockerExe = Get-Command docker.exe -ErrorAction SilentlyContinue
+        if ($dockerExe) {
+            Write-Host "[docker-bridge] Waking Docker Desktop Linux engine from Resource Saver mode..."
+            & $dockerExe.Source network create __ubuntu_box_wake 2>$null | Out-Null
+            & $dockerExe.Source network rm __ubuntu_box_wake 2>$null | Out-Null
+            Start-Sleep -Seconds 1
+        }
+        $hasSock = (& wsl.exe -d docker-desktop -- sh -c '[ -S /tmp/docker-desktop-root/run/docker.sock ] && echo YES || echo NO' 2>$null | Out-String).Trim()
+        if ($hasSock -ne 'YES') {
+            return $false
+        }
+    }
+
+    # Always refresh the bind-mount so a Docker Desktop Resource Saver restart never leaves a stale mount
+    $bindCmd = 'mkdir -p /mnt/host/wsl/box-binds && chmod 0700 /mnt/host/wsl/box-binds && umount /mnt/host/wsl/box-binds/dd-upstream.sock 2>/dev/null || true; rm -f /mnt/host/wsl/box-binds/dd-upstream.sock && touch /mnt/host/wsl/box-binds/dd-upstream.sock && chmod 0600 /mnt/host/wsl/box-binds/dd-upstream.sock && mount --bind /tmp/docker-desktop-root/run/docker.sock /mnt/host/wsl/box-binds/dd-upstream.sock'
+    & wsl.exe -d docker-desktop -- sh -c $bindCmd
+    return ($LASTEXITCODE -eq 0)
+}
+
+function Get-GlobalWslConfigWarnings {
+    $warnings = @()
+    $wslCfg = Join-Path $env:USERPROFILE '.wslconfig'
+    if (Test-Path -LiteralPath $wslCfg -PathType Leaf) {
+        $content = Get-Content -LiteralPath $wslCfg -Raw -ErrorAction SilentlyContinue
+        if ($content -match '(?im)^\s*networkingMode\s*=\s*mirrored\b') {
+            # Informational only: box-hardening.sh blocks oifname "loopback0" for agent UID in mirrored mode
+            # while keeping Windows -> WSL localhost browsing and WSL-internal lo working.
+        }
+        if ($content -match '(?im)^\s*localhostForwarding\s*=\s*false\b') {
+            $warnings += "Global '$wslCfg' sets localhostForwarding=false. Browsing WSL localhost websites from Windows requires localhostForwarding=true."
+        }
+    }
+    return $warnings
+}

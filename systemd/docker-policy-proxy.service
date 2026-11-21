@@ -1,0 +1,26 @@
+[Unit]
+Description=Hardened Docker Engine API Policy Proxy for Ubuntu WSL Agent Box
+After=box-hardening.service
+Requires=box-hardening.service
+Before=systemd-user-sessions.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/local/libexec/docker-policy-proxy \
+  -listen /run/docker-policy/docker.sock \
+  -policy /etc/ubuntu-agent-box/docker-policy.json \
+  -group agent-docker
+ExecStartPost=/bin/sh -c 'for i in 1 2 3 4 5 6 7 8 9 10; do [ -S /run/docker-policy/docker.sock ] && break; sleep 0.2; done; ln -sf /run/docker-policy/docker.sock /var/run/docker.sock'
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

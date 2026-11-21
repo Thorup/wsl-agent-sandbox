@@ -1,0 +1,193 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Ubuntu 26.04 WSL Agent Box Configuration",
+  "type": "object",
+  "required": [
+    "distroName",
+    "installDir",
+    "agentUser",
+    "image",
+    "sharedFolders",
+    "network",
+    "docker",
+    "packages"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "distroName": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{1,62}$",
+      "description": "Dedicated WSL distribution name."
+    },
+    "installDir": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Windows directory where the WSL ext4.vhdx will live. Supports %ENVVAR% expansion."
+    },
+    "agentUser": {
+      "type": "object",
+      "required": ["name", "uid", "gid"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z_][a-z0-9_-]{0,31}$"
+        },
+        "uid": {
+          "type": "integer",
+          "minimum": 10000,
+          "maximum": 60000,
+          "description": "Dedicated high UID so per-UID nftables rules do not collide with UID 1000 in other WSL distros."
+        },
+        "gid": {
+          "type": "integer",
+          "minimum": 10000,
+          "maximum": 60000
+        }
+      }
+    },
+    "image": {
+      "type": "object",
+      "required": ["release", "arch", "cacheDir"],
+      "properties": {
+        "release": {
+          "type": "string",
+          "default": "26.04"
+        },
+        "arch": {
+          "type": "string",
+          "enum": ["amd64", "arm64"]
+        },
+        "url": {
+          "type": "string",
+          "description": "Optional explicit download URL for the .wsl or .tar.gz rootfs."
+        },
+        "sha256": {
+          "type": "string",
+          "description": "Optional explicit SHA256 checksum (otherwise fetched from Canonical SHA256SUMS)."
+        },
+        "cacheDir": {
+          "type": "string"
+        }
+      }
+    },
+    "sharedFolders": {
+      "type": "array",
+      "description": "Explicit allowlist of Windows directories mounted under /shared/<name> inside WSL.",
+      "items": {
+        "type": "object",
+        "required": ["name", "windowsPath", "mode"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$"
+          },
+          "windowsPath": {
+            "type": "string",
+            "pattern": "^[A-Za-z]:\\\\.+$"
+          },
+          "mode": {
+            "type": "string",
+            "enum": ["ro", "rw"]
+          },
+          "allowDockerBind": {
+            "type": "boolean",
+            "default": false
+          }
+        }
+      }
+    },
+    "network": {
+      "type": "object",
+      "required": ["blockHostAndLan", "allowedHostPorts", "blockedCidrs"],
+      "properties": {
+        "blockHostAndLan": {
+          "type": "boolean"
+        },
+        "allowedHostPorts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["port", "protocol"],
+            "properties": {
+              "port": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 65535
+              },
+              "protocol": {
+                "type": "string",
+                "enum": ["tcp", "udp"]
+              },
+              "comment": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "blockedCidrs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "docker": {
+      "type": "object",
+      "required": ["enabled", "allowBindPrefixes", "allowBuildKit", "allowCapAdd"],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "allowBindPrefixes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^/.*"
+          }
+        },
+        "allowBuildKit": {
+          "type": "boolean"
+        },
+        "allowCapAdd": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "denyEndpoints": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "packages": {
+      "type": "object",
+      "required": ["apt"],
+      "properties": {
+        "apt": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "installDockerCli": { "type": "boolean" },
+        "installUv": { "type": "boolean" },
+        "installNodeLts": { "type": "boolean" },
+        "installPnpm": { "type": "boolean" },
+        "installGeminiCli": { "type": "boolean" },
+        "installClaudeCode": { "type": "boolean" },
+        "installKubectl": { "type": "boolean" },
+        "installAwsCli": { "type": "boolean" },
+        "installGcloudCli": { "type": "boolean" },
+        "installUpctl": { "type": "boolean" },
+        "installDotnetSdk": { "type": "boolean" },
+        "installRust": { "type": "boolean" }
+      }
+    }
+  }
+}

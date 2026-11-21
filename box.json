@@ -1,0 +1,88 @@
+{
+  "$schema": "./box.schema.json",
+  "distroName": "ubuntu-2604-agent",
+  "installDir": "%LOCALAPPDATA%\\WSL\\ubuntu-2604-agent",
+  "agentUser": {
+    "name": "agent",
+    "uid": 26040,
+    "gid": 26040
+  },
+  "image": {
+    "release": "26.04",
+    "arch": "amd64",
+    "url": "",
+    "sha256": "",
+    "cacheDir": ".cache"
+  },
+  "sharedFolders": [],
+  "network": {
+    "blockHostAndLan": true,
+    "allowedHostPorts": [],
+    "blockedCidrs": [
+      "10.0.0.0/8",
+      "172.16.0.0/12",
+      "192.168.0.0/16",
+      "169.254.0.0/16",
+      "100.64.0.0/10"
+    ]
+  },
+  "docker": {
+    "enabled": true,
+    "allowBindPrefixes": [
+      "/home/agent"
+    ],
+    "allowBuildKit": true,
+    "allowCapAdd": [],
+    "denyEndpoints": [
+      "/plugins",
+      "/swarm",
+      "/services",
+      "/nodes",
+      "/secrets",
+      "/configs",
+      "/tasks"
+    ]
+  },
+  "packages": {
+    "apt": [
+      "ca-certificates",
+      "curl",
+      "git",
+      "build-essential",
+      "jq",
+      "ripgrep",
+      "fd-find",
+      "nftables",
+      "python3",
+      "python3-venv",
+      "python3-pip",
+      "unzip",
+      "zip",
+      "openssh-client",
+      "gnupg",
+      "lsb-release",
+      "iproute2",
+      "bind9-dnsutils",
+      "iputils-ping",
+      "netcat-openbsd",
+      "tmux",
+      "vim",
+      "less",
+      "pkg-config",
+      "libssl-dev",
+      "libicu-dev"
+    ],
+    "installDockerCli": true,
+    "installUv": true,
+    "installNodeLts": true,
+    "installPnpm": true,
+    "installGeminiCli": true,
+    "installClaudeCode": true,
+    "installKubectl": true,
+    "installAwsCli": true,
+    "installGcloudCli": true,
+    "installUpctl": true,
+    "installDotnetSdk": true,
+    "installRust": true
+  }
+}
