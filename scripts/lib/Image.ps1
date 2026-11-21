@@ -16,7 +16,7 @@ function Invoke-HttpGetText {
     Enable-ModernTls
     $wc = New-Object System.Net.WebClient
     $wc.Encoding = [System.Text.Encoding]::UTF8
-    $wc.Headers.Add('User-Agent', 'ubuntu-wsl-box/1.0')
+    $wc.Headers.Add('User-Agent', 'wsl-agent-sandbox/1.0')
     try {
         return $wc.DownloadString($Url)
     } finally {
@@ -52,7 +52,7 @@ function Invoke-FileDownload {
     }
     Enable-ModernTls
     $wc = New-Object System.Net.WebClient
-    $wc.Headers.Add('User-Agent', 'ubuntu-wsl-box/1.0')
+    $wc.Headers.Add('User-Agent', 'wsl-agent-sandbox/1.0')
     try {
         $wc.DownloadFile($Url, $DestinationPath)
     } finally {

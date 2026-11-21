@@ -1,7 +1,7 @@
 {
   "$schema": "./box.schema.json",
-  "distroName": "ubuntu-2604-agent",
-  "installDir": "%LOCALAPPDATA%\\WSL\\ubuntu-2604-agent",
+  "distroName": "wsl-agent-sandbox",
+  "installDir": "%LOCALAPPDATA%\\WSL\\wsl-agent-sandbox",
   "agentUser": {
     "name": "agent",
     "uid": 26040,

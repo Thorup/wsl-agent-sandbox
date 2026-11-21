@@ -12,7 +12,7 @@ pass() { echo "  [PASS] $*"; PASS=$((PASS + 1)); }
 fail() { echo "  [FAIL] $*"; FAIL=$((FAIL + 1)); }
 warn() { echo "  [WARN] $*"; WARN=$((WARN + 1)); }
 
-echo "=== Ubuntu WSL Agent Box Security & Capability Audit ==="
+echo "=== wsl-agent-sandbox Security & Capability Audit ==="
 echo "Running as: $(id)"
 echo ""
 
@@ -33,7 +33,7 @@ else
   pass "sudo is unavailable/denied for agent user"
 fi
 
-if [[ -r /etc/ubuntu-agent-box/docker-policy.json ]] || [[ -w /etc/wsl.conf ]]; then
+if [[ -r /etc/wsl-agent-sandbox/docker-policy.json ]] || [[ -w /etc/wsl.conf ]]; then
   fail "Agent can read root-only docker-policy.json or write /etc/wsl.conf!"
 else
   pass "Root-owned config files (/etc/wsl.conf, docker-policy.json) protected"
@@ -221,10 +221,10 @@ else
 fi
 
 # ------------------------------------------------------------------
-# 6. Pre-installed Developer & Gemini Agent Toolchain
+# 6. Pre-installed Developer, Cloud & AI Agent Toolchain
 # ------------------------------------------------------------------
 echo ""
-echo "[6/6] Pre-installed Developer & Gemini Agent Toolchain"
+echo "[6/6] Pre-installed Developer, Cloud & AI Agent Toolchain"
 
 for tool in git python3 uv node pnpm gemini claude docker kubectl aws gcloud az gh jira upctl dotnet rustc cargo rustup; do
   if command -v "${tool}" >/dev/null 2>&1; then

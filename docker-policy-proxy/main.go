@@ -51,7 +51,7 @@ func resolveUpstreamSocket(explicit string) string {
 func main() {
 	listenSocket := flag.String("listen", "/run/docker-policy/docker.sock", "Unix socket path to listen on")
 	upstreamSocket := flag.String("upstream", "", "Upstream Docker Desktop Unix socket path (auto-discovered if empty)")
-	policyPath := flag.String("policy", "/etc/ubuntu-agent-box/docker-policy.json", "Path to compiled Docker policy JSON")
+	policyPath := flag.String("policy", "/etc/wsl-agent-sandbox/docker-policy.json", "Path to compiled Docker policy JSON")
 	socketGroup := flag.String("group", "agent-docker", "Group owner for the listening Unix socket")
 	flag.Parse()
 

@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Manage the hardened Ubuntu 26.04 LTS WSL2 Agent Sandbox (wsl-agent-sandbox).
 
@@ -41,7 +41,7 @@ if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
 
 function Show-Usage {
     @"
-Ubuntu 26.04 LTS Hardened WSL2 Agent Box CLI (box.ps1)
+wsl-agent-sandbox — Hardened Ubuntu 26.04 LTS WSL2 Sandbox CLI (box.ps1)
 
 Usage:
   .\box.ps1 <command> [options]
@@ -51,7 +51,8 @@ Commands:
                      build & test Docker policy proxy, harden distro, and run verification.
   up                 Ensure the distro is running and systemd hardening services are active.
   apply              Push updated box.json (shared folders, allowed host ports, Docker policy,
-                     apt packages) and reload hardening + proxy live without rebuilding.
+                     apt packages, CLI/language toolchains) and reload hardening + proxy live
+                     without rebuilding (use -RebuildProxy to rebuild docker-policy-proxy).
   shell              Open an interactive shell inside the box as the non-root agent user.
   root-shell         Open an administrative root shell (Windows host control plane only).
   status             Show distro state, systemd service health, active /shared mounts, and warnings.
@@ -72,10 +73,10 @@ function Sync-AssetsToWsl {
 
     # Push policy.json and Windows host IPs
     $policyJson = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8
-    Copy-TextToWsl -DistroName $distro -Content $policyJson -RemotePath '/etc/ubuntu-agent-box/policy.json' -Mode '0600'
+    Copy-TextToWsl -DistroName $distro -Content $policyJson -RemotePath '/etc/wsl-agent-sandbox/policy.json' -Mode '0600'
 
     $hostIps = (Get-WindowsHostIPs) -join "`n"
-    Copy-TextToWsl -DistroName $distro -Content ($hostIps + "`n") -RemotePath '/etc/ubuntu-agent-box/host_ips.txt' -Mode '0600'
+    Copy-TextToWsl -DistroName $distro -Content ($hostIps + "`n") -RemotePath '/etc/wsl-agent-sandbox/host_ips.txt' -Mode '0600'
 
     # Push Linux scripts & systemd units
     Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot 'scripts\linux\box-hardening.sh') -RemotePath '/usr/local/sbin/box-hardening.sh' -Mode '0755' -NormalizeLF
@@ -205,8 +206,8 @@ else
   echo "  (none - deny-all)"
 fi
 echo ""
-echo "Active nftables table inet ubuntu_agent_box:"
-nft list table inet ubuntu_agent_box 2>/dev/null || echo "  (not loaded)"
+echo "Active nftables table inet wsl_agent_sandbox:"
+nft list table inet wsl_agent_sandbox 2>/dev/null || echo "  (not loaded)"
 '@
     Invoke-WslRootBash -DistroName $distro -Script $statusScript
     foreach ($w in (Get-GlobalWslConfigWarnings)) {
@@ -228,7 +229,7 @@ function Invoke-Verify {
 
     # Ensure host_ips.txt is fresh
     $hostIps = (Get-WindowsHostIPs) -join "`n"
-    Copy-TextToWsl -DistroName $distro -Content ($hostIps + "`n") -RemotePath '/etc/ubuntu-agent-box/host_ips.txt' -Mode '0600'
+    Copy-TextToWsl -DistroName $distro -Content ($hostIps + "`n") -RemotePath '/etc/wsl-agent-sandbox/host_ips.txt' -Mode '0600'
 
     $overallFailed = $false
 

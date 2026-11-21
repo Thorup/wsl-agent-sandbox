@@ -44,7 +44,8 @@ function Clone-Config {
 Write-Host "=== Running Config.ps1 Automated Tests ==="
 
 $baseCfg = Read-BoxConfig -ConfigPath (Join-Path $RepoRoot 'box.json')
-Assert-True "Default box.json parses and validates cleanly" ($baseCfg.distroName -eq 'ubuntu-2604-agent')
+Assert-True "Default box.json parses and validates cleanly" ($baseCfg.distroName -eq 'wsl-agent-sandbox')
+Assert-True "Default installDir matches distroName" ($baseCfg.installDir -eq '%LOCALAPPDATA%\WSL\wsl-agent-sandbox')
 Assert-True "Default sharedFolders is empty (deny-all)" (@($baseCfg.sharedFolders).Count -eq 0)
 Assert-True "Default agentUser UID is in high isolated range (26040)" ($baseCfg.agentUser.uid -eq 26040)
 Assert-True "Default box.json enables GitHub, Azure, Azure DevOps, and Jira CLIs" (
