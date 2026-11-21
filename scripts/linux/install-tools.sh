@@ -48,6 +48,7 @@ if [[ "${INSTALL_DOCKER_CLI}" == "1" ]] && ! command -v docker >/dev/null 2>&1; 
     curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
     chmod a+r /etc/apt/keyrings/docker.asc
   fi
+  # shellcheck source=/dev/null
   CODENAME="$(. /etc/os-release && echo "${VERSION_CODENAME:-resolute}")"
   DOCKER_SUITE="${CODENAME}"
   if ! curl -fsI "https://download.docker.com/linux/ubuntu/dists/${DOCKER_SUITE}/Release" >/dev/null 2>&1; then
@@ -154,6 +155,7 @@ fi
 if [[ "${INSTALL_RUST}" == "1" ]] && [[ ! -x "/home/${AGENT_NAME}/.cargo/bin/rustc" ]]; then
   log "Installing Rust (rustup + stable + clippy + rustfmt) for user '${AGENT_NAME}'..."
   su -s /bin/bash - "${AGENT_NAME}" -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile default -c clippy -c rustfmt'
+  # shellcheck disable=SC2016 # $HOME expands inside the target user's shell
   log "Installed $(su -s /bin/bash - "${AGENT_NAME}" -c '"$HOME/.cargo/bin/rustc" --version && "$HOME/.cargo/bin/cargo" --version' | tr '\n' ' ')."
 fi
 
@@ -205,6 +207,7 @@ if [[ "${INSTALL_AZURE}" == "1" || "${INSTALL_AZURE_DEVOPS}" == "1" ]] && ! comm
     curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor --yes -o /etc/apt/keyrings/microsoft.gpg
     chmod a+r /etc/apt/keyrings/microsoft.gpg
   fi
+  # shellcheck source=/dev/null
   CODENAME="$(. /etc/os-release && echo "${VERSION_CODENAME:-resolute}")"
   AZ_SUITE="${CODENAME}"
   if ! curl -fsI "https://packages.microsoft.com/repos/azure-cli/dists/${AZ_SUITE}/Release" >/dev/null 2>&1; then

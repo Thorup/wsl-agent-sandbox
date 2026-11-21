@@ -16,7 +16,7 @@ log "Re-applying mounts, Docker bind mirrors, docker-policy.json, and nftables..
 /usr/local/sbin/box-hardening.sh
 
 # Install any newly added apt packages from policy.json
-mapfile -t APT_PKGS < <(python3 -c 'import json; d=json.load(open("/etc/wsl-agent-sandbox/policy.json")); print("\n".join(d["packages"].get("apt", [])))')
+mapfile -t APT_PKGS < <(python3 -c 'import json, sys; d=json.load(open(sys.argv[1])); print("\n".join(d["packages"].get("apt", [])))' "${POLICY_FILE}")
 MISSING=()
 for pkg in "${APT_PKGS[@]}"; do
   if ! dpkg -s "${pkg}" >/dev/null 2>&1; then
@@ -55,7 +55,7 @@ DOCKER_HOST="unix:///run/docker-policy/docker.sock"
 DOTNET_ROOT="/usr/local/share/dotnet"
 EOF
 
-DOCKER_ENABLED="$(python3 -c 'import json; d=json.load(open("/etc/wsl-agent-sandbox/policy.json")); print("1" if d["docker"].get("enabled", True) else "0")')"
+DOCKER_ENABLED="$(python3 -c 'import json, sys; d=json.load(open(sys.argv[1])); print("1" if d["docker"].get("enabled", True) else "0")' "${POLICY_FILE}")"
 
 if pidof systemd >/dev/null 2>&1; then
   systemctl daemon-reload
@@ -70,7 +70,7 @@ if pidof systemd >/dev/null 2>&1; then
     log "Docker proxy disabled per policy."
   fi
 else
-  log "WARNING: systemd is not PID 1 yet; restart distro (`wsl --terminate <distro>`) to start services."
+  log "WARNING: systemd is not PID 1 yet; restart distro ('wsl --terminate <distro>') to start services."
 fi
 
 log "Policy applied successfully."

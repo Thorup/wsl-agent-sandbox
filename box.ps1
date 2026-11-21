@@ -172,7 +172,10 @@ function Invoke-Init {
 }
 
 function Invoke-Apply {
-    param($Config)
+    param(
+        $Config,
+        [switch]$RebuildProxy
+    )
     $distro = $Config.distroName
     if (-not (Test-WslDistroExists -DistroName $distro)) {
         throw "Distro '$distro' does not exist. Run '.\box.ps1 init' first."
@@ -202,7 +205,13 @@ mv -f /usr/local/libexec/docker-policy-proxy.new /usr/local/libexec/docker-polic
 }
 
 function Invoke-SeedSecrets {
-    param($Config)
+    param(
+        $Config,
+        [string]$SecretsPath = '',
+        [string[]]$Service = @(),
+        [switch]$Prune,
+        [switch]$DryRun
+    )
     $distro = $Config.distroName
     if (-not (Test-WslDistroExists -DistroName $distro)) {
         throw "Distro '$distro' does not exist. Run '.\box.ps1 init' first."
@@ -248,7 +257,10 @@ function Invoke-SeedSecrets {
 }
 
 function Invoke-ClearSecrets {
-    param($Config)
+    param(
+        $Config,
+        [string[]]$Service = @()
+    )
     $distro = $Config.distroName
     if (-not (Test-WslDistroExists -DistroName $distro)) {
         throw "Distro '$distro' does not exist. Run '.\box.ps1 init' first."
@@ -352,7 +364,7 @@ function Invoke-Verify {
         }
     } finally {
         if ($winListener) {
-            try { $winListener.Stop() } catch {}
+            try { $winListener.Stop() } catch { Write-Verbose "Ignoring listener stop error: $($_.Exception.Message)" }
         }
     }
 
@@ -373,7 +385,7 @@ function Invoke-Verify {
         }
     } finally {
         if ($winLoopListener) {
-            try { $winLoopListener.Stop() } catch {}
+            try { $winLoopListener.Stop() } catch { Write-Verbose "Ignoring loopback listener stop error: $($_.Exception.Message)" }
         }
     }
 
@@ -394,7 +406,9 @@ function Invoke-Verify {
                     $winOk = $true
                     break
                 }
-            } catch {}
+            } catch {
+                Write-Verbose "Waiting for WSL test HTTP server on port ${webPort}: $($_.Exception.Message)"
+            }
         }
 
         if ($winOk) {
@@ -413,7 +427,7 @@ function Invoke-Verify {
         }
     } finally {
         if ($serverProc -and -not $serverProc.HasExited) {
-            try { $serverProc.Kill() } catch {}
+            try { $serverProc.Kill() } catch { Write-Verbose "Ignoring test HTTP server kill error: $($_.Exception.Message)" }
         }
         & wsl.exe -d $distro -u $agent -- rm -rf /tmp/box-web-verify 2>$null | Out-Null
     }
@@ -430,7 +444,10 @@ function Invoke-Verify {
 }
 
 function Invoke-Destroy {
-    param($Config)
+    param(
+        $Config,
+        [switch]$Force
+    )
     $distro = $Config.distroName
     $installDir = Expand-BoxPath -RawPath $Config.installDir -BaseDir $RepoRoot
 
@@ -477,13 +494,13 @@ switch ($Command) {
         }
     }
     'apply' {
-        Invoke-Apply -Config $cfg
+        Invoke-Apply -Config $cfg -RebuildProxy:$RebuildProxy
     }
     'seed-secrets' {
-        Invoke-SeedSecrets -Config $cfg
+        Invoke-SeedSecrets -Config $cfg -SecretsPath $SecretsPath -Service $Service -Prune:$Prune -DryRun:$DryRun
     }
     'clear-secrets' {
-        Invoke-ClearSecrets -Config $cfg
+        Invoke-ClearSecrets -Config $cfg -Service $Service
     }
     'shell' {
         if ($cfg.docker.enabled) {
@@ -517,10 +534,10 @@ switch ($Command) {
         Write-Host "[snapshot] Saved: $outFile"
     }
     'reset' {
-        Invoke-Destroy -Config $cfg
+        Invoke-Destroy -Config $cfg -Force:$Force
         Invoke-Init -Config $cfg
     }
     'destroy' {
-        Invoke-Destroy -Config $cfg
+        Invoke-Destroy -Config $cfg -Force:$Force
     }
 }

@@ -173,6 +173,7 @@ function Get-WindowsHostIPs {
         }
     } catch {
         # Fallback if Get-NetIPAddress is unavailable in restricted environments
+        Write-Verbose "Get-NetIPAddress unavailable: $($_.Exception.Message)"
     }
     return $ips.ToArray()
 }
