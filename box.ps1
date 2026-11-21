@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Manage the hardened Ubuntu 26.04 LTS WSL2 Agent Sandbox (wsl-agent-sandbox).
 
@@ -53,7 +53,7 @@ if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
 
 function Show-Usage {
     @"
-wsl-agent-sandbox — Hardened Ubuntu 26.04 LTS WSL2 Sandbox CLI (box.ps1)
+wsl-agent-sandbox - Hardened Ubuntu 26.04 LTS WSL2 Sandbox CLI (box.ps1)
 
 Usage:
   .\box.ps1 <command> [options]
@@ -65,7 +65,7 @@ Commands:
   apply              Push updated box.json (shared folders, allowed host ports, Docker policy,
                      apt packages, CLI/language toolchains) and reload hardening + proxy live
                      without rebuilding (use -RebuildProxy to rebuild docker-policy-proxy).
-  seed-secrets [path] Seed or rotate CLI machine account tokens & service account secrets from a
+  seed-secrets [path] Seed or rotate CLI tokens, service accounts, and SSH credentials from a
                      central Windows manifest (default: %USERPROFILE%\.wsl-agent-sandbox\secrets.json)
                      independently of init/apply. Supports -SecretsPath, -Service <names>, -Prune, -DryRun.
   clear-secrets      Remove managed seeded CLI credentials inside WSL (optionally scoped via -Service).
@@ -230,7 +230,7 @@ function Invoke-SeedSecrets {
     }
 
     if ($DryRun) {
-        Write-Host "[seed-secrets] Dry run complete — no credentials were pushed to '$distro'."
+        Write-Host "[seed-secrets] Dry run complete - no credentials were pushed to '$distro'."
         return
     }
 
