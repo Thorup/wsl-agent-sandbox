@@ -321,6 +321,8 @@ func needsJSONBodyInspection(method, rawPath string) bool {
 		return true
 	case norm == "/volumes/create":
 		return true
+	case norm == "/networks/create":
+		return true
 	case hasPrefixSuffix(norm, "/containers/", "/update"):
 		return true
 	case hasPrefixSuffix(norm, "/containers/", "/exec"):

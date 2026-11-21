@@ -236,6 +236,9 @@ elif docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
   expect_docker_blocked "malicious volume create (type=none,o=bind,device=/run/desktop/mnt/host/c)" \
     docker volume create --driver local --opt type=none --opt o=bind --opt device=/run/desktop/mnt/host/c evil_box_vol
 
+  expect_docker_blocked "non-loopback PortBindings (0.0.0.0:18999:80)" \
+    docker run --rm -p 0.0.0.0:18999:80 alpine:latest true
+
   rm -rf "${WORK_DIR}"
 else
   warn "Docker Desktop not reachable via proxy (is Docker Desktop running on Windows?)"

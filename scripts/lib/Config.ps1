@@ -424,6 +424,14 @@ function Assert-BoxConfigValid {
             throw "Unsafe docker.allowBindPrefixes entry '$bp'."
         }
     }
+    if ($Config.docker.PSObject.Properties['allowedPublishedPorts'] -and $null -ne $Config.docker.allowedPublishedPorts) {
+        foreach ($pp in @($Config.docker.allowedPublishedPorts)) {
+            $pNum = [int]$pp
+            if ($pNum -lt 1 -or $pNum -gt 65535) {
+                throw "Invalid docker.allowedPublishedPorts port '$pp'. Must be 1-65535."
+            }
+        }
+    }
 
     # Validate packages
     if (-not $Config.packages) {

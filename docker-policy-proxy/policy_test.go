@@ -811,3 +811,75 @@ func TestEphemeralCleanupOnEmptyIDAndPruneAndMissing(t *testing.T) {
 		t.Fatalf("expected 3 unmounted targets total after AutoRemove event, got %d", u)
 	}
 }
+
+func boolPtr(b bool) *bool { return &b }
+
+func TestPortBindingsAndInternalNetworkPolicy(t *testing.T) {
+	// 1. Default forceLoopbackPortBindings=true rewrites empty HostIp -> 127.0.0.1 and blocks 0.0.0.0
+	pol := &Policy{Enabled: true}
+	body, _ := json.Marshal(map[string]any{
+		"Image": "alpine",
+		"HostConfig": map[string]any{
+			"PortBindings": map[string]any{
+				"80/tcp": []map[string]any{{"HostPort": "8080"}},
+			},
+		},
+	})
+	rewritten, modified, err := pol.ProcessJSONBody(http.MethodPost, "/containers/create", body)
+	if err != nil || !modified {
+		t.Fatalf("expected loopback HostIp rewrite, got err=%v modified=%v", err, modified)
+	}
+	if !strings.Contains(string(rewritten), `"127.0.0.1"`) {
+		t.Fatalf("expected HostIp 127.0.0.1 in rewritten payload: %s", string(rewritten))
+	}
+
+	badIPBody, _ := json.Marshal(map[string]any{
+		"Image": "alpine",
+		"HostConfig": map[string]any{
+			"PortBindings": map[string]any{
+				"80/tcp": []map[string]any{{"HostIp": "0.0.0.0", "HostPort": "8080"}},
+			},
+		},
+	})
+	if _, _, err := pol.ProcessJSONBody(http.MethodPost, "/containers/create", badIPBody); err == nil {
+		t.Fatalf("expected 0.0.0.0 HostIp to be denied when forceLoopbackPortBindings=true")
+	}
+
+	// 2. allowedPublishedPorts allowlist
+	polAllowed := &Policy{Enabled: true, AllowedPublishedPorts: []int{8080}}
+	if _, _, err := polAllowed.ProcessJSONBody(http.MethodPost, "/containers/create", body); err != nil {
+		t.Fatalf("expected allowlisted port 8080 to pass, got %v", err)
+	}
+	badPortBody, _ := json.Marshal(map[string]any{
+		"Image": "alpine",
+		"HostConfig": map[string]any{
+			"PortBindings": map[string]any{
+				"80/tcp": []map[string]any{{"HostIp": "127.0.0.1", "HostPort": "9090"}},
+			},
+		},
+	})
+	if _, _, err := polAllowed.ProcessJSONBody(http.MethodPost, "/containers/create", badPortBody); err == nil {
+		t.Fatalf("expected non-allowlisted port 9090 to be denied")
+	}
+
+	// 3. allowPortBindings=false denies PortBindings and PublishAllPorts
+	polNoPorts := &Policy{Enabled: true, AllowPortBindings: boolPtr(false)}
+	if _, _, err := polNoPorts.ProcessJSONBody(http.MethodPost, "/containers/create", body); err == nil {
+		t.Fatalf("expected PortBindings to be denied when allowPortBindings=false")
+	}
+
+	// 4. forceInternalNetwork=true blocks bridge and forces Internal=true on /networks/create
+	polInternal := &Policy{Enabled: true, ForceInternalNetwork: true}
+	bridgeBody, _ := json.Marshal(map[string]any{
+		"Image":      "alpine",
+		"HostConfig": map[string]any{"NetworkMode": "bridge"},
+	})
+	if _, _, err := polInternal.ProcessJSONBody(http.MethodPost, "/containers/create", bridgeBody); err == nil {
+		t.Fatalf("expected NetworkMode=bridge to be denied when forceInternalNetwork=true")
+	}
+	netCreateBody, _ := json.Marshal(map[string]any{"Name": "test-net"})
+	netOut, netMod, err := polInternal.ProcessJSONBody(http.MethodPost, "/networks/create", netCreateBody)
+	if err != nil || !netMod || !strings.Contains(string(netOut), `"Internal":true`) {
+		t.Fatalf("expected /networks/create to inject Internal:true, got err=%v mod=%v body=%s", err, netMod, string(netOut))
+	}
+}

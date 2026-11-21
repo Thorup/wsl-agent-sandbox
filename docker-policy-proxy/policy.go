@@ -9,6 +9,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 )
@@ -23,14 +24,32 @@ type BindMapping struct {
 
 // Policy defines the Docker API containment rules loaded from JSON.
 type Policy struct {
-	Enabled             bool                   `json:"enabled"`
-	AllowBuildKit       bool                   `json:"allowBuildKit"`
-	AllowCapAdd         []string               `json:"allowCapAdd"`
-	DenyEndpoints       []string               `json:"denyEndpoints"`
-	BindMappings        []BindMapping          `json:"bindMappings"`
-	EphemeralBindRoot   string                 `json:"ephemeralBindRoot,omitempty"`
-	EphemeralDaemonRoot string                 `json:"ephemeralDaemonRoot,omitempty"`
-	bindManager         *EphemeralMountManager `json:"-"`
+	Enabled                   bool                   `json:"enabled"`
+	AllowBuildKit             bool                   `json:"allowBuildKit"`
+	AllowCapAdd               []string               `json:"allowCapAdd"`
+	DenyEndpoints             []string               `json:"denyEndpoints"`
+	AllowPortBindings         *bool                  `json:"allowPortBindings,omitempty"`
+	ForceLoopbackPortBindings *bool                  `json:"forceLoopbackPortBindings,omitempty"`
+	AllowedPublishedPorts     []int                  `json:"allowedPublishedPorts,omitempty"`
+	ForceInternalNetwork      bool                   `json:"forceInternalNetwork,omitempty"`
+	BindMappings              []BindMapping          `json:"bindMappings"`
+	EphemeralBindRoot         string                 `json:"ephemeralBindRoot,omitempty"`
+	EphemeralDaemonRoot       string                 `json:"ephemeralDaemonRoot,omitempty"`
+	bindManager               *EphemeralMountManager `json:"-"`
+}
+
+func (p *Policy) portBindingsAllowed() bool {
+	if p.AllowPortBindings == nil {
+		return true
+	}
+	return *p.AllowPortBindings
+}
+
+func (p *Policy) loopbackPortBindingsForced() bool {
+	if p.ForceLoopbackPortBindings == nil {
+		return true
+	}
+	return *p.ForceLoopbackPortBindings
 }
 
 var (
@@ -203,6 +222,9 @@ func (p *Policy) ProcessJSONBodyWithMounts(method, rawPath string, body []byte) 
 	case norm == "/volumes/create":
 		b, m, err := p.processVolumeCreate(body)
 		return b, m, nil, err
+	case norm == "/networks/create":
+		b, m, err := p.processNetworkCreate(body)
+		return b, m, nil, err
 	default:
 		return body, false, nil, nil
 	}
@@ -299,6 +321,14 @@ func (p *Policy) processContainerCreate(body []byte) ([]byte, bool, []string, er
 	}
 	hcKey, hcRaw, hasHC := getKeyCI(obj, "HostConfig")
 	if !hasHC || hcRaw == nil {
+		if p.ForceInternalNetwork {
+			obj["HostConfig"] = map[string]any{"NetworkMode": "none"}
+			out, err := json.Marshal(obj)
+			if err != nil {
+				return nil, false, nil, fmt.Errorf("re-marshaling container create body: %w", err)
+			}
+			return out, true, nil, nil
+		}
 		return body, false, nil, nil
 	}
 	hc, ok := hcRaw.(map[string]any)
@@ -394,6 +424,97 @@ func checkVolumeDriverOpts(opts map[string]any) error {
 	return nil
 }
 
+func (p *Policy) processNetworkCreate(body []byte) ([]byte, bool, error) {
+	if !p.ForceInternalNetwork {
+		return body, false, nil
+	}
+	obj, err := decodeStrictObject(body)
+	if err != nil {
+		return nil, false, err
+	}
+	_, intRaw, hasInt := getKeyCI(obj, "Internal")
+	if hasInt && intRaw != nil {
+		b, valid := asBool(intRaw)
+		if !valid {
+			return nil, false, deny("network Internal must be a boolean")
+		}
+		if !b {
+			return nil, false, deny("non-internal Docker networks are forbidden when forceInternalNetwork is enabled")
+		}
+		return body, false, nil
+	}
+	obj["Internal"] = true
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return nil, false, fmt.Errorf("re-marshaling network create body: %w", err)
+	}
+	return out, true, nil
+}
+
+func (p *Policy) validateAndRewritePortBindings(pbMap map[string]any) (bool, error) {
+	if len(pbMap) == 0 {
+		return false, nil
+	}
+	if !p.portBindingsAllowed() {
+		return false, deny("HostConfig.PortBindings is disabled by policy")
+	}
+	allowedSet := make(map[int]bool, len(p.AllowedPublishedPorts))
+	for _, port := range p.AllowedPublishedPorts {
+		allowedSet[port] = true
+	}
+
+	modified := false
+	for portProto, rawBindings := range pbMap {
+		if rawBindings == nil {
+			continue
+		}
+		arr, ok := rawBindings.([]any)
+		if !ok {
+			return false, deny("PortBindings[%q] must be an array", portProto)
+		}
+		for _, item := range arr {
+			bObj, ok := item.(map[string]any)
+			if !ok {
+				return false, deny("PortBindings[%q] entry must be an object", portProto)
+			}
+			if len(allowedSet) > 0 {
+				_, hpRaw, hasHP := getKeyCI(bObj, "HostPort")
+				if !hasHP || hpRaw == nil {
+					return false, deny("PortBindings[%q] must specify an allowlisted HostPort", portProto)
+				}
+				hpStr, ok := asString(hpRaw)
+				if !ok {
+					return false, deny("PortBindings[%q].HostPort must be a string", portProto)
+				}
+				hpNum, err := strconv.Atoi(strings.TrimSpace(hpStr))
+				if err != nil || !allowedSet[hpNum] {
+					return false, deny("published host port %q is not in docker.allowedPublishedPorts", hpStr)
+				}
+			}
+			if p.loopbackPortBindingsForced() {
+				ipKey, ipRaw, hasIP := getKeyCI(bObj, "HostIp")
+				if !hasIP || ipRaw == nil {
+					bObj["HostIp"] = "127.0.0.1"
+					modified = true
+				} else {
+					ipStr, ok := asString(ipRaw)
+					if !ok {
+						return false, deny("PortBindings[%q].HostIp must be a string", portProto)
+					}
+					trimmed := strings.TrimSpace(ipStr)
+					if trimmed == "" {
+						bObj[ipKey] = "127.0.0.1"
+						modified = true
+					} else if trimmed != "127.0.0.1" && trimmed != "::1" {
+						return false, deny("PortBindings HostIp %q is forbidden (must bind to 127.0.0.1)", ipStr)
+					}
+				}
+			}
+		}
+	}
+	return modified, nil
+}
+
 func (p *Policy) validateAndRewriteHostConfig(hc map[string]any) (bool, []string, error) {
 	modified := false
 	var ephemeralTargets []string
@@ -420,6 +541,49 @@ func (p *Policy) validateAndRewriteHostConfig(hc map[string]any) (bool, []string
 			if lm == "host" || strings.HasPrefix(lm, "host:") || strings.HasPrefix(lm, "ns:") {
 				return false, ephemeralTargets, deny("HostConfig.%s=%q is forbidden", nsField, mode)
 			}
+		}
+	}
+
+	// 2b. Force internal/isolated container networking when configured
+	if p.ForceInternalNetwork {
+		nmKey, nmRaw, hasNM := getKeyCI(hc, "NetworkMode")
+		if !hasNM || nmRaw == nil {
+			hc["NetworkMode"] = "none"
+			modified = true
+		} else {
+			mode, _ := asString(nmRaw)
+			lm := strings.ToLower(strings.TrimSpace(mode))
+			if lm == "" || lm == "default" {
+				hc[nmKey] = "none"
+				modified = true
+			} else if lm == "bridge" {
+				return false, ephemeralTargets, deny("HostConfig.NetworkMode=%q is forbidden when forceInternalNetwork is enabled", mode)
+			}
+		}
+	}
+
+	// 2c. PortBindings & PublishAllPorts policy
+	if _, val, ok := getKeyCI(hc, "PublishAllPorts"); ok && val != nil {
+		b, valid := asBool(val)
+		if !valid {
+			return false, ephemeralTargets, deny("HostConfig.PublishAllPorts must be a boolean")
+		}
+		if b && (!p.portBindingsAllowed() || len(p.AllowedPublishedPorts) > 0) {
+			return false, ephemeralTargets, deny("HostConfig.PublishAllPorts is forbidden by policy")
+		}
+	}
+	if pbKey, val, ok := getKeyCI(hc, "PortBindings"); ok && val != nil {
+		pbMap, valid := val.(map[string]any)
+		if !valid {
+			return false, ephemeralTargets, deny("HostConfig.PortBindings must be an object")
+		}
+		pbModified, err := p.validateAndRewritePortBindings(pbMap)
+		if err != nil {
+			return false, ephemeralTargets, err
+		}
+		if pbModified {
+			hc[pbKey] = pbMap
+			modified = true
 		}
 	}
 
