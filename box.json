@@ -87,6 +87,12 @@
     "installJiraCli": true,
     "installUpctl": true,
     "installDotnetSdk": true,
-    "installRust": true
+    "installRust": true,
+    "installCodexCli": false,
+    "installOpenCode": false,
+    "installAider": false,
+    "installHelm": false,
+    "installOpenTofu": false,
+    "installPlaywrightChromium": false
   }
 }
