@@ -432,6 +432,45 @@ function Assert-BoxConfigValid {
             }
         }
     }
+    $limitSpecs = @{
+        memoryBytes = [int64]4194304
+        nanoCpus    = [int64]1000000
+        pidsLimit   = [int64]1
+    }
+    foreach ($sectionName in @('defaultLimits', 'maxLimits')) {
+        if ($Config.docker.PSObject.Properties[$sectionName] -and $null -ne $Config.docker.$sectionName) {
+            $secObj = $Config.docker.$sectionName
+            foreach ($prop in $secObj.PSObject.Properties) {
+                if (-not $limitSpecs.ContainsKey($prop.Name)) {
+                    throw "Unknown property '$($prop.Name)' in docker.$sectionName. Allowed: $($limitSpecs.Keys -join ', ')."
+                }
+                if ($null -eq $prop.Value) { continue }
+                $valNum = [int64]$prop.Value
+                $minVal = $limitSpecs[$prop.Name]
+                if ($valNum -lt $minVal) {
+                    throw "docker.$sectionName.$($prop.Name) ($valNum) must be >= $minVal."
+                }
+            }
+        }
+    }
+    if ($Config.docker.PSObject.Properties['defaultLimits'] -and $null -ne $Config.docker.defaultLimits -and
+        $Config.docker.PSObject.Properties['maxLimits'] -and $null -ne $Config.docker.maxLimits) {
+        foreach ($field in $limitSpecs.Keys) {
+            $hasDef = $Config.docker.defaultLimits.PSObject.Properties[$field] -and $null -ne $Config.docker.defaultLimits.$field
+            $hasMax = $Config.docker.maxLimits.PSObject.Properties[$field] -and $null -ne $Config.docker.maxLimits.$field
+            if ($hasDef -and $hasMax -and ([int64]$Config.docker.defaultLimits.$field -gt [int64]$Config.docker.maxLimits.$field)) {
+                throw "docker.defaultLimits.$field ($($Config.docker.defaultLimits.$field)) exceeds docker.maxLimits.$field ($($Config.docker.maxLimits.$field))."
+            }
+        }
+    }
+    if ($Config.docker.PSObject.Properties['allowedRegistries'] -and $null -ne $Config.docker.allowedRegistries) {
+        foreach ($reg in @($Config.docker.allowedRegistries)) {
+            $rStr = [string]$reg
+            if ([string]::IsNullOrWhiteSpace($rStr) -or $rStr -match '://|[/\\\s]') {
+                throw "Invalid docker.allowedRegistries entry '$reg'. Expected registry host[:port] (e.g., docker.io, ghcr.io, localhost:5000)."
+            }
+        }
+    }
 
     # Validate packages
     if (-not $Config.packages) {

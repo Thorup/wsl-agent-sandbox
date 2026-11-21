@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"math/big"
 	"net/http"
 	"os"
 	"path"
@@ -22,6 +24,13 @@ type BindMapping struct {
 	ReadOnly     bool   `json:"readOnly"`
 }
 
+// ResourceLimits defines optional default/maximum container resource caps.
+type ResourceLimits struct {
+	MemoryBytes int64 `json:"memoryBytes,omitempty"`
+	NanoCpus    int64 `json:"nanoCpus,omitempty"`
+	PidsLimit   int64 `json:"pidsLimit,omitempty"`
+}
+
 // Policy defines the Docker API containment rules loaded from JSON.
 type Policy struct {
 	Enabled                   bool                   `json:"enabled"`
@@ -32,6 +41,9 @@ type Policy struct {
 	ForceLoopbackPortBindings *bool                  `json:"forceLoopbackPortBindings,omitempty"`
 	AllowedPublishedPorts     []int                  `json:"allowedPublishedPorts,omitempty"`
 	ForceInternalNetwork      bool                   `json:"forceInternalNetwork,omitempty"`
+	DefaultLimits             ResourceLimits         `json:"defaultLimits,omitempty"`
+	MaxLimits                 ResourceLimits         `json:"maxLimits,omitempty"`
+	AllowedRegistries         []string               `json:"allowedRegistries,omitempty"`
 	BindMappings              []BindMapping          `json:"bindMappings"`
 	EphemeralBindRoot         string                 `json:"ephemeralBindRoot,omitempty"`
 	EphemeralDaemonRoot       string                 `json:"ephemeralDaemonRoot,omitempty"`
@@ -193,6 +205,33 @@ func (p *Policy) CheckEndpoint(method, rawPath string, query map[string][]string
 		}
 	}
 
+	// Image pull / import registry allowlist on POST /images/create and POST /images/load
+	if len(p.AllowedRegistries) > 0 && method == http.MethodPost {
+		if norm == "/images/load" {
+			return deny("endpoint %q is forbidden when docker.allowedRegistries is configured", norm)
+		}
+		if norm == "/images/create" {
+			for k, vals := range query {
+				if strings.EqualFold(k, "fromSrc") {
+					for _, v := range vals {
+						if strings.TrimSpace(v) != "" {
+							return deny("image import fromSrc %q is forbidden when docker.allowedRegistries is configured", v)
+						}
+					}
+				}
+				if strings.EqualFold(k, "fromImage") {
+					for _, v := range vals {
+						if trimmed := strings.TrimSpace(v); trimmed != "" {
+							if err := p.checkImageRegistry(trimmed); err != nil {
+								return err
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -345,6 +384,19 @@ func (p *Policy) processContainerCreate(body []byte) ([]byte, bool, []string, er
 	if err != nil {
 		return nil, false, nil, err
 	}
+	if len(p.AllowedRegistries) > 0 {
+		if _, imgRaw, ok := getKeyCI(obj, "Image"); ok && imgRaw != nil {
+			imgStr, valid := asString(imgRaw)
+			if !valid {
+				return nil, false, nil, deny("Image must be a string")
+			}
+			if strings.TrimSpace(imgStr) != "" {
+				if err := p.checkImageRegistry(imgStr); err != nil {
+					return nil, false, nil, err
+				}
+			}
+		}
+	}
 
 	hasEndpoints := false
 	ncModified := false
@@ -383,8 +435,17 @@ func (p *Policy) processContainerCreate(body []byte) ([]byte, bool, []string, er
 
 	hcKey, hcRaw, hasHC := getKeyCI(obj, "HostConfig")
 	if !hasHC || hcRaw == nil {
+		hc := map[string]any{}
+		modified, _, err := p.applyResourceLimits(hc)
+		if err != nil {
+			return nil, false, nil, err
+		}
 		if p.ForceInternalNetwork && !hasEndpoints {
-			obj["HostConfig"] = map[string]any{"NetworkMode": "none"}
+			hc["NetworkMode"] = "none"
+			modified = true
+		}
+		if modified {
+			obj["HostConfig"] = hc
 			ncModified = true
 		}
 		if !ncModified {
@@ -434,6 +495,9 @@ func (p *Policy) processContainerUpdate(body []byte) ([]byte, bool, error) {
 		if _, val, ok := getKeyCI(obj, forbidden); ok && !isEmptyValue(val) {
 			return nil, false, deny("container update field %q is forbidden", forbidden)
 		}
+	}
+	if err := p.validateMaxLimits(obj, true); err != nil {
+		return nil, false, err
 	}
 	return body, false, nil
 }
@@ -597,9 +661,245 @@ func (p *Policy) validateAndRewritePortBindings(pbMap map[string]any) (bool, err
 	return modified, nil
 }
 
+func extractImageRegistry(imageRef string) string {
+	ref := strings.TrimSpace(imageRef)
+	if strings.HasPrefix(strings.ToLower(ref), "sha256:") {
+		return ""
+	}
+	if idx := strings.Index(ref, "@"); idx != -1 {
+		ref = ref[:idx]
+	}
+	if ref == "" {
+		return ""
+	}
+	firstSlash := strings.Index(ref, "/")
+	if firstSlash == -1 {
+		return "docker.io"
+	}
+	firstPart := ref[:firstSlash]
+	if strings.Contains(firstPart, ".") || strings.Contains(firstPart, ":") || strings.EqualFold(firstPart, "localhost") {
+		return strings.ToLower(firstPart)
+	}
+	return "docker.io"
+}
+
+func (p *Policy) checkImageRegistry(imageRef string) error {
+	if len(p.AllowedRegistries) == 0 {
+		return nil
+	}
+	reg := extractImageRegistry(imageRef)
+	if reg == "" {
+		return deny("image %q has no registry (raw digests/IDs are forbidden when docker.allowedRegistries is set)", imageRef)
+	}
+	for _, allowed := range p.AllowedRegistries {
+		a := strings.ToLower(strings.TrimSpace(allowed))
+		if a == "" {
+			continue
+		}
+		if a == reg {
+			return nil
+		}
+		if a == "docker.io" && (reg == "index.docker.io" || reg == "registry-1.docker.io" || reg == "registry.hub.docker.com") {
+			return nil
+		}
+	}
+	return deny("image %q registry %q is not in docker.allowedRegistries", imageRef, reg)
+}
+
+func asInt64(v any) (int64, bool) {
+	switch tv := v.(type) {
+	case float64:
+		if math.IsNaN(tv) || math.IsInf(tv, 0) || math.Trunc(tv) != tv {
+			return 0, false
+		}
+		if tv < -9223372036854775808.0 || tv >= 9223372036854775808.0 {
+			return 0, false
+		}
+		return int64(tv), true
+	case int64:
+		return tv, true
+	case int:
+		return int64(tv), true
+	default:
+		return 0, false
+	}
+}
+
+func (p *Policy) validateCpuQuotaLimits(obj map[string]any, enforce bool) (bool, error) {
+	var hasQuota bool
+	var quota int64
+	if _, qVal, ok := getKeyCI(obj, "CpuQuota"); ok && qVal != nil {
+		q, valid := asInt64(qVal)
+		if !valid {
+			return false, deny("HostConfig.CpuQuota must be an integer")
+		}
+		if q < 0 {
+			return false, deny("HostConfig.CpuQuota (%d) cannot be negative", q)
+		}
+		if q > 0 {
+			hasQuota = true
+			quota = q
+		}
+	}
+	var period int64
+	if _, pVal, ok := getKeyCI(obj, "CpuPeriod"); ok && pVal != nil {
+		pr, valid := asInt64(pVal)
+		if !valid {
+			return false, deny("HostConfig.CpuPeriod must be an integer")
+		}
+		if pr < 0 {
+			return false, deny("HostConfig.CpuPeriod (%d) cannot be negative", pr)
+		}
+		period = pr
+	}
+	if enforce && hasQuota && p.MaxLimits.NanoCpus > 0 {
+		effPeriod := int64(100000)
+		if period > 0 {
+			effPeriod = period
+		}
+		lhs := new(big.Int).Mul(big.NewInt(quota), big.NewInt(1_000_000_000))
+		rhs := new(big.Int).Mul(big.NewInt(p.MaxLimits.NanoCpus), big.NewInt(effPeriod))
+		if lhs.Cmp(rhs) > 0 {
+			return hasQuota, deny("HostConfig.CpuQuota (%d) / CpuPeriod (%d) exceeds maxLimits.nanoCpus (%d)", quota, effPeriod, p.MaxLimits.NanoCpus)
+		}
+	}
+	return hasQuota, nil
+}
+
+func (p *Policy) validateMemorySwapLimits(obj map[string]any) error {
+	enforceMem := p.MaxLimits.MemoryBytes > 0 || p.DefaultLimits.MemoryBytes > 0
+	if !enforceMem {
+		return nil
+	}
+	_, val, ok := getKeyCI(obj, "MemorySwap")
+	if !ok || val == nil {
+		return nil
+	}
+	swap, valid := asInt64(val)
+	if !valid {
+		return deny("HostConfig.MemorySwap must be an integer")
+	}
+	if swap < 0 {
+		return deny("HostConfig.MemorySwap (%d) unlimited swap is forbidden when memory limits are enforced", swap)
+	}
+	if p.MaxLimits.MemoryBytes > 0 && swap > 0 {
+		maxSwap := new(big.Int).Mul(big.NewInt(p.MaxLimits.MemoryBytes), big.NewInt(2))
+		if big.NewInt(swap).Cmp(maxSwap) > 0 {
+			return deny("HostConfig.MemorySwap (%d) exceeds 2x maxLimits.memoryBytes (%d)", swap, p.MaxLimits.MemoryBytes)
+		}
+	}
+	return nil
+}
+
+func (p *Policy) validateMaxLimits(obj map[string]any, allowZero bool) error {
+	checks := []struct {
+		field string
+		def   int64
+		max   int64
+	}{
+		{"Memory", p.DefaultLimits.MemoryBytes, p.MaxLimits.MemoryBytes},
+		{"NanoCpus", p.DefaultLimits.NanoCpus, p.MaxLimits.NanoCpus},
+		{"PidsLimit", p.DefaultLimits.PidsLimit, p.MaxLimits.PidsLimit},
+	}
+	for _, c := range checks {
+		if c.max <= 0 && c.def <= 0 {
+			continue
+		}
+		if _, val, ok := getKeyCI(obj, c.field); ok && val != nil {
+			n, valid := asInt64(val)
+			if !valid {
+				return deny("HostConfig.%s must be an integer", c.field)
+			}
+			if n < 0 {
+				return deny("HostConfig.%s (%d) cannot be negative", c.field, n)
+			}
+			if c.max > 0 {
+				if n == 0 && !allowZero {
+					if c.field == "NanoCpus" {
+						if hasQuota, _ := p.validateCpuQuotaLimits(obj, false); hasQuota {
+							continue
+						}
+					}
+					return deny("HostConfig.%s (0) exceeds maxLimits (%d)", c.field, c.max)
+				}
+				if n > c.max {
+					return deny("HostConfig.%s (%d) exceeds maxLimits (%d)", c.field, n, c.max)
+				}
+			}
+		}
+	}
+	if _, err := p.validateCpuQuotaLimits(obj, true); err != nil {
+		return err
+	}
+	return p.validateMemorySwapLimits(obj)
+}
+
+func (p *Policy) applyResourceLimits(hc map[string]any) (bool, []string, error) {
+	hasExplicitQuota, err := p.validateCpuQuotaLimits(hc, true)
+	if err != nil {
+		return false, nil, err
+	}
+	if err := p.validateMemorySwapLimits(hc); err != nil {
+		return false, nil, err
+	}
+
+	modified := false
+	limits := []struct {
+		field string
+		def   int64
+		max   int64
+	}{
+		{"Memory", p.DefaultLimits.MemoryBytes, p.MaxLimits.MemoryBytes},
+		{"NanoCpus", p.DefaultLimits.NanoCpus, p.MaxLimits.NanoCpus},
+		{"PidsLimit", p.DefaultLimits.PidsLimit, p.MaxLimits.PidsLimit},
+	}
+	for _, l := range limits {
+		eff := l.def
+		if eff <= 0 {
+			eff = l.max
+		}
+		key, val, ok := getKeyCI(hc, l.field)
+		if ok && val != nil {
+			n, valid := asInt64(val)
+			if !valid {
+				return false, nil, deny("HostConfig.%s must be an integer", l.field)
+			}
+			if n < 0 && (l.def > 0 || l.max > 0) {
+				return false, nil, deny("HostConfig.%s (%d) cannot be negative", l.field, n)
+			}
+			if l.field == "NanoCpus" && hasExplicitQuota {
+				if n > 0 {
+					return false, nil, deny("HostConfig.NanoCpus cannot be combined with CpuQuota")
+				}
+				continue
+			}
+			if eff > 0 && n == 0 {
+				hc[key] = eff
+				modified = true
+			}
+		} else if eff > 0 {
+			if l.field == "NanoCpus" && hasExplicitQuota {
+				continue
+			}
+			hc[l.field] = eff
+			modified = true
+		}
+	}
+	if err := p.validateMaxLimits(hc, false); err != nil {
+		return false, nil, err
+	}
+	return modified, nil, nil
+}
+
 func (p *Policy) validateAndRewriteHostConfig(hc map[string]any, hasEndpoints bool) (bool, []string, error) {
 	modified := false
 	var ephemeralTargets []string
+
+	if limMod, _, err := p.applyResourceLimits(hc); err != nil {
+		return false, ephemeralTargets, err
+	} else if limMod {
+		modified = true
+	}
 
 	// 1. Privileged
 	if _, val, ok := getKeyCI(hc, "Privileged"); ok {

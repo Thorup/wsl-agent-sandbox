@@ -235,6 +235,9 @@ compiled_docker_policy = {
     "forceLoopbackPortBindings": bool(docker_cfg.get("forceLoopbackPortBindings", True)),
     "allowedPublishedPorts": [int(p) for p in docker_cfg.get("allowedPublishedPorts", [])],
     "forceInternalNetwork": bool(docker_cfg.get("forceInternalNetwork", False)),
+    "defaultLimits": docker_cfg.get("defaultLimits", {}),
+    "maxLimits": docker_cfg.get("maxLimits", {}),
+    "allowedRegistries": docker_cfg.get("allowedRegistries", []),
     "bindMappings": bind_mappings,
 }
 if is_mountpoint(private_wsl_mnt):

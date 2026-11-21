@@ -196,6 +196,29 @@
           "type": "boolean",
           "default": false,
           "description": "Restrict containers from using Docker Desktop's default bridge network (prevents container egress to host.docker.internal/Windows host/LAN)."
+        },
+        "defaultLimits": {
+          "type": "object",
+          "description": "Default resource caps injected into HostConfig if unset.",
+          "properties": {
+            "memoryBytes": { "type": "integer", "minimum": 4194304 },
+            "nanoCpus": { "type": "integer", "minimum": 1000000 },
+            "pidsLimit": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "maxLimits": {
+          "type": "object",
+          "description": "Maximum allowed resource caps on container create/update.",
+          "properties": {
+            "memoryBytes": { "type": "integer", "minimum": 4194304 },
+            "nanoCpus": { "type": "integer", "minimum": 1000000 },
+            "pidsLimit": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "allowedRegistries": {
+          "type": "array",
+          "description": "Optional allowlist of container image registries (e.g., docker.io, ghcr.io, mcr.microsoft.com). Empty allows all.",
+          "items": { "type": "string" }
         }
       }
     },

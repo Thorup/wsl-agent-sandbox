@@ -414,6 +414,36 @@ try {
     Remove-Item -LiteralPath $tmpProfRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+# Accept valid docker limits and allowedRegistries
+$validLimitsCfg = Copy-Config $baseCfg
+$validLimitsCfg.docker | Add-Member -NotePropertyName 'defaultLimits' -NotePropertyValue ([pscustomobject]@{ memoryBytes = [int64]536870912; nanoCpus = [int64]1000000000; pidsLimit = 128 }) -Force
+$validLimitsCfg.docker | Add-Member -NotePropertyName 'maxLimits' -NotePropertyValue ([pscustomobject]@{ memoryBytes = [int64]1073741824; nanoCpus = [int64]2000000000; pidsLimit = 256 }) -Force
+$validLimitsCfg.docker | Add-Member -NotePropertyName 'allowedRegistries' -NotePropertyValue @('docker.io', 'ghcr.io', 'localhost:5000') -Force
+Assert-BoxConfigValid -Config $validLimitsCfg
+Assert-True "Accepts valid docker defaultLimits, maxLimits, and allowedRegistries" $true
+
+# Reject docker limit below schema minimum
+Assert-Throws "Rejects docker.defaultLimits.memoryBytes below 4MiB schema minimum" {
+    $c = Copy-Config $baseCfg
+    $c.docker | Add-Member -NotePropertyName 'defaultLimits' -NotePropertyValue ([pscustomobject]@{ memoryBytes = 1024 }) -Force
+    Assert-BoxConfigValid -Config $c
+} 'must be >='
+
+# Reject defaultLimits > maxLimits
+Assert-Throws "Rejects docker.defaultLimits exceeding docker.maxLimits" {
+    $c = Copy-Config $baseCfg
+    $c.docker | Add-Member -NotePropertyName 'defaultLimits' -NotePropertyValue ([pscustomobject]@{ memoryBytes = [int64]2147483648 }) -Force
+    $c.docker | Add-Member -NotePropertyName 'maxLimits' -NotePropertyValue ([pscustomobject]@{ memoryBytes = [int64]1073741824 }) -Force
+    Assert-BoxConfigValid -Config $c
+} 'exceeds docker.maxLimits'
+
+# Reject malformed docker.allowedRegistries entry
+Assert-Throws "Rejects invalid URL/slash in docker.allowedRegistries" {
+    $c = Copy-Config $baseCfg
+    $c.docker | Add-Member -NotePropertyName 'allowedRegistries' -NotePropertyValue @('https://ghcr.io/org') -Force
+    Assert-BoxConfigValid -Config $c
+} 'Invalid docker.allowedRegistries'
+
 Write-Host ""
 Write-Host "=== Config.Tests.ps1 Summary: PASS=$script:Passed FAIL=$script:Failed ==="
 if ($script:Failed -gt 0) {
