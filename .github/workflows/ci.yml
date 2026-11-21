@@ -1,0 +1,133 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  linux:
+    name: Linux (Go, ShellCheck, Schemas)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: docker-policy-proxy/go.mod
+          cache: false
+
+      - name: Run Go vet and race tests
+        working-directory: docker-policy-proxy
+        run: |
+          go vet ./...
+          go test -v -race ./...
+
+      - name: Check bash syntax and run ShellCheck
+        run: |
+          set -euo pipefail
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y --no-install-recommends shellcheck
+          fi
+          shellcheck --version
+          for script in scripts/linux/*.sh; do
+            bash -n "${script}"
+          done
+          shellcheck scripts/linux/*.sh
+
+      - name: Validate JSON schemas and configs
+        run: |
+          python3 -m pip install --quiet jsonschema
+          python3 - <<'PYEOF'
+          import json
+          import jsonschema
+
+          pairs = [
+              ("box.json", "box.schema.json"),
+              ("examples/secrets.example.json", "secrets.schema.json"),
+          ]
+          for data_path, schema_path in pairs:
+              with open(schema_path, encoding="utf-8") as f:
+                  schema = json.load(f)
+              with open(data_path, encoding="utf-8") as f:
+                  data = json.load(f)
+              jsonschema.Draft7Validator.check_schema(schema)
+              jsonschema.validate(instance=data, schema=schema)
+              print(f"[PASS] {data_path} validates against {schema_path}")
+          PYEOF
+
+  windows:
+    name: Windows (PowerShell Tests & PSScriptAnalyzer)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check PowerShell script syntax
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $scripts = Get-ChildItem -Path box.ps1, scripts, tests -Recurse -Filter *.ps1 | Sort-Object FullName
+          $parseErrorCount = 0
+          foreach ($file in $scripts) {
+            $tokens = $null
+            $parseErrors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$parseErrors)
+            if ($parseErrors.Count -gt 0) {
+              Write-Error "Syntax error(s) in $($file.FullName):`n$($parseErrors -join "`n")"
+              $parseErrorCount += $parseErrors.Count
+            } else {
+              Write-Host "[PASS] Syntax OK: $($file.FullName)"
+            }
+          }
+          if ($parseErrorCount -gt 0) {
+            exit 1
+          }
+
+      - name: Run PowerShell test suites (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/Config.Tests.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/Secrets.Tests.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run PowerShell test suites (PowerShell 7)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          pwsh -NoProfile -File tests/Config.Tests.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pwsh -NoProfile -File tests/Secrets.Tests.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Get-Module -ListAvailable -Name PSScriptAnalyzer)) {
+            Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
+          }
+          Import-Module PSScriptAnalyzer -Force
+          $targets = @('box.ps1', 'scripts', 'tests')
+          $findings = @(foreach ($t in $targets) {
+            Invoke-ScriptAnalyzer -Path $t -Recurse -Settings .PSScriptAnalyzerSettings.psd1
+          })
+          if ($findings.Count -gt 0) {
+            $findings | Format-Table ScriptName, Line, Severity, RuleName, Message -AutoSize -Wrap
+            throw "PSScriptAnalyzer reported $($findings.Count) issue(s)."
+          }
+          Write-Host "[PASS] PSScriptAnalyzer passed with 0 errors/warnings."

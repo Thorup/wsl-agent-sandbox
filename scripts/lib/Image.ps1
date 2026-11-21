@@ -4,11 +4,15 @@ Set-StrictMode -Version Latest
 function Enable-ModernTls {
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-    } catch {}
+    } catch {
+        Write-Verbose "TLS 1.2 configuration skipped: $($_.Exception.Message)"
+    }
     try {
         # TLS 1.3 enum value (12288) on newer .NET runtimes
         [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 12288
-    } catch {}
+    } catch {
+        Write-Verbose "TLS 1.3 configuration skipped: $($_.Exception.Message)"
+    }
 }
 
 function Invoke-HttpGetText {
