@@ -18,7 +18,7 @@
 #Requires -Version 5.1
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('init', 'up', 'apply', 'seed-secrets', 'clear-secrets', 'shell', 'root-shell', 'status', 'verify', 'snapshot', 'reset', 'destroy', 'help')]
+    [ValidateSet('init', 'up', 'apply', 'seed-secrets', 'clear-secrets', 'shell', 'root-shell', 'status', 'verify', 'snapshot', 'restore', 'reset', 'destroy', 'help')]
     [string]$Command = 'help',
 
     [Parameter(Position = 1)]
@@ -36,7 +36,13 @@ param(
 
     [switch]$Force,
 
-    [switch]$RebuildProxy
+    [switch]$RebuildProxy,
+
+    [switch]$Golden,
+
+    [switch]$SaveGolden,
+
+    [switch]$Full
 )
 
 Set-StrictMode -Version Latest
@@ -74,8 +80,10 @@ Commands:
   status             Show distro state, systemd service health, active /shared mounts, seeded secrets, and warnings.
   verify             Run full red-team isolation audit + Windows<->WSL localhost web test +
                      blocked Windows host port test + Docker escape tests.
-  snapshot [path]    Export the distro to a .tar backup (defaults to .cache\<distro>-<timestamp>.tar).
-  reset              Destroy and re-provision a clean distro from cached Ubuntu 26.04 image.
+  snapshot [path]    Export the distro to a .tar backup (defaults to .cache\<distro>-<timestamp>.tar;
+                     pass -Golden to save .cache\<distro>-golden.tar for fast resets).
+  restore <path>     Unregister the current distro, import a .tar backup, re-apply box.json, and verify.
+  reset              Fast-restore from golden snapshot if present (pass -Full for clean Ubuntu rebuild).
   destroy            Unregister the WSL distro and remove its VHDX directory (use -Force to skip prompt).
 "@
 }
@@ -112,8 +120,79 @@ function Sync-AssetsToWsl {
     }
 }
 
+function Get-GoldenSnapshotPath {
+    param([Parameter(Mandatory)]$Config)
+    $cacheDir = Expand-BoxPath -RawPath $Config.image.cacheDir -BaseDir $RepoRoot
+    return (Join-Path $cacheDir "$($Config.distroName)-golden.tar")
+}
+
+function Invoke-Snapshot {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [string]$OutFile = '',
+        [switch]$Golden
+    )
+    if (-not (Test-WslDistroExists -DistroName $Config.distroName)) {
+        throw "Distro '$($Config.distroName)' does not exist."
+    }
+    $cacheDir = Expand-BoxPath -RawPath $Config.image.cacheDir -BaseDir $RepoRoot
+    if (-not (Test-Path -LiteralPath $cacheDir)) {
+        New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null
+    }
+    if ($Golden) {
+        $OutFile = Get-GoldenSnapshotPath -Config $Config
+    } elseif ([string]::IsNullOrWhiteSpace($OutFile)) {
+        $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+        $OutFile = Join-Path $cacheDir "$($Config.distroName)-$stamp.tar"
+    }
+    Write-Host "[snapshot] Exporting '$($Config.distroName)' -> '$OutFile'..."
+    & wsl.exe --export $Config.distroName $OutFile
+    if ($LASTEXITCODE -ne 0) { throw "wsl --export failed." }
+    Write-Host "[snapshot] Saved: $OutFile"
+}
+
+function Invoke-Restore {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string]$SnapshotPath,
+        [switch]$Force
+    )
+    if ([string]::IsNullOrWhiteSpace($SnapshotPath) -or -not (Test-Path -LiteralPath $SnapshotPath -PathType Leaf)) {
+        throw "Snapshot file not found: '$SnapshotPath'"
+    }
+    $distro = $Config.distroName
+    $installDir = Expand-BoxPath -RawPath $Config.installDir -BaseDir $RepoRoot
+
+    if (Test-WslDistroExists -DistroName $distro) {
+        Invoke-Destroy -Config $Config -Force:$Force
+        if (Test-WslDistroExists -DistroName $distro) {
+            return
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath $installDir)) {
+        New-Item -ItemType Directory -Path $installDir -Force | Out-Null
+    }
+    Write-Host "[restore] Importing '$distro' into '$installDir' from '$SnapshotPath' (WSL 2)..."
+    & wsl.exe --import $distro $installDir $SnapshotPath --version 2
+    if ($LASTEXITCODE -ne 0) {
+        throw "wsl --import failed with exit code $LASTEXITCODE."
+    }
+
+    Write-Host "[restore] Waiting for systemd and box-hardening.service..."
+    if (-not (Wait-WslSystemdReady -DistroName $distro -TimeoutSeconds 60)) {
+        throw "Restored distro '$distro' systemd hardening did not reach active state."
+    }
+
+    Invoke-Apply -Config $Config
+    Invoke-Verify -Config $Config
+}
+
 function Invoke-Init {
-    param($Config)
+    param(
+        $Config,
+        [switch]$SaveGolden
+    )
     $distro = $Config.distroName
     $installDir = Expand-BoxPath -RawPath $Config.installDir -BaseDir $RepoRoot
 
@@ -169,6 +248,12 @@ function Invoke-Init {
 
     Write-Host "[init] '$distro' is provisioned and hardened! Running verification..."
     Invoke-Verify -Config $Config
+
+    $goldenPath = Get-GoldenSnapshotPath -Config $Config
+    if ($SaveGolden -or -not (Test-Path -LiteralPath $goldenPath -PathType Leaf)) {
+        Write-Host "[init] Saving golden base snapshot for fast resets -> '$goldenPath'..."
+        Invoke-Snapshot -Config $Config -Golden
+    }
 }
 
 function Invoke-Apply {
@@ -485,7 +570,7 @@ $cfg = Read-BoxConfig -ConfigPath $ConfigPath
 
 switch ($Command) {
     'init' {
-        Invoke-Init -Config $cfg
+        Invoke-Init -Config $cfg -SaveGolden:$SaveGolden
     }
     'up' {
         if (-not (Test-WslDistroExists -DistroName $cfg.distroName)) {
@@ -525,24 +610,20 @@ switch ($Command) {
         Invoke-Verify -Config $cfg
     }
     'snapshot' {
-        if (-not (Test-WslDistroExists -DistroName $cfg.distroName)) {
-            throw "Distro '$($cfg.distroName)' does not exist."
-        }
-        $outFile = $Argument
-        if ([string]::IsNullOrWhiteSpace($outFile)) {
-            $cacheDir = Expand-BoxPath -RawPath $cfg.image.cacheDir -BaseDir $RepoRoot
-            if (-not (Test-Path -LiteralPath $cacheDir)) { New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null }
-            $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-            $outFile = Join-Path $cacheDir "$($cfg.distroName)-$stamp.tar"
-        }
-        Write-Host "[snapshot] Exporting '$($cfg.distroName)' -> '$outFile'..."
-        & wsl.exe --export $cfg.distroName $outFile
-        if ($LASTEXITCODE -ne 0) { throw "wsl --export failed." }
-        Write-Host "[snapshot] Saved: $outFile"
+        Invoke-Snapshot -Config $cfg -OutFile $Argument -Golden:$Golden
+    }
+    'restore' {
+        Invoke-Restore -Config $cfg -SnapshotPath $Argument -Force:$Force
     }
     'reset' {
-        Invoke-Destroy -Config $cfg -Force:$Force
-        Invoke-Init -Config $cfg
+        $goldenPath = Get-GoldenSnapshotPath -Config $cfg
+        if ((-not $Full) -and (Test-Path -LiteralPath $goldenPath -PathType Leaf)) {
+            Write-Host "[reset] Fast-restoring from golden snapshot '$goldenPath' (use -Full for clean Ubuntu rebuild)..."
+            Invoke-Restore -Config $cfg -SnapshotPath $goldenPath -Force:$Force
+        } else {
+            Invoke-Destroy -Config $cfg -Force:$Force
+            Invoke-Init -Config $cfg -SaveGolden:$SaveGolden
+        }
     }
     'destroy' {
         Invoke-Destroy -Config $cfg -Force:$Force

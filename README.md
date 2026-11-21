@@ -217,8 +217,9 @@ Manifest path resolution priority:
 - `.\box.ps1 verify` — Run full red-team isolation audit + Windows ↔ WSL `localhost` web test.
 - `.\box.ps1 status` — Inspect systemd services, active `/shared` mounts, seeded CLI secrets, and `nftables` rules.
 - `.\box.ps1 shell` / `.\box.ps1 root-shell` — Open agent shell or Windows-side admin root shell.
-- `.\box.ps1 snapshot [path]` — Export a `.tar` backup of the distro.
-- `.\box.ps1 reset` / `.\box.ps1 destroy` — Rebuild cleanly or remove the distro completely.
+- `.\box.ps1 snapshot [path]` — Export a `.tar` backup of the distro (pass `-Golden` to save `.cache\<distro>-golden.tar`).
+- `.\box.ps1 restore <path>` — Import a `.tar` backup, re-apply `box.json` policy, and run `verify`.
+- `.\box.ps1 reset` / `.\box.ps1 destroy` — Fast-restore from golden snapshot (pass `-Full` for clean Ubuntu rebuild) or remove the distro completely.
 
 ---
 
