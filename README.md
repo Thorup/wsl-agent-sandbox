@@ -160,7 +160,8 @@ Manifest path resolution priority:
 
 | Service Key | CLI / Tool | Auth Mechanism & Linux Target |
 | :--- | :--- | :--- |
-| `github` | `gh` + `git` | Machine account / fine-grained PAT → `~/.config/gh/hosts.yml`, `gh auth setup-git`, optional `GH_TOKEN` / `GH_ENTERPRISE_TOKEN` (and optional `loginOnline: true`). |
+| `github` | `gh` + `git` (HTTPS) | Machine account / fine-grained PAT → `~/.config/gh/hosts.yml`, `gh auth setup-git`, optional `GH_TOKEN` / `GH_ENTERPRISE_TOKEN` (and optional `loginOnline: true`). |
+| `git` | `git` (SSH + signing) | Dedicated Git SSH keys (plus optional `.pub` & OpenSSH `-cert.pub` certs) → `~/.ssh/wsl-agent-sandbox-git/` (`0600`), independent Git `Host` stanzas in `~/.ssh/config`, pinned `known_hosts`, plus optional Git identity (`user.name`/`user.email`), SSH commit/tag signing (`gpg.format = ssh`, `allowed_signers`), and HTTPS-to-SSH rewrites via `~/.config/wsl-agent-sandbox/gitconfig`. |
 | `aws` | `aws` | IAM access keys / STS tokens (single or multi-profile) → `~/.aws/credentials`, `~/.aws/config`, optional `AWS_PROFILE`. |
 | `gcloud` | `gcloud` + GCP SDKs | Service Account JSON key → `~/.config/wsl-agent-sandbox/keys/gcloud-service-account.json`, `gcloud auth activate-service-account`, project/region/zone config, `GOOGLE_APPLICATION_CREDENTIALS`. |
 | `azure` | `az` + Azure SDKs | Entra ID Service Principal (client secret or PEM cert) → `az login --service-principal`, optional subscription, `AZURE_CLIENT_ID`/`AZURE_TENANT_ID`/`AZURE_CLIENT_SECRET` (or `AZURE_CLIENT_CERTIFICATE_PATH`). |
@@ -170,9 +171,14 @@ Manifest path resolution priority:
 | `kubectl` | `kubectl` | Dedicated kubeconfig file OR Service Account bearer token → `~/.kube/config` + optional context switch. |
 | `gemini` | `gemini` | `GEMINI_API_KEY` and/or Vertex AI variables (`GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION`, `GOOGLE_GENAI_USE_VERTEXAI`). |
 | `claude` | `claude` | `ANTHROPIC_API_KEY` and/or `CLAUDE_CODE_OAUTH_TOKEN`. |
-| `ssh` | `ssh` / `scp` / `sftp` / `git` | Named SSH private keys (plus optional `.pub` & OpenSSH user `-cert.pub` certificates) → `~/.ssh/wsl-agent-sandbox/` (`0600`), marker-delimited `Host` stanzas & optional `defaultKey` in `~/.ssh/config`, and pinned `known_hosts`. |
+| `ssh` | `ssh` / `scp` / `sftp` | Named SSH private keys for remote servers/bastions (plus optional `.pub` & OpenSSH user `-cert.pub` certificates) → `~/.ssh/wsl-agent-sandbox/` (`0600`), marker-delimited `Host` stanzas & optional `defaultKey` in `~/.ssh/config`, and pinned `known_hosts`. |
 | `env` | Any CLI | Additional custom token environment variables exported into `~/.config/wsl-agent-sandbox/secrets.env` (protected system vars like `PATH`/`DOCKER_HOST`/`LD_PRELOAD` are rejected). |
 | `files` | Any CLI | Additional secret files (e.g., `~/.npmrc`, `~/.netrc`) copied atomically with `0600` strictly inside `/home/<agent>/`. |
+
+> **Git SSH & Commit Signing Notes**:
+> - Rotate or revoke Git SSH keys independently of remote server `ssh` credentials with `.\box.ps1 seed-secrets -Service git` or `.\box.ps1 clear-secrets -Service git`. Managed Git keys live in `~/.ssh/wsl-agent-sandbox-git/` and use their own marker-delimited block in `~/.ssh/config` (ahead of `ssh`'s `Host *` defaults), so `git` and `ssh` never clobber each other.
+> - Supports both a concise single-host shorthand (`"host": "github.com"`, `"privateKeyFile": "..."`) and multi-host / per-repo deploy-key aliases (`keys[]` + `hosts[]` for GitHub, GitLab, Azure DevOps `ssh.dev.azure.com`, Bitbucket, etc.), plus optional `userName`/`userEmail`, SSH commit/tag signing (`signing` → `gpg.format = ssh` + `allowed_signers` in `~/.config/wsl-agent-sandbox/gitconfig` included from `~/.gitconfig`), and optional `rewriteHttpsToSsh`.
+> - `StrictHostKeyChecking` is computed per Git host (`yes` when pinned known hosts cover that host, `accept-new` otherwise), and `BatchMode` defaults to `true` so agents fail fast instead of hanging on interactive SSH prompts. If you also use `github` with `"gitProtocol": "ssh"`, configure `git` alongside `github` to supply the SSH key.
 
 > **SSH Remote Server Access Notes**:
 > - Rotate or revoke agent SSH keys at any time with `.\box.ps1 seed-secrets -Service ssh` or `.\box.ps1 clear-secrets -Service ssh`. Managed keys live strictly in `~/.ssh/wsl-agent-sandbox/` and `~/.ssh/config` uses marker-delimited blocks, so manual user keys and custom `~/.ssh/config` entries are never overwritten; stale managed keys are automatically pruned on rotation.

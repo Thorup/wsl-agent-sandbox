@@ -65,7 +65,7 @@ Commands:
   apply              Push updated box.json (shared folders, allowed host ports, Docker policy,
                      apt packages, CLI/language toolchains) and reload hardening + proxy live
                      without rebuilding (use -RebuildProxy to rebuild docker-policy-proxy).
-  seed-secrets [path] Seed or rotate CLI tokens, service accounts, and SSH credentials from a
+  seed-secrets [path] Seed or rotate CLI tokens, service accounts, and Git/SSH credentials from a
                      central Windows manifest (default: %USERPROFILE%\.wsl-agent-sandbox\secrets.json)
                      independently of init/apply. Supports -SecretsPath, -Service <names>, -Prune, -DryRun.
   clear-secrets      Remove managed seeded CLI credentials inside WSL (optionally scoped via -Service).
