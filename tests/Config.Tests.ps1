@@ -313,6 +313,24 @@ try {
     }
 }
 
+# Resource quota validation tests
+$resOk = Copy-Config $baseCfg
+$resOk | Add-Member -NotePropertyName 'resources' -NotePropertyValue ([pscustomobject]@{ memoryMax = '8G'; cpuQuota = '400%'; tasksMax = 512 })
+Assert-BoxConfigValid -Config $resOk
+Assert-True "Accepts valid systemd resources block" $true
+
+Assert-Throws "Rejects invalid resources.memoryMax format" {
+    $c = Copy-Config $baseCfg
+    $c | Add-Member -NotePropertyName 'resources' -NotePropertyValue ([pscustomobject]@{ memoryMax = '8GB' })
+    Assert-BoxConfigValid -Config $c
+} 'Invalid resources\.memoryMax'
+
+Assert-Throws "Rejects out-of-range resources.tasksMax" {
+    $c = Copy-Config $baseCfg
+    $c | Add-Member -NotePropertyName 'resources' -NotePropertyValue ([pscustomobject]@{ tasksMax = 5 })
+    Assert-BoxConfigValid -Config $c
+} 'must be between 32 and 65536'
+
 Write-Host ""
 Write-Host "=== Config.Tests.ps1 Summary: PASS=$script:Passed FAIL=$script:Failed ==="
 if ($script:Failed -gt 0) {

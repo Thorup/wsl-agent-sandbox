@@ -413,4 +413,26 @@ if res.returncode != 0:
     sys.exit(1)
 
 print(f"[box-hardening] Loaded nftables table inet wsl_agent_sandbox for UID {agent_uid} (blockHostAndLan={block_host_and_lan}).")
+
+# --- D. Optional per-UID systemd resource quotas (user-<uid>.slice) ---
+slice_dir = f"/etc/systemd/system/user-{agent_uid}.slice.d"
+dropin_path = os.path.join(slice_dir, "50-wsl-agent-sandbox.conf")
+res_cfg = policy.get("resources") or {}
+slice_lines = []
+if res_cfg.get("memoryMax"):
+    slice_lines.append(f"MemoryMax={res_cfg['memoryMax']}")
+if res_cfg.get("cpuQuota"):
+    slice_lines.append(f"CPUQuota={res_cfg['cpuQuota']}")
+if res_cfg.get("tasksMax") is not None:
+    slice_lines.append(f"TasksMax={int(res_cfg['tasksMax'])}")
+
+if slice_lines:
+    os.makedirs(slice_dir, mode=0o755, exist_ok=True)
+    with open(dropin_path, "w", encoding="utf-8") as f:
+        f.write("[Slice]\n" + "\n".join(slice_lines) + "\n")
+    os.chmod(dropin_path, 0o644)
+    print(f"[box-hardening] Configured {dropin_path}: {', '.join(slice_lines)}")
+elif os.path.exists(dropin_path):
+    os.remove(dropin_path)
+    print(f"[box-hardening] Removed {dropin_path} (no resources quota configured).")
 PYEOF
