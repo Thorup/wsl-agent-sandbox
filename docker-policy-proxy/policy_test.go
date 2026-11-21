@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -493,5 +494,113 @@ func TestUpgradeHijackStream(t *testing.T) {
 	}
 	if reply != "ECHO:hello-docker-hijack\n" {
 		t.Fatalf("unexpected hijack echo: %q", reply)
+	}
+}
+
+type mockBindRecord struct {
+	target   string
+	ino      uint64
+	isDir    bool
+	readOnly bool
+}
+
+type mockBindMounter struct {
+	bound     []mockBindRecord
+	unmounted []string
+}
+
+func (m *mockBindMounter) BindFD(fd int, target string, isDir bool, readOnly bool) error {
+	var st syscall.Stat_t
+	if err := syscall.Fstat(fd, &st); err != nil {
+		return err
+	}
+	m.bound = append(m.bound, mockBindRecord{
+		target:   target,
+		ino:      st.Ino,
+		isDir:    isDir,
+		readOnly: readOnly,
+	})
+	return nil
+}
+
+func (m *mockBindMounter) UnmountAndRemove(target string) error {
+	m.unmounted = append(m.unmounted, target)
+	return nil
+}
+
+func TestBindPinningTOCTOUMitigation(t *testing.T) {
+	tmp := t.TempDir()
+	homeDir := filepath.Join(tmp, "home-agent")
+	sharedRO := filepath.Join(tmp, "shared-ro")
+	outsideDir := filepath.Join(tmp, "outside")
+	ephRoot := filepath.Join(tmp, "ephemeral")
+	projDir := filepath.Join(homeDir, "proj")
+	for _, d := range []string{projDir, sharedRO, outsideDir, ephRoot} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var origStat syscall.Stat_t
+	if err := syscall.Stat(projDir, &origStat); err != nil {
+		t.Fatal(err)
+	}
+
+	mounter := &mockBindMounter{}
+	bm := NewEphemeralMountManager(mounter)
+	pol := &Policy{
+		Enabled:             true,
+		EphemeralBindRoot:   ephRoot,
+		EphemeralDaemonRoot: "/run/desktop/mnt/host/wsl/box-binds/test/ephemeral",
+		BindMappings: []BindMapping{
+			{GuestPrefix: homeDir, DaemonPrefix: "/daemon/home", ReadOnly: false},
+			{GuestPrefix: sharedRO, DaemonPrefix: "/daemon/shared", ReadOnly: true},
+		},
+		bindManager: bm,
+	}
+
+	// 1. Allowed bind pins the original inode via openat(O_NOFOLLOW) and rewrites to ephemeralDaemonRoot.
+	body, _ := json.Marshal(map[string]any{
+		"Image": "alpine",
+		"HostConfig": map[string]any{
+			"Binds": []string{projDir + ":/app", sharedRO + ":/ro:rw"},
+		},
+	})
+	newBody, modified, targets, err := pol.ProcessJSONBodyWithMounts(http.MethodPost, "/containers/create", body)
+	if err != nil {
+		t.Fatalf("expected allowed binds to succeed, got: %v", err)
+	}
+	if !modified || len(targets) != 2 || len(mounter.bound) != 2 {
+		t.Fatalf("expected 2 pinned ephemeral mounts, got modified=%v targets=%d bound=%d", modified, len(targets), len(mounter.bound))
+	}
+	if mounter.bound[0].ino != origStat.Ino || mounter.bound[0].readOnly {
+		t.Fatalf("unexpected first pinned mount: %+v (expected ino=%d ro=false)", mounter.bound[0], origStat.Ino)
+	}
+	if !mounter.bound[1].readOnly {
+		t.Fatalf("expected sharedRO ephemeral mount to force readOnly=true")
+	}
+
+	// Simulate post-validation symlink swap: even if projDir is now replaced with a symlink
+	// to outsideDir, the already-pinned inode (mounter.bound[0].ino) was the original dir,
+	// and any subsequent create attempt is immediately rejected by O_NOFOLLOW.
+	if err := os.RemoveAll(projDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outsideDir, projDir); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := pol.ProcessJSONBodyWithMounts(http.MethodPost, "/containers/create", body); err == nil {
+		t.Fatalf("expected symlink-swapped path to be rejected by openat(O_NOFOLLOW)")
+	}
+
+	// 2. Verify container tracking and cleanup on delete.
+	var parsed map[string]any
+	if err := json.Unmarshal(newBody, &parsed); err != nil {
+		t.Fatal(err)
+	}
+	bm.Track("cid-123", targets)
+	bm.CleanupContainer("cid-123")
+	if len(mounter.unmounted) != 2 {
+		t.Fatalf("expected 2 ephemeral mounts unmounted on container delete, got %d", len(mounter.unmounted))
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strings"
 	"sync/atomic"
 )
 
@@ -21,6 +22,7 @@ const maxInspectBodyBytes = 10 * 1024 * 1024 // 10 MiB max JSON body for contain
 type PolicyProxy struct {
 	upstreamSocket string
 	policy         atomic.Pointer[Policy]
+	bindManager    *EphemeralMountManager
 	reverseProxy   *httputil.ReverseProxy
 	logger         *log.Logger
 }
@@ -29,8 +31,16 @@ func NewPolicyProxy(upstreamSocket string, initial *Policy, logger *log.Logger) 
 	if logger == nil {
 		logger = log.Default()
 	}
+	bm := NewEphemeralMountManager(nil)
+	if initial != nil {
+		initial.bindManager = bm
+		if initial.EphemeralBindRoot != "" {
+			bm.CleanupStale(initial.EphemeralBindRoot)
+		}
+	}
 	pp := &PolicyProxy{
 		upstreamSocket: upstreamSocket,
+		bindManager:    bm,
 		logger:         logger,
 	}
 	pp.policy.Store(initial)
@@ -57,7 +67,31 @@ func NewPolicyProxy(upstreamSocket string, initial *Policy, logger *log.Logger) 
 }
 
 func (pp *PolicyProxy) UpdatePolicy(next *Policy) {
+	if next != nil && next.bindManager == nil {
+		next.bindManager = pp.bindManager
+	}
 	pp.policy.Store(next)
+}
+
+type statusCaptureWriter struct {
+	http.ResponseWriter
+	status int
+	body   bytes.Buffer
+}
+
+func (w *statusCaptureWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *statusCaptureWriter) Write(p []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	if w.body.Len() < 64*1024 {
+		w.body.Write(p)
+	}
+	return w.ResponseWriter.Write(p)
 }
 
 func (pp *PolicyProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -73,6 +107,7 @@ func (pp *PolicyProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var ephemeralTargets []string
 	if needsJSONBodyInspection(r.Method, r.URL.Path) {
 		limited := io.LimitReader(r.Body, maxInspectBodyBytes+1)
 		bodyBytes, err := io.ReadAll(limited)
@@ -86,7 +121,7 @@ func (pp *PolicyProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		newBody, modified, err := pol.ProcessJSONBody(r.Method, r.URL.Path, bodyBytes)
+		newBody, modified, targets, err := pol.ProcessJSONBodyWithMounts(r.Method, r.URL.Path, bodyBytes)
 		if err != nil {
 			var pe *PolicyError
 			if errors.As(err, &pe) {
@@ -98,6 +133,7 @@ func (pp *PolicyProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeDockerJSONError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		ephemeralTargets = targets
 
 		if modified {
 			pp.logger.Printf("REWRITE method=%s path=%s bytes=%d->%d", r.Method, r.URL.Path, len(bodyBytes), len(newBody))
@@ -109,7 +145,33 @@ func (pp *PolicyProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		r.Header.Set("Content-Length", strconvItoa(len(newBody)))
 	}
 
+	if len(ephemeralTargets) > 0 {
+		capW := &statusCaptureWriter{ResponseWriter: w}
+		pp.reverseProxy.ServeHTTP(capW, r)
+		if capW.status >= 200 && capW.status < 300 {
+			var resp struct {
+				ID string `json:"Id"`
+			}
+			if json.Unmarshal(capW.body.Bytes(), &resp) == nil && resp.ID != "" {
+				pp.bindManager.Track(resp.ID, ephemeralTargets)
+			}
+		} else {
+			pp.bindManager.CleanupTargets(ephemeralTargets)
+		}
+		return
+	}
+
 	pp.reverseProxy.ServeHTTP(w, r)
+
+	if r.Method == http.MethodDelete {
+		norm := NormalizeAPIPath(r.URL.Path)
+		if strings.HasPrefix(norm, "/containers/") {
+			rest := strings.TrimPrefix(norm, "/containers/")
+			if cid, _, _ := strings.Cut(rest, "/"); cid != "" {
+				pp.bindManager.CleanupContainer(cid)
+			}
+		}
+	}
 }
 
 func needsJSONBodyInspection(method, rawPath string) bool {

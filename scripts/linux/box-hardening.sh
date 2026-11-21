@@ -233,6 +233,11 @@ compiled_docker_policy = {
     ]),
     "bindMappings": bind_mappings,
 }
+if is_mountpoint(private_wsl_mnt):
+    eph_local = os.path.join(private_wsl_mnt, "box-binds", distro, "ephemeral")
+    os.makedirs(eph_local, mode=0o700, exist_ok=True)
+    compiled_docker_policy["ephemeralBindRoot"] = eph_local
+    compiled_docker_policy["ephemeralDaemonRoot"] = f"/run/desktop/mnt/host/wsl/box-binds/{distro}/ephemeral"
 with open(docker_policy_file, "w", encoding="utf-8") as f:
     json.dump(compiled_docker_policy, f, indent=2)
 os.chmod(docker_policy_file, 0o600)
