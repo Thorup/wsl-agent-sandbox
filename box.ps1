@@ -18,7 +18,7 @@
 #Requires -Version 5.1
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('init', 'up', 'apply', 'upgrade', 'doctor', 'compact', 'logs', 'audit', 'push-repo', 'pull-diff', 'pull-branch', 'seed-secrets', 'clear-secrets', 'register-terminal', 'shell', 'root-shell', 'status', 'verify', 'snapshot', 'restore', 'reset', 'destroy', 'help')]
+    [ValidateSet('init', 'up', 'apply', 'upgrade', 'doctor', 'compact', 'logs', 'audit', 'list', 'push-repo', 'pull-diff', 'pull-branch', 'seed-secrets', 'clear-secrets', 'register-terminal', 'shell', 'root-shell', 'status', 'verify', 'snapshot', 'restore', 'reset', 'destroy', 'help')]
     [string]$Command = 'help',
 
     [Parameter(Position = 1)]
@@ -60,7 +60,10 @@ param(
 
     [string]$Branch = 'HEAD',
 
-    [string]$RepoPath = ''
+    [string]$RepoPath = '',
+
+    [Alias('Profile')]
+    [string]$ProfileName = ''
 )
 
 Set-StrictMode -Version Latest
@@ -97,6 +100,7 @@ Commands:
   compact            Trim free blocks inside WSL (fstrim) and compact the distro's ext4.vhdx.
   logs / audit       View root-owned security events (nftables drops, docker-policy-proxy denials,
                      box-hardening reloads) with optional -Source, -Since, -Lines.
+  list               List configured sandbox profiles, their distro names, UIDs, and WSL state.
   push-repo <path>   Bundle a Windows git repo and clone/update it into ~/work/<name> on native ext4.
   pull-diff <name>   Show git status, recent commits, and diffstat from ~/work/<name> inside WSL.
   pull-branch <name> Fetch agent commits from ~/work/<name> into a safe local branch (sandbox/<name>)
@@ -434,7 +438,8 @@ function Invoke-Status {
     if ($localOverride) {
         Write-Host "Local override: $localOverride (active)"
     }
-    $statusScript = @'
+    $agentUid = [int]$Config.agentUser.uid
+    $statusScript = "AGENT_UID=$agentUid`n" + @'
 echo "OS:          $(. /etc/os-release && echo "$PRETTY_NAME")"
 echo "Systemd:     $(systemctl is-system-running 2>/dev/null || echo inactive)"
 echo "Hardening:   $(systemctl is-active box-hardening.service 2>/dev/null || echo inactive)"
@@ -455,8 +460,13 @@ else
   echo "  (not initialized)"
 fi
 echo ""
-echo "Active nftables table inet wsl_agent_sandbox:"
-nft list table inet wsl_agent_sandbox 2>/dev/null || echo "  (not loaded)"
+echo "Active nftables table inet wsl_agent_sandbox_${AGENT_UID}:"
+nft list table inet "wsl_agent_sandbox_${AGENT_UID}" 2>/dev/null || echo "  (not loaded)"
+if nft list table inet wsl_agent_sandbox_shared >/dev/null 2>&1; then
+  echo ""
+  echo "Shared mirrored-loopback table inet wsl_agent_sandbox_shared:"
+  nft list table inet wsl_agent_sandbox_shared 2>/dev/null || true
+fi
 '@
     Invoke-WslRootBash -DistroName $distro -Script $statusScript
     $installDir = Expand-BoxPath -RawPath $Config.installDir -BaseDir $RepoRoot
@@ -546,25 +556,53 @@ function Invoke-Verify {
         }
     }
 
-    # Verify Windows -> WSL localhost web browsing AND WSL-internal localhost!
-    $webPort = 18765
+    # Verify Windows -> WSL localhost web browsing AND WSL-internal localhost using an ephemeral free port!
+    $webPort = 0
     $token = "wsl-localhost-ok-$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
     $serverProc = $null
     try {
-        & wsl.exe -d $distro -u $agent -- bash -c "mkdir -p /tmp/box-web-verify && printf '%s' '$token' > /tmp/box-web-verify/token.txt"
-        $serverProc = Start-Process -FilePath 'wsl.exe' -ArgumentList "-d $distro -u $agent -- python3 -m http.server $webPort --bind 0.0.0.0 --directory /tmp/box-web-verify" -PassThru -WindowStyle Hidden
+        $prepWeb = @'
+set -euo pipefail
+mkdir -p /tmp/box-web-verify
+rm -f /tmp/box-web-verify/port.txt /tmp/box-web-verify/port.txt.tmp
+cat <<'PYEOF' > /tmp/box-web-verify/srv.py
+import functools
+import http.server
+import os
+handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory="/tmp/box-web-verify")
+httpd = http.server.HTTPServer(("0.0.0.0", 0), handler)
+with open("/tmp/box-web-verify/port.txt.tmp", "w", encoding="utf-8") as f:
+    f.write(str(httpd.server_port))
+os.replace("/tmp/box-web-verify/port.txt.tmp", "/tmp/box-web-verify/port.txt")
+httpd.serve_forever()
+PYEOF
+printf '%s' "$1" > /tmp/box-web-verify/token.txt
+'@.Replace("`r`n", "`n")
+        $null = Invoke-WslAgentBashStdin -DistroName $distro -AgentName $agent -BashArgs @($token) -ScriptText $prepWeb
+        $serverProc = Start-Process -FilePath 'wsl.exe' -ArgumentList "-d $distro -u $agent -- python3 /tmp/box-web-verify/srv.py" -PassThru -WindowStyle Hidden
+
+        for ($i = 0; $i -lt 25; $i++) {
+            Start-Sleep -Milliseconds 200
+            $portStr = (& wsl.exe -d $distro -u $agent -- cat /tmp/box-web-verify/port.txt 2>$null | Out-String).Trim()
+            if ($portStr -match '^\d+$') {
+                $webPort = [int]$portStr
+                break
+            }
+        }
 
         $winOk = $false
-        for ($i = 0; $i -lt 15; $i++) {
-            Start-Sleep -Milliseconds 300
-            try {
-                $resp = Invoke-WebRequest -Uri "http://127.0.0.1:$webPort/token.txt" -UseBasicParsing -TimeoutSec 2
-                if ($resp.StatusCode -eq 200 -and $resp.Content.Trim() -eq $token) {
-                    $winOk = $true
-                    break
+        if ($webPort -gt 0) {
+            for ($i = 0; $i -lt 15; $i++) {
+                try {
+                    $resp = Invoke-WebRequest -Uri "http://127.0.0.1:$webPort/token.txt" -UseBasicParsing -TimeoutSec 2
+                    if ($resp.StatusCode -eq 200 -and $resp.Content.Trim() -eq $token) {
+                        $winOk = $true
+                        break
+                    }
+                } catch {
+                    Write-Verbose "Waiting for WSL test HTTP server on port ${webPort}: $($_.Exception.Message)"
                 }
-            } catch {
-                Write-Verbose "Waiting for WSL test HTTP server on port ${webPort}: $($_.Exception.Message)"
+                Start-Sleep -Milliseconds 250
             }
         }
 
@@ -575,7 +613,9 @@ function Invoke-Verify {
             $overallFailed = $true
         }
 
-        $wslSelf = (& wsl.exe -d $distro -u $agent -- curl -fsS --max-time 3 "http://127.0.0.1:$webPort/token.txt" 2>$null | Out-String).Trim()
+        $wslSelf = if ($webPort -gt 0) {
+            (& wsl.exe -d $distro -u $agent -- curl -fsS --max-time 3 "http://127.0.0.1:$webPort/token.txt" 2>$null | Out-String).Trim()
+        } else { '' }
         if ($wslSelf -eq $token) {
             Write-Host "  [PASS] WSL-internal localhost (http://127.0.0.1:$webPort) still works for agent's own local services!"
         } else {
@@ -1119,7 +1159,20 @@ if ($Command -eq 'help') {
     exit 0
 }
 
-$cfg = Read-BoxConfig -ConfigPath $ConfigPath
+if ($Command -eq 'list') {
+    $registered = @(Get-WslDistroList)
+    $profileNames = @('') + @(Get-ManagedBoxProfileNames -RepoRoot $RepoRoot -WarnOnInvalid)
+    Write-Host "=== Managed Sandbox Profiles ==="
+    foreach ($pName in $profileNames) {
+        $c = Resolve-BoxProfileConfig -RepoRoot $RepoRoot -Profile $pName
+        $state = if ($registered -contains $c.distroName) { 'Installed' } else { 'Not Installed' }
+        $label = if ($pName) { $pName } else { 'default' }
+        Write-Host ("  - {0,-15} distro={1,-28} uid={2} state={3}" -f $label, $c.distroName, $c.agentUser.uid, $state)
+    }
+    exit 0
+}
+
+$cfg = Resolve-BoxProfileConfig -RepoRoot $RepoRoot -ProfileName $ProfileName -ExplicitConfigPath $(if ($ConfigPath -ne (Join-Path $RepoRoot 'box.json')) { $ConfigPath } else { '' })
 
 switch ($Command) {
     'init' {

@@ -296,32 +296,81 @@ allowed_udp = sorted({int(p["port"]) for p in net_cfg.get("allowedHostPorts", []
 
 # Detect WSL2 mirrored networking (presence of 'loopback0' interface)
 has_loopback0 = run(["ip", "link", "show", "loopback0"], check=False).returncode == 0
-MARK_HEX = "0x00002604"
+SHARED_MARK_HEX = "0x00002604"
+LEGACY_MARK_HEX = f"0x{agent_uid:08x}"
+NFT_TABLE = f"wsl_agent_sandbox_{agent_uid}"
+SHARED_NFT_TABLE = "wsl_agent_sandbox_shared"
 
-# Manage per-UID mirrored-loopback policy routing rules cleanly (only affects agent_uid!)
-def sync_mirrored_ip_rules(enable):
+def sync_shared_nft_prerouting(enable_shared):
+    if enable_shared:
+        shared_script = (
+            f"table inet {SHARED_NFT_TABLE} {{\n"
+            "    chain prerouting {\n"
+            "        type filter hook prerouting priority mangle; policy accept;\n"
+            "    }\n"
+            "}\n"
+            f"flush chain inet {SHARED_NFT_TABLE} prerouting\n"
+            f'add rule inet {SHARED_NFT_TABLE} prerouting iifname "loopback0" ct mark set {SHARED_MARK_HEX}\n'
+        )
+        r = subprocess.run(["nft", "-f", "-"], input=shared_script, text=True, capture_output=True)
+        if r.returncode != 0:
+            print(f"[box-hardening] ERROR loading {SHARED_NFT_TABLE}: {r.stderr}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        run(["nft", "delete", "table", "inet", SHARED_NFT_TABLE], check=False)
+
+def any_sandbox_mangle_tables_active():
+    res = run(["nft", "list", "tables", "inet"], check=False)
+    if res.returncode != 0:
+        return False
+    for line in res.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 3 and parts[0] == "table" and parts[1] == "inet" and parts[2].startswith("wsl_agent_sandbox_"):
+            suffix = parts[2][len("wsl_agent_sandbox_"):]
+            if suffix.isdigit():
+                tbl = run(["nft", "list", "table", "inet", parts[2]], check=False)
+                if tbl.returncode == 0 and "chain mangle_output" in tbl.stdout:
+                    return True
+    return False
+
+# Manage per-UID mirrored-loopback policy routing rules cleanly (only affects agent_uid!),
+# while keeping one shared fwmark 0x00002604 rule across concurrent profiles.
+def sync_mirrored_ip_rules(enable_uid, enable_shared):
     for fam, target, wsl_table in [("-4", "127.0.0.0/8", "127"), ("-6", "::1/128", "127")]:
-        # Clean up any prior rules we installed (including legacy 'not' rule if present)
-        cleanup_specs = [
-            ["pref", "0", "to", target, "fwmark", MARK_HEX, "lookup", wsl_table],
+        # Remove legacy per-UID fwmark rules and this UID's uidrange rule
+        legacy_and_uid_specs = [
+            ["pref", "0", "to", target, "fwmark", LEGACY_MARK_HEX, "lookup", wsl_table],
             ["pref", "0", "to", target, "uidrange", f"{agent_uid}-{agent_uid}", "lookup", "local"],
-            ["pref", "0", "not", "to", target, "uidrange", f"{agent_uid}-{agent_uid}", "fwmark", MARK_HEX, "lookup", "local"],
+            ["pref", "0", "not", "to", target, "uidrange", f"{agent_uid}-{agent_uid}", "fwmark", LEGACY_MARK_HEX, "lookup", "local"],
+            ["pref", "0", "not", "to", target, "uidrange", f"{agent_uid}-{agent_uid}", "fwmark", SHARED_MARK_HEX, "lookup", "local"],
         ]
-        for spec in cleanup_specs:
+        for spec in legacy_and_uid_specs:
             for _ in range(4):
                 r = run(["ip", fam, "rule", "del"] + spec, check=False)
                 if r.returncode != 0:
                     break
-        if enable:
-            # Rule 1 (checked first): marked Windows->WSL replies & allowlisted host ports -> WSL loopback0 table
-            run(["ip", fam, "rule", "add", "pref", "0", "to", target, "fwmark", MARK_HEX, "lookup", wsl_table], check=False)
-            # Rule 2 (checked second): all other agent UID loopback traffic -> Linux local lo only
+        if enable_uid:
+            # Shared rule (checked first): marked Windows->WSL replies & allowlisted host ports -> WSL loopback0 table
+            existing = run(["ip", fam, "rule", "show"], check=False).stdout
+            target_prefix = target.split("/")[0]
+            has_shared = any(
+                ("0x2604" in ln or SHARED_MARK_HEX in ln)
+                and target_prefix in ln
+                and f"lookup {wsl_table}" in ln
+                for ln in existing.splitlines()
+            )
+            if not has_shared:
+                run(["ip", fam, "rule", "add", "pref", "0", "to", target, "fwmark", SHARED_MARK_HEX, "lookup", wsl_table], check=False)
+            # Per-UID rule (checked second): all other agent UID loopback traffic -> Linux local lo only
             run(["ip", fam, "rule", "add", "pref", "0", "to", target, "uidrange", f"{agent_uid}-{agent_uid}", "lookup", "local"], check=False)
-
-sync_mirrored_ip_rules(has_loopback0 and block_host_and_lan)
+        elif not enable_shared:
+            for _ in range(4):
+                r = run(["ip", fam, "rule", "del", "pref", "0", "to", target, "fwmark", SHARED_MARK_HEX, "lookup", wsl_table], check=False)
+                if r.returncode != 0:
+                    break
 
 lines = [
-    "table inet wsl_agent_sandbox {",
+    f"table inet {NFT_TABLE} {{",
 ]
 
 log_drops = bool(net_cfg.get("logDrops", True))
@@ -351,25 +400,22 @@ if block_host_and_lan and log_drops:
     ])
 
 if has_loopback0 and block_host_and_lan:
-    # Tag inbound connections from Windows -> WSL arriving on loopback0 so replies route back via loopback0
+    # Per-UID mangle_output uses the shared 0x00002604 reply mark from wsl_agent_sandbox_shared,
+    # while scoping allowedHostPorts strictly to this UID so concurrent profiles never interfere.
     lines.extend([
-        "    chain prerouting {",
-        "        type filter hook prerouting priority mangle; policy accept;",
-        f'        iifname "loopback0" ct mark set {MARK_HEX}',
-        "    }",
         "    chain mangle_output {",
         "        type route hook output priority mangle; policy accept;",
-        f"        ct mark {MARK_HEX} meta mark set {MARK_HEX} accept",
+        f"        ct mark {SHARED_MARK_HEX} meta mark set {SHARED_MARK_HEX} accept",
         f"        meta skuid != {agent_uid} accept",
     ])
     if allowed_tcp:
         ports = ", ".join(str(p) for p in allowed_tcp)
-        lines.append(f"        ip daddr 127.0.0.0/8 tcp dport {{ {ports} }} meta mark set {MARK_HEX} accept")
-        lines.append(f"        ip6 daddr ::1 tcp dport {{ {ports} }} meta mark set {MARK_HEX} accept")
+        lines.append(f"        ip daddr 127.0.0.0/8 tcp dport {{ {ports} }} meta mark set {SHARED_MARK_HEX} accept")
+        lines.append(f"        ip6 daddr ::1 tcp dport {{ {ports} }} meta mark set {SHARED_MARK_HEX} accept")
     if allowed_udp:
         ports = ", ".join(str(p) for p in allowed_udp)
-        lines.append(f"        ip daddr 127.0.0.0/8 udp dport {{ {ports} }} meta mark set {MARK_HEX} accept")
-        lines.append(f"        ip6 daddr ::1 udp dport {{ {ports} }} meta mark set {MARK_HEX} accept")
+        lines.append(f"        ip daddr 127.0.0.0/8 udp dport {{ {ports} }} meta mark set {SHARED_MARK_HEX} accept")
+        lines.append(f"        ip6 daddr ::1 udp dport {{ {ports} }} meta mark set {SHARED_MARK_HEX} accept")
     lines.append("    }")
 
 lines.extend([
@@ -431,7 +477,8 @@ with open(nft_conf_file, "w", encoding="utf-8") as f:
     f.write(nft_text)
 os.chmod(nft_conf_file, 0o600)
 
-# Replace ONLY our table so Docker / other distros are never disrupted.
+# Replace ONLY our table so Docker / other distros / other profiles are never disrupted.
+run(["nft", "delete", "table", "inet", NFT_TABLE], check=False)
 run(["nft", "delete", "table", "inet", "wsl_agent_sandbox"], check=False)
 run(["nft", "delete", "table", "inet", "ubuntu_agent_box"], check=False)
 res = run(["nft", "-f", nft_conf_file], check=False)
@@ -439,7 +486,12 @@ if res.returncode != 0:
     print(f"[box-hardening] ERROR loading nftables: {res.stderr}", file=sys.stderr)
     sys.exit(1)
 
-print(f"[box-hardening] Loaded nftables table inet wsl_agent_sandbox for UID {agent_uid} (blockHostAndLan={block_host_and_lan}).")
+enable_uid_mirrored = bool(has_loopback0 and block_host_and_lan)
+enable_shared_mirrored = bool(has_loopback0 and (enable_uid_mirrored or any_sandbox_mangle_tables_active()))
+sync_shared_nft_prerouting(enable_shared_mirrored)
+sync_mirrored_ip_rules(enable_uid_mirrored, enable_shared_mirrored)
+
+print(f"[box-hardening] Loaded nftables table inet {NFT_TABLE} for UID {agent_uid} (blockHostAndLan={block_host_and_lan}).")
 
 # --- D. Optional per-UID systemd resource quotas (user-<uid>.slice) ---
 slice_dir = f"/etc/systemd/system/user-{agent_uid}.slice.d"

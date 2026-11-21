@@ -29,6 +29,187 @@ function Get-BoxLocalOverridePath {
     return $null
 }
 
+function Get-DeterministicProfileUid {
+    param([Parameter(Mandatory)][string]$ProfileName)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes("wsl-agent-sandbox-profile:$ProfileName")
+        $hash = $sha.ComputeHash($bytes)
+        $val = [BitConverter]::ToUInt16($hash, 0)
+        return 26100 + ($val % 899)
+    } finally {
+        $sha.Dispose()
+    }
+}
+
+function Get-ProfileOverridePath {
+    param(
+        [Parameter(Mandatory)][string]$RepoRoot,
+        [Parameter(Mandatory)][Alias('Profile')][string]$ProfileName
+    )
+    $candidates = @(
+        (Join-Path $RepoRoot "profiles\$ProfileName.json"),
+        (Join-Path $RepoRoot "box.$ProfileName.json")
+    )
+    return ($candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1)
+}
+
+function Get-ManagedBoxProfileNames {
+    param(
+        [Parameter(Mandatory)][string]$RepoRoot,
+        [switch]$WarnOnInvalid
+    )
+    $rawFiles = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+    $profDir = Join-Path $RepoRoot 'profiles'
+    if (Test-Path -LiteralPath $profDir -PathType Container) {
+        foreach ($f in (Get-ChildItem -Path $profDir -Filter '*.json' -File | Sort-Object Name)) {
+            $rawFiles.Add($f)
+        }
+    }
+    foreach ($f in (Get-ChildItem -Path $RepoRoot -Filter 'box.*.json' -File | Where-Object { $_.Name -notin @('box.schema.json', 'box.local.json') } | Sort-Object Name)) {
+        $rawFiles.Add($f)
+    }
+
+    $seen = @{}
+    $names = New-Object System.Collections.Generic.List[string]
+    foreach ($f in $rawFiles) {
+        $pName = $f.Name -replace '^box\.|\.json$', ''
+        if ($pName -cnotmatch '^[a-z0-9][a-z0-9_-]{0,24}$') {
+            if ($WarnOnInvalid) {
+                Write-Warning "Skipping invalid profile file '$($f.FullName)': profile name '$pName' must match ^[a-z0-9][a-z0-9_-]{0,24}$ (lowercase)."
+            }
+            continue
+        }
+        if (-not $seen.ContainsKey($pName)) {
+            $seen[$pName] = $true
+            $names.Add($pName)
+        }
+    }
+    return @($names | Sort-Object)
+}
+
+function Get-DerivedProfileInstallDir {
+    param(
+        [string]$BaseInstallDir,
+        [Parameter(Mandatory)][string]$DistroName
+    )
+    if (-not [string]::IsNullOrWhiteSpace($BaseInstallDir) -and $BaseInstallDir -match '^(.*)[\\/][^\\/]+$') {
+        return "$($Matches[1])\$DistroName"
+    }
+    return "%LOCALAPPDATA%\WSL\$DistroName"
+}
+
+function Get-ResolvedProfileUidMap {
+    param(
+        [Parameter(Mandatory)][string]$RepoRoot,
+        [Parameter(Mandatory)][int]$BaseUid,
+        [string]$IncludeProfile = ''
+    )
+    $usedUids = @{}
+    $usedUids[$BaseUid] = 'default'
+    $uidMap = @{}
+    $autoProfiles = New-Object System.Collections.Generic.List[string]
+
+    $allProfiles = New-Object System.Collections.Generic.List[string]
+    foreach ($p in (Get-ManagedBoxProfileNames -RepoRoot $RepoRoot)) {
+        if (-not $allProfiles.Contains($p)) { $allProfiles.Add($p) }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($IncludeProfile) -and -not $allProfiles.Contains($IncludeProfile)) {
+        $allProfiles.Add($IncludeProfile)
+    }
+
+    foreach ($p in ($allProfiles | Sort-Object)) {
+        $pPath = Get-ProfileOverridePath -RepoRoot $RepoRoot -Profile $p
+        $hasExplicitUid = $false
+        if ($pPath) {
+            $pObj = (Get-Content -LiteralPath $pPath -Raw -Encoding UTF8) | ConvertFrom-Json
+            if ($null -ne $pObj -and $pObj.PSObject.Properties['agentUser'] -and $null -ne $pObj.agentUser -and
+                $pObj.agentUser.PSObject.Properties['uid'] -and $null -ne $pObj.agentUser.uid) {
+                $hasExplicitUid = $true
+                $explicitUid = [int]$pObj.agentUser.uid
+                if ($usedUids.ContainsKey($explicitUid)) {
+                    throw "Profile '$p' agentUser.uid ($explicitUid) collides with profile '$($usedUids[$explicitUid])'."
+                }
+                $usedUids[$explicitUid] = $p
+                $uidMap[$p] = $explicitUid
+            }
+        }
+        if (-not $hasExplicitUid) {
+            $autoProfiles.Add($p)
+        }
+    }
+
+    foreach ($p in ($autoProfiles | Sort-Object)) {
+        $candidate = Get-DeterministicProfileUid -ProfileName $p
+        $attempts = 0
+        while ($usedUids.ContainsKey($candidate)) {
+            $attempts++
+            if ($attempts -ge 899) {
+                throw "Exhausted available automatic profile UIDs in range 26100..26998."
+            }
+            $candidate = 26100 + ((($candidate - 26100) + 1) % 899)
+        }
+        $usedUids[$candidate] = $p
+        $uidMap[$p] = $candidate
+    }
+
+    return $uidMap
+}
+
+function Resolve-BoxProfileConfig {
+    param(
+        [Parameter(Mandatory)][string]$RepoRoot,
+        [Alias('Profile')][string]$ProfileName = '',
+        [string]$ExplicitConfigPath = ''
+    )
+    $basePath = if (-not [string]::IsNullOrWhiteSpace($ExplicitConfigPath)) {
+        $ExplicitConfigPath
+    } else {
+        Join-Path $RepoRoot 'box.json'
+    }
+    $baseCfg = Read-BoxConfig -ConfigPath $basePath
+    $cfg = Read-BoxConfig -ConfigPath $basePath
+
+    if (-not [string]::IsNullOrWhiteSpace($ProfileName)) {
+        if ($ProfileName -cnotmatch '^[a-z0-9][a-z0-9_-]{0,24}$') {
+            throw "Invalid profile name '$ProfileName'. Use lowercase alphanumeric, '-', or '_'."
+        }
+        $profilePath = Get-ProfileOverridePath -RepoRoot $RepoRoot -ProfileName $ProfileName
+        $profObj = $null
+        if ($profilePath) {
+            $profObj = (Get-Content -LiteralPath $profilePath -Raw -Encoding UTF8) | ConvertFrom-Json
+            $cfg = Merge-BoxConfigObject -Base $cfg -Override $profObj
+        }
+
+        $profSetsDistro = ($null -ne $profObj -and $null -ne $profObj.PSObject.Properties['distroName'] -and -not [string]::IsNullOrWhiteSpace([string]$profObj.distroName))
+        $profSetsInstallDir = ($null -ne $profObj -and $null -ne $profObj.PSObject.Properties['installDir'] -and -not [string]::IsNullOrWhiteSpace([string]$profObj.installDir))
+        $profSetsUid = ($null -ne $profObj -and $null -ne $profObj.PSObject.Properties['agentUser'] -and $null -ne $profObj.agentUser -and $null -ne $profObj.agentUser.PSObject.Properties['uid'] -and $null -ne $profObj.agentUser.uid)
+        $profSetsGid = ($null -ne $profObj -and $null -ne $profObj.PSObject.Properties['agentUser'] -and $null -ne $profObj.agentUser -and $null -ne $profObj.agentUser.PSObject.Properties['gid'] -and $null -ne $profObj.agentUser.gid)
+
+        if (-not $profSetsDistro) {
+            $baseDistro = [string]$baseCfg.distroName
+            $maxBaseLen = [Math]::Max(1, 63 - 1 - $ProfileName.Length)
+            if ($baseDistro.Length -gt $maxBaseLen) {
+                $baseDistro = $baseDistro.Substring(0, $maxBaseLen)
+            }
+            $cfg.distroName = "$baseDistro-$ProfileName"
+        }
+        if (-not $profSetsInstallDir) {
+            $cfg.installDir = Get-DerivedProfileInstallDir -BaseInstallDir $baseCfg.installDir -DistroName $cfg.distroName
+        }
+
+        $uidMap = Get-ResolvedProfileUidMap -RepoRoot $RepoRoot -BaseUid ([int]$baseCfg.agentUser.uid) -IncludeProfile $ProfileName
+        if (-not $profSetsUid) {
+            $cfg.agentUser.uid = [int]$uidMap[$ProfileName]
+        }
+        if (-not $profSetsGid) {
+            $cfg.agentUser.gid = [int]$cfg.agentUser.uid
+        }
+        Assert-BoxConfigValid -Config $cfg
+    }
+    return $cfg
+}
+
 function Test-IsBoxJsonObject {
     param($Value)
     if ($null -eq $Value) { return $false }
