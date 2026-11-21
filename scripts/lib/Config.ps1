@@ -10,9 +10,61 @@ function Expand-BoxPath {
     return [System.IO.Path]::GetFullPath($expanded)
 }
 
-function Read-BoxConfig {
+function Get-BoxLocalOverridePath {
     param(
         [Parameter(Mandatory)][string]$ConfigPath
+    )
+    $dir = Split-Path -Parent $ConfigPath
+    if ([string]::IsNullOrWhiteSpace($dir)) {
+        $dir = '.'
+    }
+    $leaf = Split-Path -Leaf $ConfigPath
+    if ($leaf -eq 'box.local.json') {
+        return $null
+    }
+    $candidate = Join-Path $dir 'box.local.json'
+    if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+        return $candidate
+    }
+    return $null
+}
+
+function Test-IsBoxJsonObject {
+    param($Value)
+    if ($null -eq $Value) { return $false }
+    if ($Value -is [System.Collections.IDictionary]) { return $true }
+    if ($Value -is [psobject] -and $Value -isnot [string] -and $Value -isnot [System.Collections.IEnumerable] -and $Value.GetType().IsClass) {
+        return $true
+    }
+    return $false
+}
+
+function Merge-BoxConfigObject {
+    param(
+        [Parameter(Mandatory)]$Base,
+        [Parameter(Mandatory)]$Override
+    )
+    $result = $Base | ConvertTo-Json -Depth 20 | ConvertFrom-Json
+    foreach ($prop in $Override.PSObject.Properties) {
+        $name = $prop.Name
+        $ovVal = $prop.Value
+        $existingProp = $result.PSObject.Properties[$name]
+        if ($null -ne $existingProp -and (Test-IsBoxJsonObject $existingProp.Value) -and (Test-IsBoxJsonObject $ovVal)) {
+            $merged = Merge-BoxConfigObject -Base $existingProp.Value -Override $ovVal
+            $existingProp.Value = $merged
+        } elseif ($null -ne $existingProp) {
+            $existingProp.Value = $ovVal
+        } else {
+            $result | Add-Member -NotePropertyName $name -NotePropertyValue $ovVal -Force
+        }
+    }
+    return $result
+}
+
+function Read-BoxConfig {
+    param(
+        [Parameter(Mandatory)][string]$ConfigPath,
+        [string]$LocalOverridePath = ''
     )
     if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
         throw "Configuration file not found: $ConfigPath"
@@ -23,6 +75,24 @@ function Read-BoxConfig {
     } catch {
         throw "Failed to parse JSON in '$ConfigPath': $($_.Exception.Message)"
     }
+
+    $overrideFile = if (-not [string]::IsNullOrWhiteSpace($LocalOverridePath)) {
+        $LocalOverridePath
+    } else {
+        Get-BoxLocalOverridePath -ConfigPath $ConfigPath
+    }
+    if ($overrideFile -and (Test-Path -LiteralPath $overrideFile -PathType Leaf)) {
+        $ovRaw = Get-Content -LiteralPath $overrideFile -Raw -Encoding UTF8
+        try {
+            $ovCfg = $ovRaw | ConvertFrom-Json
+        } catch {
+            throw "Failed to parse JSON in '$overrideFile': $($_.Exception.Message)"
+        }
+        if ($null -ne $ovCfg) {
+            $cfg = Merge-BoxConfigObject -Base $cfg -Override $ovCfg
+        }
+    }
+
     Assert-BoxConfigValid -Config $cfg
     return $cfg
 }

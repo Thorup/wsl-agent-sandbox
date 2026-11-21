@@ -143,6 +143,45 @@ Assert-Throws "Rejects storing raw credential keys inside box.json secrets secti
     Assert-BoxConfigValid -Config $c
 } 'only allows non-secret pointer property'
 
+# Deep-merge box.local.json override tests
+$tmpCfgDir = Join-Path ([System.IO.Path]::GetTempPath()) ("wsl-box-cfg-test-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Path $tmpCfgDir -Force | Out-Null
+try {
+    $baseFile = Join-Path $tmpCfgDir 'box.json'
+    $localFile = Join-Path $tmpCfgDir 'box.local.json'
+    Copy-Item -LiteralPath (Join-Path $RepoRoot 'box.json') -Destination $baseFile
+
+    $overrideObj = @{
+        sharedFolders = @(
+            @{ name = 'work'; windowsPath = 'C:\Users\demo\work'; mode = 'ro'; allowDockerBind = $true }
+        )
+        network = @{
+            allowedHostPorts = @(
+                @{ port = 8080; protocol = 'tcp'; comment = 'local test' }
+            )
+        }
+        packages = @{
+            installKubectl = $false
+        }
+    }
+    [System.IO.File]::WriteAllText($localFile, ($overrideObj | ConvertTo-Json -Depth 10), (New-Object System.Text.UTF8Encoding($false)))
+
+    $mergedCfg = Read-BoxConfig -ConfigPath $baseFile
+    Assert-True "box.local.json overrides array (sharedFolders)" (@($mergedCfg.sharedFolders).Count -eq 1 -and $mergedCfg.sharedFolders[0].name -eq 'work')
+    Assert-True "box.local.json deep-merges nested object while preserving sibling keys (network.blockHostAndLan)" ([bool]$mergedCfg.network.blockHostAndLan -and @($mergedCfg.network.allowedHostPorts).Count -eq 1 -and $mergedCfg.network.allowedHostPorts[0].port -eq 8080)
+    Assert-True "box.local.json overrides nested boolean while preserving other package flags" (-not [bool]$mergedCfg.packages.installKubectl -and [bool]$mergedCfg.packages.installNodeLts)
+    Assert-True "Get-BoxLocalOverridePath detects adjacent box.local.json" ((Get-BoxLocalOverridePath -ConfigPath $baseFile) -eq $localFile)
+
+    [System.IO.File]::WriteAllText($localFile, (@{ agentUser = @{ uid = 1000 } } | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding($false)))
+    Assert-Throws "Rejects invalid agentUser.uid introduced via box.local.json" {
+        Read-BoxConfig -ConfigPath $baseFile | Out-Null
+    } 'between 10000 and 60000'
+} finally {
+    if (Test-Path -LiteralPath $tmpCfgDir) {
+        Remove-Item -LiteralPath $tmpCfgDir -Recurse -Force
+    }
+}
+
 Write-Host ""
 Write-Host "=== Config.Tests.ps1 Summary: PASS=$script:Passed FAIL=$script:Failed ==="
 if ($script:Failed -gt 0) {

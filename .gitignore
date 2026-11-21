@@ -9,3 +9,4 @@ docker-policy-proxy/docker-policy-proxy.exe
 secrets.json
 *.secrets.json
 .secrets/
+box.local.json
