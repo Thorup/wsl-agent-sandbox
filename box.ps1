@@ -136,28 +136,47 @@ function Invoke-Snapshot {
         throw "Distro '$($Config.distroName)' does not exist."
     }
     $cacheDir = Expand-BoxPath -RawPath $Config.image.cacheDir -BaseDir $RepoRoot
-    if (-not (Test-Path -LiteralPath $cacheDir)) {
-        New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null
-    }
     if ($Golden) {
         $OutFile = Get-GoldenSnapshotPath -Config $Config
     } elseif ([string]::IsNullOrWhiteSpace($OutFile)) {
         $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
         $OutFile = Join-Path $cacheDir "$($Config.distroName)-$stamp.tar"
+    } else {
+        $OutFile = Expand-BoxPath -RawPath $OutFile -BaseDir $RepoRoot
     }
+
+    $outParent = Split-Path -Parent $OutFile
+    if (-not [string]::IsNullOrWhiteSpace($outParent) -and -not (Test-Path -LiteralPath $outParent)) {
+        New-Item -ItemType Directory -Path $outParent -Force | Out-Null
+    }
+
+    $tmpOut = "$OutFile.tmp.$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
     Write-Host "[snapshot] Exporting '$($Config.distroName)' -> '$OutFile'..."
-    & wsl.exe --export $Config.distroName $OutFile
-    if ($LASTEXITCODE -ne 0) { throw "wsl --export failed." }
+    try {
+        & wsl.exe --export $Config.distroName $tmpOut
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $tmpOut -PathType Leaf)) {
+            throw "wsl --export failed (exit code $LASTEXITCODE)."
+        }
+        Move-Item -LiteralPath $tmpOut -Destination $OutFile -Force
+    } finally {
+        if (Test-Path -LiteralPath $tmpOut -PathType Leaf) {
+            Remove-Item -LiteralPath $tmpOut -Force -ErrorAction SilentlyContinue
+        }
+    }
     Write-Host "[snapshot] Saved: $OutFile"
 }
 
 function Invoke-Restore {
     param(
         [Parameter(Mandatory)]$Config,
-        [Parameter(Mandatory)][string]$SnapshotPath,
+        [string]$SnapshotPath = '',
         [switch]$Force
     )
-    if ([string]::IsNullOrWhiteSpace($SnapshotPath) -or -not (Test-Path -LiteralPath $SnapshotPath -PathType Leaf)) {
+    if ([string]::IsNullOrWhiteSpace($SnapshotPath)) {
+        throw "Snapshot path is required. Usage: .\box.ps1 restore <path-to-snapshot.tar>"
+    }
+    $SnapshotPath = Expand-BoxPath -RawPath $SnapshotPath -BaseDir $RepoRoot
+    if (-not (Test-Path -LiteralPath $SnapshotPath -PathType Leaf)) {
         throw "Snapshot file not found: '$SnapshotPath'"
     }
     $distro = $Config.distroName
@@ -179,12 +198,16 @@ function Invoke-Restore {
         throw "wsl --import failed with exit code $LASTEXITCODE."
     }
 
-    Write-Host "[restore] Waiting for systemd and box-hardening.service..."
-    if (-not (Wait-WslSystemdReady -DistroName $distro -TimeoutSeconds 60)) {
-        throw "Restored distro '$distro' systemd hardening did not reach active state."
+    Write-Host "[restore] Syncing current policy and scripts, and waiting for systemd..."
+    Sync-AssetsToWsl -Config $Config
+    if (-not (Wait-WslSystemdReady -DistroName $distro -TimeoutSeconds 60 -SkipHardeningCheck)) {
+        throw "Restored distro '$distro' systemd did not finish booting."
     }
 
     Invoke-Apply -Config $Config
+    if (-not (Wait-WslSystemdReady -DistroName $distro -TimeoutSeconds 30)) {
+        throw "Restored distro '$distro' systemd hardening did not reach active state."
+    }
     Invoke-Verify -Config $Config
 }
 
@@ -622,7 +645,7 @@ switch ($Command) {
             Invoke-Restore -Config $cfg -SnapshotPath $goldenPath -Force:$Force
         } else {
             Invoke-Destroy -Config $cfg -Force:$Force
-            Invoke-Init -Config $cfg -SaveGolden:$SaveGolden
+            Invoke-Init -Config $cfg -SaveGolden:($Full -or $SaveGolden)
         }
     }
     'destroy' {

@@ -121,14 +121,20 @@ function Copy-TextToWsl {
 function Wait-WslSystemdReady {
     param(
         [Parameter(Mandatory)][string]$DistroName,
-        [int]$TimeoutSeconds = 45
+        [int]$TimeoutSeconds = 45,
+        [switch]$SkipHardeningCheck
     )
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     while ((Get-Date) -lt $deadline) {
         $state = (& wsl.exe -d $DistroName -u root -- sh -c "systemctl is-system-running 2>/dev/null || true" | Out-String).Trim()
-        $harden = (& wsl.exe -d $DistroName -u root -- sh -c "systemctl is-active box-hardening.service 2>/dev/null || true" | Out-String).Trim()
-        if (($state -eq 'running' -or $state -eq 'degraded') -and $harden -eq 'active') {
-            return $true
+        if ($state -eq 'running' -or $state -eq 'degraded') {
+            if ($SkipHardeningCheck) {
+                return $true
+            }
+            $harden = (& wsl.exe -d $DistroName -u root -- sh -c "systemctl is-active box-hardening.service 2>/dev/null || true" | Out-String).Trim()
+            if ($harden -eq 'active') {
+                return $true
+            }
         }
         Start-Sleep -Seconds 1
     }
