@@ -134,6 +134,168 @@ function Resolve-SecretFileContent {
     return (($text -replace "`r`n", "`n") -replace "`r", "`n")
 }
 
+$script:VaultResolverHook = $null
+$script:CurrentServiceVaultSources = $null
+
+function Invoke-VaultCliProcess {
+    param(
+        [Parameter(Mandatory)][string]$FileName,
+        [Parameter(Mandatory)][string[]]$Arguments,
+        [Parameter(Mandatory)][string]$Context,
+        [Parameter(Mandatory)][string]$Uri
+    )
+    $cmd = Get-Command $FileName -ErrorAction SilentlyContinue
+    if (-not $cmd) {
+        throw "${Context}: CLI '$FileName' not found on Windows PATH to resolve '$Uri'."
+    }
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $cmd.Source
+    $quotedArgs = foreach ($a in $Arguments) {
+        if ($a.Length -eq 0 -or $a -match '[\s"]') {
+            '"' + ($a -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"'
+        } else {
+            $a
+        }
+    }
+    $psi.Arguments = ($quotedArgs -join ' ')
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    try {
+        $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+        $stderrTask = $proc.StandardError.ReadToEndAsync()
+        $proc.WaitForExit()
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        if ($proc.ExitCode -ne 0) {
+            $errLine = (($stderr -split '\r?\n' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1) -join '').Trim()
+            $suffix = if ($errLine) { ": $errLine" } else { " (exit code $($proc.ExitCode))" }
+            throw "${Context}: '$FileName' lookup failed for '$Uri'${suffix}"
+        }
+        $val = if ($null -ne $stdout) { $stdout.Trim() } else { '' }
+        if ([string]::IsNullOrWhiteSpace($val)) {
+            throw "${Context}: '$FileName' returned an empty secret for '$Uri'."
+        }
+        return $val
+    } finally {
+        $proc.Dispose()
+    }
+}
+
+function Resolve-VaultSecretUri {
+    param(
+        [Parameter(Mandatory)][string]$Uri,
+        [Parameter(Mandatory)][string]$BaseDir,
+        [Parameter(Mandatory)][string]$Context
+    )
+    if ($Uri.Contains("`0") -or $Uri.Contains("`r") -or $Uri.Contains("`n")) {
+        throw "${Context}: vault URI contains invalid newline or control characters."
+    }
+    if ($Uri -notmatch '^([a-zA-Z][a-zA-Z0-9+.-]*)://(.+)$') {
+        throw "${Context}: invalid vault URI '$Uri'. Expected scheme like op://, bw://, dpapi://, azkv://, awssm://, or gcpsm://."
+    }
+    $scheme = $Matches[1].ToLowerInvariant()
+    $target = $Matches[2].Trim()
+    if ([string]::IsNullOrWhiteSpace($target) -or $target.StartsWith('-')) {
+        throw "${Context}: invalid vault URI target in '$Uri' (target must be non-empty and cannot start with '-')."
+    }
+
+    switch ($scheme) {
+        'op' {
+            $opSegments = @($target.Trim('/') -split '/')
+            if ($opSegments.Count -lt 2 -or ($opSegments | Where-Object { [string]::IsNullOrWhiteSpace($_) -or $_.StartsWith('-') })) {
+                throw "${Context}: op:// URI must be op://<vault>/<item>[/<section>]/<field> with non-empty segments."
+            }
+        }
+        'bw' {
+            # Validated non-empty and non-flag above
+        }
+        'dpapi' {
+            # Validated non-empty above
+        }
+        'azkv' {
+            $parts = $target -split '/', 2
+            if ($parts.Count -ne 2 -or [string]::IsNullOrWhiteSpace($parts[0]) -or [string]::IsNullOrWhiteSpace($parts[1]) -or
+                $parts[0].StartsWith('-') -or $parts[1].StartsWith('-') -or $parts[1].Contains('/')) {
+                throw "${Context}: azkv:// URI must be azkv://<vault>/<secret> with non-empty vault and secret names."
+            }
+        }
+        'awssm' {
+            # Validated non-empty and non-flag above
+        }
+        'gcpsm' {
+            $parts = $target -split '/', 2
+            if ($parts.Count -ne 2 -or [string]::IsNullOrWhiteSpace($parts[0]) -or [string]::IsNullOrWhiteSpace($parts[1]) -or
+                $parts[0].StartsWith('-') -or $parts[1].StartsWith('-') -or $parts[1].Contains('/')) {
+                throw "${Context}: gcpsm:// URI must be gcpsm://<project>/<secret> with non-empty project and secret names."
+            }
+        }
+        default {
+            throw "${Context}: unsupported vault URI scheme '${scheme}://' in '$Uri'."
+        }
+    }
+
+    if ($null -ne $script:CurrentServiceVaultSources) {
+        $schemeTag = "${scheme}://"
+        if (-not $script:CurrentServiceVaultSources.Contains($schemeTag)) {
+            $script:CurrentServiceVaultSources.Add($schemeTag)
+        }
+    }
+
+    if ($null -ne $script:VaultResolverHook) {
+        $hookVal = [string](& $script:VaultResolverHook $Uri $BaseDir $Context)
+        if ([string]::IsNullOrWhiteSpace($hookVal)) {
+            throw "${Context}: vault resolver returned an empty secret for '$Uri'."
+        }
+        return $hookVal
+    }
+
+    switch ($scheme) {
+        'op' {
+            return (Invoke-VaultCliProcess -FileName 'op' -Arguments @('read', $Uri) -Context $Context -Uri $Uri)
+        }
+        'bw' {
+            return (Invoke-VaultCliProcess -FileName 'bw' -Arguments @('get', 'password', '--', $target) -Context $Context -Uri $Uri)
+        }
+        'dpapi' {
+            if (-not ('System.Security.Cryptography.ProtectedData' -as [type])) {
+                try { Add-Type -AssemblyName 'System.Security' -ErrorAction Stop } catch { Write-Verbose $_.Exception.Message }
+            }
+            if (-not ('System.Security.Cryptography.ProtectedData' -as [type])) {
+                try { Add-Type -AssemblyName 'System.Security.Cryptography.ProtectedData' -ErrorAction Stop } catch { Write-Verbose $_.Exception.Message }
+            }
+            if (-not ('System.Security.Cryptography.ProtectedData' -as [type])) {
+                throw "${Context}: System.Security.Cryptography.ProtectedData is unavailable in this PowerShell runtime."
+            }
+            $filePath = Expand-BoxPath -RawPath $target -BaseDir $BaseDir
+            if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) {
+                throw "${Context}: DPAPI secret file not found: '$filePath'."
+            }
+            $encBytes = [System.IO.File]::ReadAllBytes($filePath)
+            $decBytes = [System.Security.Cryptography.ProtectedData]::Unprotect($encBytes, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+            $val = [System.Text.Encoding]::UTF8.GetString($decBytes).Trim()
+            if ([string]::IsNullOrWhiteSpace($val)) {
+                throw "${Context}: DPAPI secret file '$filePath' decrypted to an empty value."
+            }
+            return $val
+        }
+        'azkv' {
+            $parts = $target -split '/', 2
+            return (Invoke-VaultCliProcess -FileName 'az' -Arguments @('keyvault', 'secret', 'show', '--vault-name', $parts[0], '--name', $parts[1], '--query', 'value', '-o', 'tsv') -Context $Context -Uri $Uri)
+        }
+        'awssm' {
+            return (Invoke-VaultCliProcess -FileName 'aws' -Arguments @('secretsmanager', 'get-secret-value', '--secret-id', $target, '--query', 'SecretString', '--output', 'text') -Context $Context -Uri $Uri)
+        }
+        'gcpsm' {
+            $parts = $target -split '/', 2
+            return (Invoke-VaultCliProcess -FileName 'gcloud' -Arguments @('secrets', 'versions', 'access', 'latest', "--project=$($parts[0])", "--secret=$($parts[1])") -Context $Context -Uri $Uri)
+        }
+    }
+}
+
 function Resolve-SecretValue {
     param(
         [Parameter(Mandatory)]$Object,
@@ -144,20 +306,27 @@ function Resolve-SecretValue {
     )
     $fileProp = "${BaseName}File"
     $envProp = "${BaseName}Env"
+    $vaultProp = "${BaseName}Vault"
 
     $hasDirect = (Test-ObjectHasProperty -Object $Object -Name $BaseName) -and -not [string]::IsNullOrEmpty([string](Get-ObjectProperty -Object $Object -Name $BaseName -Default ''))
     $hasFile = (Test-ObjectHasProperty -Object $Object -Name $fileProp) -and -not [string]::IsNullOrWhiteSpace([string](Get-ObjectProperty -Object $Object -Name $fileProp -Default ''))
     $hasEnv = (Test-ObjectHasProperty -Object $Object -Name $envProp) -and -not [string]::IsNullOrWhiteSpace([string](Get-ObjectProperty -Object $Object -Name $envProp -Default ''))
+    $hasVault = (Test-ObjectHasProperty -Object $Object -Name $vaultProp) -and -not [string]::IsNullOrWhiteSpace([string](Get-ObjectProperty -Object $Object -Name $vaultProp -Default ''))
 
-    $sourceCount = @($hasDirect, $hasFile, $hasEnv | Where-Object { $_ }).Count
+    $sourceCount = @($hasDirect, $hasFile, $hasEnv, $hasVault | Where-Object { $_ }).Count
     if ($sourceCount -gt 1) {
-        throw "${Context}: specify only one of '$BaseName', '$fileProp', or '$envProp'."
+        throw "${Context}: specify only one of '$BaseName', '$fileProp', '$envProp', or '$vaultProp'."
     }
     if ($sourceCount -eq 0) {
         if ($Required) {
-            throw "${Context}: missing required secret ('$BaseName', '$fileProp', or '$envProp')."
+            throw "${Context}: missing required secret ('$BaseName', '$fileProp', '$envProp', or '$vaultProp')."
         }
         return ''
+    }
+
+    if ($hasVault) {
+        $uri = [string](Get-ObjectProperty -Object $Object -Name $vaultProp)
+        return (Resolve-VaultSecretUri -Uri $uri -BaseDir $BaseDir -Context "${Context}.${vaultProp}")
     }
 
     if ($hasDirect) {
@@ -481,6 +650,7 @@ function Build-SeedSecretsPayload {
         }
 
         $summaryCountBefore = $summary.Count
+        $script:CurrentServiceVaultSources = New-Object System.Collections.Generic.List[string]
         switch ($svcName) {
             'github' {
                 $hostname = [string](Get-ObjectProperty -Object $entry -Name 'hostname' -Default 'github.com')
@@ -1724,7 +1894,17 @@ function Build-SeedSecretsPayload {
             }
         }
 
+        $svcVaultSources = @()
+        if ($null -ne $script:CurrentServiceVaultSources -and $script:CurrentServiceVaultSources.Count -gt 0) {
+            $svcVaultSources = @($script:CurrentServiceVaultSources.ToArray())
+        }
+        $script:CurrentServiceVaultSources = $null
+
         if ($resolvedServices.Contains($svcName)) {
+            if ($svcVaultSources.Count -gt 0 -and $summary.Count -gt $summaryCountBefore) {
+                $lastIdx = $summary.Count - 1
+                $summary[$lastIdx] = "$($summary[$lastIdx]) [vault=$($svcVaultSources -join ',')]"
+            }
             $effSvcTtl = [int64]0
             if ($ttlSeconds -gt 0) {
                 $effSvcTtl = $ttlSeconds
