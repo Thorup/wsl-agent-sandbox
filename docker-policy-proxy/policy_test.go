@@ -943,3 +943,146 @@ func TestPortBindingsAndInternalNetworkPolicy(t *testing.T) {
 		t.Fatalf("expected /networks/create to inject Internal:true, got err=%v mod=%v body=%s", err, netMod, string(netOut))
 	}
 }
+
+func TestResourceLimitsAndRegistryAllowlist(t *testing.T) {
+	pol := &Policy{
+		Enabled: true,
+		DefaultLimits: ResourceLimits{
+			MemoryBytes: 512 * 1024 * 1024,
+			NanoCpus:    1_000_000_000,
+			PidsLimit:   128,
+		},
+		MaxLimits: ResourceLimits{
+			MemoryBytes: 1024 * 1024 * 1024,
+			NanoCpus:    2_000_000_000,
+			PidsLimit:   256,
+		},
+		AllowedRegistries: []string{"docker.io", "ghcr.io", "localhost:5000"},
+	}
+
+	// 1. Injects default limits when HostConfig is omitted
+	createBody, _ := json.Marshal(map[string]any{"Image": "alpine:latest"})
+	out, mod, err := pol.ProcessJSONBody(http.MethodPost, "/containers/create", createBody)
+	if err != nil || !mod {
+		t.Fatalf("expected default limits injection, got err=%v mod=%v", err, mod)
+	}
+	if !strings.Contains(string(out), `"Memory":536870912`) || !strings.Contains(string(out), `"PidsLimit":128`) {
+		t.Fatalf("missing injected limits in: %s", string(out))
+	}
+
+	// 2. Rejects Memory exceeding maxLimits on create and update
+	tooBigBody, _ := json.Marshal(map[string]any{
+		"Image":      "ghcr.io/org/app@sha256:abcdef",
+		"HostConfig": map[string]any{"Memory": 2 * 1024 * 1024 * 1024},
+	})
+	if _, _, err := pol.ProcessJSONBody(http.MethodPost, "/containers/create", tooBigBody); err == nil {
+		t.Fatalf("expected Memory > maxLimits to be denied on create")
+	}
+	updateTooBig, _ := json.Marshal(map[string]any{"PidsLimit": 999})
+	if _, _, err := pol.ProcessJSONBody(http.MethodPost, "/containers/abc/update", updateTooBig); err == nil {
+		t.Fatalf("expected PidsLimit > maxLimits to be denied on update")
+	}
+
+	// 3. Registry allowlist edge cases (aliases, raw digests, fromSrc, duplicate params, /images/load)
+	for _, allowedImg := range []string{"alpine", "library/ubuntu:24.04", "registry.hub.docker.com/library/alpine", "ghcr.io/org/img:v1", "localhost:5000/test:1", "ghcr.io/org/img@sha256:1234"} {
+		b, _ := json.Marshal(map[string]any{"Image": allowedImg})
+		if _, _, err := pol.ProcessJSONBody(http.MethodPost, "/containers/create", b); err != nil {
+			t.Fatalf("expected image %q to be allowed, got: %v", allowedImg, err)
+		}
+		if err := pol.CheckEndpoint(http.MethodPost, "/images/create", map[string][]string{"fromImage": {allowedImg}}); err != nil {
+			t.Fatalf("expected pull %q to be allowed, got: %v", allowedImg, err)
+		}
+	}
+	for _, blockedImg := range []string{"quay.io/coreos/etcd:v3", "evil.example.com:8443/malware:latest", "sha256:0123456789abcdef"} {
+		b, _ := json.Marshal(map[string]any{"Image": blockedImg})
+		if _, _, err := pol.ProcessJSONBody(http.MethodPost, "/containers/create", b); err == nil {
+			t.Fatalf("expected image %q to be denied", blockedImg)
+		}
+		if err := pol.CheckEndpoint(http.MethodPost, "/images/create", map[string][]string{"fromImage": {blockedImg}}); err == nil {
+			t.Fatalf("expected pull %q to be denied", blockedImg)
+		}
+	}
+	if err := pol.CheckEndpoint(http.MethodPost, "/images/create", map[string][]string{"fromSrc": {"https://evil.example.com/rootfs.tar"}}); err == nil {
+		t.Fatalf("expected /images/create?fromSrc=... to be denied when allowedRegistries is set")
+	}
+	if err := pol.CheckEndpoint(http.MethodPost, "/images/create", map[string][]string{"fromImage": {"docker.io/alpine", "evil.com/backdoor"}}); err == nil {
+		t.Fatalf("expected duplicate fromImage parameter pollution to be denied")
+	}
+	if err := pol.CheckEndpoint(http.MethodPost, "/images/load", map[string][]string{}); err == nil {
+		t.Fatalf("expected POST /images/load to be denied when allowedRegistries is set")
+	}
+
+	// 4. Realistic Docker CLI payload (Memory=0, NanoCpus=0, MemorySwap=0) injects defaults before maxLimits check
+	cliPayload, _ := json.Marshal(map[string]any{
+		"Image": "alpine",
+		"HostConfig": map[string]any{
+			"Memory":     0,
+			"NanoCpus":   0,
+			"MemorySwap": 0,
+			"CpuQuota":   0,
+			"CpuPeriod":  0,
+		},
+	})
+	cliOut, cliMod, err := pol.ProcessJSONBody(http.MethodPost, "/containers/create", cliPayload)
+	if err != nil || !cliMod {
+		t.Fatalf("expected realistic Docker CLI payload with zeros to inject defaults cleanly, got err=%v mod=%v", err, cliMod)
+	}
+	if !strings.Contains(string(cliOut), `"Memory":536870912`) || !strings.Contains(string(cliOut), `"NanoCpus":1000000000`) || !strings.Contains(string(cliOut), `"PidsLimit":128`) {
+		t.Fatalf("expected default limits injected over zeros: %s", string(cliOut))
+	}
+
+	// 5. maxLimits without defaultLimits still caps containers when fields are omitted or 0
+	polMaxOnly := &Policy{
+		Enabled: true,
+		MaxLimits: ResourceLimits{
+			MemoryBytes: 1024 * 1024 * 1024,
+			NanoCpus:    2_000_000_000,
+			PidsLimit:   256,
+		},
+	}
+	maxOnlyBody, _ := json.Marshal(map[string]any{
+		"Image":      "alpine",
+		"HostConfig": map[string]any{"Memory": 0, "NanoCpus": 0},
+	})
+	maxOut, maxMod, err := polMaxOnly.ProcessJSONBody(http.MethodPost, "/containers/create", maxOnlyBody)
+	if err != nil || !maxMod {
+		t.Fatalf("expected maxLimits-only policy to inject max caps on 0/unset fields, got err=%v mod=%v", err, maxMod)
+	}
+	if !strings.Contains(string(maxOut), `"Memory":1073741824`) || !strings.Contains(string(maxOut), `"PidsLimit":256`) {
+		t.Fatalf("expected maxLimits caps injected: %s", string(maxOut))
+	}
+	maxNoHCOut, maxNoHCMod, err := polMaxOnly.ProcessJSONBody(http.MethodPost, "/containers/create", []byte(`{"Image":"alpine"}`))
+	if err != nil || !maxNoHCMod || !strings.Contains(string(maxNoHCOut), `"Memory":1073741824`) {
+		t.Fatalf("expected maxLimits-only policy to inject caps when HostConfig omitted, got err=%v mod=%v body=%s", err, maxNoHCMod, string(maxNoHCOut))
+	}
+
+	// 6. Update allows 0 ("unchanged"), rejects negative (-1), and rejects > maxLimits
+	updateOk, _ := json.Marshal(map[string]any{"Memory": 256 * 1024 * 1024, "NanoCpus": 0, "PidsLimit": 0})
+	if _, _, err := pol.ProcessJSONBody(http.MethodPost, "/containers/abc/update", updateOk); err != nil {
+		t.Fatalf("expected /update with valid Memory and 0 NanoCpus to pass, got %v", err)
+	}
+	if _, _, err := pol.ProcessJSONBody(http.MethodPost, "/containers/abc/update", []byte(`{"PidsLimit":-1}`)); err == nil {
+		t.Fatalf("expected /update PidsLimit=-1 (unlimited) to be denied")
+	}
+
+	// 7. MemorySwap, CpuQuota/CpuPeriod bypasses, and float edge cases
+	if _, _, err := pol.ProcessJSONBody(http.MethodPost, "/containers/create", []byte(`{"Image":"alpine","HostConfig":{"MemorySwap":-1}}`)); err == nil {
+		t.Fatalf("expected MemorySwap=-1 to be denied")
+	}
+	if _, _, err := pol.ProcessJSONBody(http.MethodPost, "/containers/create", []byte(`{"Image":"alpine","HostConfig":{"CpuQuota":500000,"CpuPeriod":100000}}`)); err == nil {
+		t.Fatalf("expected CpuQuota/CpuPeriod=5 CPUs (> max 2 CPUs) to be denied")
+	}
+	quotaOkBody, _, err := pol.ProcessJSONBody(http.MethodPost, "/containers/create", []byte(`{"Image":"alpine","HostConfig":{"CpuQuota":50000,"CpuPeriod":100000,"NanoCpus":0}}`))
+	if err != nil {
+		t.Fatalf("expected valid CpuQuota <= maxLimits to be allowed, got %v", err)
+	}
+	if strings.Contains(string(quotaOkBody), `"NanoCpus":1000000000`) {
+		t.Fatalf("did not expect NanoCpus injection alongside explicit CpuQuota: %s", string(quotaOkBody))
+	}
+	if _, _, err := pol.ProcessJSONBody(http.MethodPost, "/containers/create", []byte(`{"Image":"alpine","HostConfig":{"Memory":1.5}}`)); err == nil {
+		t.Fatalf("expected non-integer float Memory to be rejected")
+	}
+	if _, _, err := pol.ProcessJSONBody(http.MethodPost, "/containers/create", []byte(`{"Image":"alpine","HostConfig":{"Memory":1e25}}`)); err == nil {
+		t.Fatalf("expected overflowing float Memory to be rejected")
+	}
+}
