@@ -4,6 +4,7 @@ $ErrorActionPreference = 'Stop'
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $RepoRoot 'scripts\lib\Config.ps1')
+. (Join-Path $RepoRoot 'scripts\lib\Terminal.ps1')
 
 $script:Passed = 0
 $script:Failed = 0
@@ -209,6 +210,106 @@ try {
 } finally {
     if (Test-Path -LiteralPath $tmpCfgDir) {
         Remove-Item -LiteralPath $tmpCfgDir -Recurse -Force
+    }
+}
+
+# Windows Terminal profile registration tests
+$tmpWtDir = Join-Path ([System.IO.Path]::GetTempPath()) ("wsl-box-wt-test-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Path $tmpWtDir -Force | Out-Null
+try {
+    $wtSettings = Join-Path $tmpWtDir 'settings.json'
+    $initialWt = @{
+        defaultProfile = '{00000000-0000-0000-0000-000000000001}'
+        profiles = @{
+            list = @(
+                @{ guid = '{00000000-0000-0000-0000-000000000001}'; name = 'PowerShell' }
+            )
+        }
+    }
+    [System.IO.File]::WriteAllText($wtSettings, ($initialWt | ConvertTo-Json -Depth 10), (New-Object System.Text.UTF8Encoding($false)))
+
+    [void](Register-WindowsTerminalProfile -Config $baseCfg -SettingsPaths @($wtSettings))
+    [void](Register-WindowsTerminalProfile -Config $baseCfg -SettingsPaths @($wtSettings))
+    $afterAdd = Get-Content -LiteralPath $wtSettings -Raw | ConvertFrom-Json
+    $expectedGuid = Get-DeterministicTerminalProfileGuid -DistroName $baseCfg.distroName
+    $matching = @($afterAdd.profiles.list | Where-Object { $_.guid -eq $expectedGuid })
+    Assert-True "Register-WindowsTerminalProfile is idempotent (no duplicate profiles)" ($matching.Count -eq 1 -and @($afterAdd.profiles.list).Count -eq 2)
+    Assert-True "Register-WindowsTerminalProfile sets wsl.exe commandline" ($matching[0].commandline -eq "wsl.exe -d $($baseCfg.distroName) -u $($baseCfg.agentUser.name) --cd ~")
+    Assert-True "Register-WindowsTerminalProfile creates timestamped backup" (@(Get-ChildItem -Path $tmpWtDir -Filter 'settings.json.bak-*').Count -ge 1)
+
+    [void](Register-WindowsTerminalProfile -Config $baseCfg -SettingsPaths @($wtSettings) -Unregister)
+    $afterRemove = Get-Content -LiteralPath $wtSettings -Raw | ConvertFrom-Json
+    Assert-True "Register-WindowsTerminalProfile -Unregister removes managed profile cleanly" (@($afterRemove.profiles.list).Count -eq 1 -and $afterRemove.profiles.list[0].name -eq 'PowerShell')
+
+    # Finding 3: No-op -Unregister must not create backup or rewrite settings.json
+    $noopDir = Join-Path $tmpWtDir 'noop'
+    New-Item -ItemType Directory -Path $noopDir -Force | Out-Null
+    $noopSettings = Join-Path $noopDir 'settings.json'
+    [System.IO.File]::WriteAllText($noopSettings, '{"profiles":{"list":[{"guid":"{00000000-0000-0000-0000-000000000001}","name":"PS"}]}}', (New-Object System.Text.UTF8Encoding($false)))
+    $noopUpdated = @(Register-WindowsTerminalProfile -Config $baseCfg -SettingsPaths @($noopSettings) -Unregister)
+    Assert-True "No-op -Unregister skips backup and rewrite when profile absent" ($noopUpdated.Count -eq 0 -and @(Get-ChildItem -Path $noopDir -Filter 'settings.json.bak-*').Count -eq 0)
+
+    # Finding 1: JSONC comments (//, /* */), trailing commas, and URL strings
+    $jsoncPath = Join-Path $tmpWtDir 'jsonc-settings.json'
+    $jsoncText = @"
+// Windows Terminal default JSONC header
+{
+  "`$schema": "https://aka.ms/terminal-profiles-schema", // keep // inside URL
+  /* block comment */
+  "profiles": {
+    "list": [
+      {
+        "guid": "{00000000-0000-0000-0000-000000000001}",
+        "name": "PowerShell",
+        "commandline": "pwsh.exe /* literal */",
+      },
+    ],
+  },
+}
+"@
+    [System.IO.File]::WriteAllText($jsoncPath, $jsoncText, (New-Object System.Text.UTF8Encoding($false)))
+    [void](Register-WindowsTerminalProfile -Config $baseCfg -SettingsPaths @($jsoncPath))
+    $parsedJsonc = Get-Content -LiteralPath $jsoncPath -Raw | ConvertFrom-Json
+    Assert-True "Parses JSONC comments, trailing commas, and preserves URL/block-like strings" ($parsedJsonc.'$schema' -eq 'https://aka.ms/terminal-profiles-schema' -and $parsedJsonc.profiles.list[0].commandline -eq 'pwsh.exe /* literal */' -and @($parsedJsonc.profiles.list).Count -eq 2)
+
+    # Finding 4: Re-registering preserves user customizations on matching profile
+    $customEntry = $parsedJsonc.profiles.list | Where-Object { $_.guid -eq $expectedGuid } | Select-Object -First 1
+    $customEntry | Add-Member -NotePropertyName 'opacity' -NotePropertyValue 85 -Force
+    $customEntry | Add-Member -NotePropertyName 'colorScheme' -NotePropertyValue 'One Half Dark' -Force
+    $customEntry.tabColor = '#123456'
+    [System.IO.File]::WriteAllText($jsoncPath, ($parsedJsonc | ConvertTo-Json -Depth 10), (New-Object System.Text.UTF8Encoding($false)))
+    [void](Register-WindowsTerminalProfile -Config $baseCfg -SettingsPaths @($jsoncPath))
+    $afterReReg = Get-Content -LiteralPath $jsoncPath -Raw | ConvertFrom-Json
+    $reRegMatch = $afterReReg.profiles.list | Where-Object { $_.guid -eq $expectedGuid } | Select-Object -First 1
+    Assert-True "Re-running register-terminal preserves opacity, colorScheme, and custom tabColor" ($reRegMatch.opacity -eq 85 -and $reRegMatch.colorScheme -eq 'One Half Dark' -and $reRegMatch.tabColor -eq '#123456')
+
+    # Finding 5: Legacy array-shaped profiles
+    $legacyPath = Join-Path $tmpWtDir 'legacy-settings.json'
+    [System.IO.File]::WriteAllText($legacyPath, '{"profiles":[{"guid":"{11111111-1111-1111-1111-111111111111}","name":"Legacy"}]}', (New-Object System.Text.UTF8Encoding($false)))
+    [void](Register-WindowsTerminalProfile -Config $baseCfg -SettingsPaths @($legacyPath))
+    $afterLegacy = Get-Content -LiteralPath $legacyPath -Raw | ConvertFrom-Json
+    Assert-True "Handles legacy array-shaped profiles cleanly" ($afterLegacy.profiles -is [System.Array] -and @($afterLegacy.profiles).Count -eq 2)
+
+    # Finding 2: Portable unpackaged Windows Terminal settings path & empty LOCALAPPDATA guard
+    $fakeLocalApp = Join-Path $tmpWtDir 'fake-localappdata'
+    $portableDir = Join-Path $fakeLocalApp 'Microsoft\Windows Terminal'
+    New-Item -ItemType Directory -Path $portableDir -Force | Out-Null
+    $portableSettings = Join-Path $portableDir 'settings.json'
+    [System.IO.File]::WriteAllText($portableSettings, '{}', (New-Object System.Text.UTF8Encoding($false)))
+    $prevLocalApp = $env:LOCALAPPDATA
+    try {
+        $env:LOCALAPPDATA = $fakeLocalApp
+        $discovered = @(Get-WindowsTerminalSettingsPaths)
+        Assert-True "Discovers unpackaged/portable Windows Terminal settings.json" ($discovered -contains $portableSettings)
+        $env:LOCALAPPDATA = ''
+        $emptyDiscovered = @(Get-WindowsTerminalSettingsPaths)
+        Assert-True "Handles empty LOCALAPPDATA safely" ($emptyDiscovered.Count -eq 0)
+    } finally {
+        $env:LOCALAPPDATA = $prevLocalApp
+    }
+} finally {
+    if (Test-Path -LiteralPath $tmpWtDir) {
+        Remove-Item -LiteralPath $tmpWtDir -Recurse -Force
     }
 }
 
