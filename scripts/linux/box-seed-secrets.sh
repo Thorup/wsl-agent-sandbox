@@ -286,14 +286,84 @@ def yaml_scalar(val):
 # Per-service seeders
 # ------------------------------------------------------------------
 def seed_github(cfg, prev_meta):
-    hostname = cfg["hostname"]
-    token = cfg["token"]
-    register_secret(token)
-    user = cfg.get("user", "")
-    git_protocol = cfg.get("gitProtocol", "https")
-    setup_git = bool(cfg.get("setupGit", True))
-    export_env = bool(cfg.get("exportEnv", True))
-    login_online = bool(cfg.get("loginOnline", False))
+    raw_profiles = cfg.get("profiles")
+    if isinstance(raw_profiles, list) and len(raw_profiles) > 0:
+        profiles = raw_profiles
+    else:
+        profiles = [
+            {
+                "name": "default",
+                "owner": cfg.get("owner") or cfg.get("user") or "default",
+                "hostname": cfg["hostname"],
+                "token": cfg["token"],
+                "user": cfg.get("user", ""),
+                "gitProtocol": cfg.get("gitProtocol", "https"),
+                "setupGit": bool(cfg.get("setupGit", True)),
+                "exportEnv": bool(cfg.get("exportEnv", True)),
+                "loginOnline": bool(cfg.get("loginOnline", False)),
+                "proxyInject": bool(cfg.get("proxyBaseUrl")),
+                "proxyBaseUrl": cfg.get("proxyBaseUrl", ""),
+            }
+        ]
+
+    default_prof_name = cfg.get("defaultProfile") or profiles[0].get("name") or "default"
+    active_prof = profiles[0]
+    new_hosts = set()
+    new_prof_names = []
+    profile_details = []
+    profiles_store = []
+
+    for p in profiles:
+        p_name = (p.get("name") or "default").strip()
+        p_token = p["token"]
+        register_secret(p_token)
+        p_host = p.get("hostname", "github.com")
+        p_user = p.get("user", "")
+        p_owner = p.get("owner") or p_user or p_name
+        p_proto = p.get("gitProtocol", "https")
+        p_setup_git = bool(p.get("setupGit", True))
+        p_export_env = bool(p.get("exportEnv", True))
+        p_login_online = bool(p.get("loginOnline", False))
+        p_proxy_url = p.get("proxyBaseUrl", "")
+        new_hosts.add(p_host)
+        new_prof_names.append(p_name)
+        profile_details.append({
+            "name": p_name,
+            "owner": p_owner,
+            "hostname": p_host,
+            "user": p_user,
+            "gitProtocol": p_proto,
+            "proxyInject": bool(p_proxy_url),
+        })
+        profiles_store.append({
+            "name": p_name,
+            "owner": p_owner,
+            "hostname": p_host,
+            "token": p_token,
+            "user": p_user,
+            "gitProtocol": p_proto,
+            "exportEnv": p_export_env,
+            "proxyBaseUrl": p_proxy_url,
+        })
+        if p_name == default_prof_name:
+            active_prof = p
+
+    gh_profiles_file = os.path.join(STATE_DIR, "github-profiles.json")
+    write_agent_file(
+        gh_profiles_file,
+        json.dumps({"defaultProfile": active_prof.get("name", "default"), "profiles": profiles_store}, indent=2) + "\n",
+        mode=0o600,
+        dir_mode=0o700,
+    )
+
+    hostname = active_prof.get("hostname", "github.com")
+    token = active_prof["token"]
+    user = active_prof.get("user", "")
+    git_protocol = active_prof.get("gitProtocol", "https")
+    setup_git = bool(active_prof.get("setupGit", True))
+    export_env = bool(active_prof.get("exportEnv", True))
+    login_online = bool(active_prof.get("loginOnline", False))
+    proxy_url = active_prof.get("proxyBaseUrl", "")
 
     hosts_file = os.path.join(AGENT_HOME, ".config", "gh", "hosts.yml")
 
@@ -310,31 +380,41 @@ def seed_github(cfg, prev_meta):
             with open(hosts_file, "r", encoding="utf-8") as f:
                 existing = f.read()
         order, blocks = parse_gh_hosts_yml(existing)
-        if hostname not in order:
-            order.append(hostname)
-        host_lines = [
-            f"    git_protocol: {git_protocol}",
-            f"    oauth_token: {yaml_scalar(token)}",
-        ]
-        if user:
-            host_lines.append(f"    user: {yaml_scalar(user)}")
-        blocks[hostname] = host_lines
+        # Write each distinct hostname (with active_prof winning for its hostname)
+        for p in profiles:
+            h = p.get("hostname", "github.com")
+            if h not in order:
+                order.append(h)
+            win_p = active_prof if h == hostname else p
+            h_lines = [
+                f"    git_protocol: {win_p.get('gitProtocol', 'https')}",
+                f"    oauth_token: {yaml_scalar(win_p['token'])}",
+            ]
+            if win_p.get("user"):
+                h_lines.append(f"    user: {yaml_scalar(win_p['user'])}")
+            blocks[h] = h_lines
         write_agent_file(hosts_file, render_gh_hosts_yml(order, blocks), mode=0o600, dir_mode=0o700)
 
     if setup_git and shutil.which("gh"):
         run_as_agent(["gh", "auth", "setup-git", "--hostname", hostname])
 
     env_vars = {}
+    if len(profiles) > 1 or active_prof.get("name", "default") != "default":
+        env_vars["WSL_BOX_GITHUB_PROFILE"] = active_prof.get("name", "default")
     if export_env:
         env_key = "GH_TOKEN" if hostname == "github.com" else "GH_ENTERPRISE_TOKEN"
         env_vars[env_key] = token
-    if cfg.get("proxyBaseUrl"):
-        env_vars["GITHUB_API_URL"] = cfg["proxyBaseUrl"]
+    if proxy_url:
+        env_vars["GITHUB_API_URL"] = proxy_url
     written_keys = write_service_env("github", env_vars)
+    clear_overrides_section("github")
 
-    managed_hosts = sorted(set((prev_meta or {}).get("hosts", []) + [hostname]))
+    managed_hosts = sorted(set((prev_meta or {}).get("hosts", [])).union(new_hosts))
     return {
         "hosts": managed_hosts,
+        "profiles": new_prof_names,
+        "defaultProfile": active_prof.get("name", "default"),
+        "profileDetails": profile_details,
         "envVars": written_keys,
         "updatedAt": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
@@ -354,7 +434,9 @@ def clear_github(prev_meta):
             write_agent_file(hosts_file, rendered, mode=0o600, dir_mode=0o700)
         else:
             remove_file_quiet(hosts_file)
+    remove_file_quiet(os.path.join(STATE_DIR, "github-profiles.json"))
     write_service_env("github", {})
+    clear_overrides_section("github")
 
 def seed_aws(cfg, prev_meta):
     aws_dir = os.path.join(AGENT_HOME, ".aws")

@@ -89,10 +89,63 @@ class TestBoxSyncContext(unittest.TestCase):
                     "keys": ["github-git"],
                     "updatedAt": "2026-11-22T22:00:00Z",
                 },
+                "github": {
+                    "hosts": ["github.com"],
+                    "profiles": ["personal", "work-org"],
+                    "defaultProfile": "personal",
+                    "profileDetails": [
+                        {
+                            "name": "personal",
+                            "owner": "Thorup",
+                            "hostname": "github.com",
+                            "user": "Thorup",
+                            "gitProtocol": "ssh",
+                            "proxyInject": True,
+                        },
+                        {
+                            "name": "work-org",
+                            "owner": "acme-org",
+                            "hostname": "github.com",
+                            "user": "Thorup",
+                            "gitProtocol": "ssh",
+                            "proxyInject": True,
+                        },
+                    ],
+                    "updatedAt": "2026-11-22T22:00:00Z",
+                },
             },
         }
         with open(os.path.join(self.state_dir, "seeded-services.json"), "w", encoding="utf-8") as f:
             json.dump(self.seeded_state, f)
+        with open(os.path.join(self.state_dir, "github-profiles.json"), "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "defaultProfile": "personal",
+                    "profiles": [
+                        {
+                            "name": "personal",
+                            "owner": "Thorup",
+                            "hostname": "github.com",
+                            "token": "sandbox-proxy-github-personal-placeholder",
+                            "user": "Thorup",
+                            "gitProtocol": "ssh",
+                            "exportEnv": True,
+                            "proxyBaseUrl": "http://127.0.0.1:3129/github",
+                        },
+                        {
+                            "name": "work-org",
+                            "owner": "acme-org",
+                            "hostname": "github.com",
+                            "token": "sandbox-proxy-github-workorg-placeholder",
+                            "user": "Thorup",
+                            "gitProtocol": "ssh",
+                            "exportEnv": True,
+                            "proxyBaseUrl": "http://127.0.0.1:3129/github",
+                        },
+                    ],
+                },
+                f,
+            )
 
     def tearDown(self):
         self.tmp_dir.cleanup()
@@ -167,6 +220,21 @@ class TestBoxSyncContext(unittest.TestCase):
         self.assertIn("# >>> gcloud >>>", overrides_both)
         self.assertIn("# >>> aws >>>", overrides_both)
         self.assertIn("AWS_PROFILE=", overrides_both)
+
+        use_gh_bin = os.path.join(self.bin_dir, "use-github")
+        res_gh = subprocess.run(
+            [sys.executable, use_gh_bin, "acme-org"],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertIn("Activated GitHub profile 'work-org'", res_gh.stdout)
+        with open(overrides_file, "r", encoding="utf-8") as f:
+            overrides_all = f.read()
+        self.assertIn("# >>> github >>>", overrides_all)
+        self.assertIn("WSL_BOX_GITHUB_PROFILE=", overrides_all)
+        self.assertIn("sandbox-proxy-github-workorg-placeholder", overrides_all)
 
 
 if __name__ == "__main__":

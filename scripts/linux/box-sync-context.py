@@ -311,6 +311,176 @@ if __name__ == "__main__":
     sys.exit(main())
 """
 
+USE_GITHUB_SCRIPT = """#!/usr/bin/env python3
+import json
+import os
+import re
+import shlex
+import sys
+import tempfile
+
+HOME = os.path.expanduser("~")
+STATE_DIR = os.path.join(HOME, ".config", "wsl-agent-sandbox")
+GH_PROFILES_FILE = os.path.join(STATE_DIR, "github-profiles.json")
+OVERRIDES_FILE = os.path.join(STATE_DIR, "active-overrides.env")
+GH_HOSTS_FILE = os.path.join(HOME, ".config", "gh", "hosts.yml")
+
+
+def load_github_profiles():
+    if os.path.isfile(GH_PROFILES_FILE):
+        try:
+            with open(GH_PROFILES_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data.get("defaultProfile", "default"), (data.get("profiles") or [])
+        except Exception:
+            pass
+    return "default", []
+
+
+def parse_gh_hosts_yml(text):
+    blocks = {}
+    order = []
+    cur_host = None
+    cur_lines = []
+    for line in text.splitlines():
+        if line and not line.startswith((" ", "\\t", "#")) and line.rstrip().endswith(":"):
+            if cur_host is not None:
+                blocks[cur_host] = cur_lines
+            cur_host = line.rstrip()[:-1].strip().strip("'\\"")
+            if cur_host not in order:
+                order.append(cur_host)
+            cur_lines = []
+        elif cur_host is not None:
+            cur_lines.append(line)
+    if cur_host is not None:
+        blocks[cur_host] = cur_lines
+    return order, blocks
+
+
+def update_overrides_section(section_name, lines):
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    existing = ""
+    if os.path.isfile(OVERRIDES_FILE):
+        try:
+            with open(OVERRIDES_FILE, "r", encoding="utf-8") as f:
+                existing = f.read()
+        except Exception:
+            existing = ""
+    begin_tag = f"# >>> {section_name} >>>"
+    end_tag = f"# <<< {section_name} <<<"
+    pattern = re.compile(
+        r"^" + re.escape(begin_tag) + r"\\n.*?^" + re.escape(end_tag) + r"\\n?",
+        re.MULTILINE | re.DOTALL,
+    )
+    cleaned = pattern.sub("", existing).strip()
+    block = "\\n".join([begin_tag] + lines + [end_tag])
+    new_text = (cleaned + "\\n\\n" + block + "\\n") if cleaned else (block + "\\n")
+    fd, tmp_path = tempfile.mkstemp(prefix=".overrides-", dir=STATE_DIR)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(new_text)
+        os.replace(tmp_path, OVERRIDES_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def main():
+    args = sys.argv[1:]
+    default_prof, profiles = load_github_profiles()
+    active_prof = os.environ.get("WSL_BOX_GITHUB_PROFILE") or default_prof
+
+    if not args or args[0] in ("-l", "--list", "list"):
+        if not profiles:
+            print("[use-github] No seeded GitHub token profiles found.")
+            return 0
+        print("Available GitHub token profiles:")
+        for p in profiles:
+            marker = "*" if p.get("name") == active_prof else " "
+            owner = p.get("owner") or p.get("name")
+            host = p.get("hostname", "github.com")
+            user = f", user={p['user']}" if p.get("user") else ""
+            print(f"  {marker} {p['name']} (owner={owner}, host={host}{user})")
+        return 0
+
+    if args[0] in ("-h", "--help", "help"):
+        print("Usage: use-github [<profile-name-or-owner> | --list]")
+        return 0
+
+    target = args[0].strip()
+    matched = None
+    for p in profiles:
+        if p.get("name") == target or p.get("owner") == target:
+            matched = p
+            break
+
+    if not matched:
+        avail = ", ".join(p.get("name", "") for p in profiles if p.get("name")) or "(none)"
+        print(
+            f"[use-github] ERROR: Unknown GitHub profile or owner '{target}'. Available: {avail}",
+            file=sys.stderr,
+        )
+        return 1
+
+    prof_name = matched["name"]
+    hostname = matched.get("hostname", "github.com")
+    token = matched["token"]
+    user = matched.get("user", "")
+    git_proto = matched.get("gitProtocol", "https")
+    proxy_url = matched.get("proxyBaseUrl", "")
+
+    os.makedirs(os.path.dirname(GH_HOSTS_FILE), mode=0o700, exist_ok=True)
+    existing_hosts = ""
+    if os.path.isfile(GH_HOSTS_FILE):
+        try:
+            with open(GH_HOSTS_FILE, "r", encoding="utf-8") as f:
+                existing_hosts = f.read()
+        except Exception:
+            existing_hosts = ""
+    order, blocks = parse_gh_hosts_yml(existing_hosts)
+    if hostname not in order:
+        order.append(hostname)
+    h_lines = [
+        f"    git_protocol: {git_proto}",
+        f"    oauth_token: {json.dumps(str(token))}",
+    ]
+    if user:
+        h_lines.append(f"    user: {json.dumps(str(user))}")
+    blocks[hostname] = h_lines
+    out_lines = []
+    for h in order:
+        if h in blocks:
+            out_lines.append(f"{h}:")
+            out_lines.extend(blocks[h])
+    with open(GH_HOSTS_FILE, "w", encoding="utf-8") as f:
+        f.write("\\n".join(out_lines) + "\\n")
+    os.chmod(GH_HOSTS_FILE, 0o600)
+
+    lines = [f"export WSL_BOX_GITHUB_PROFILE={shlex.quote(prof_name)}"]
+    if matched.get("exportEnv", True):
+        if hostname == "github.com":
+            lines.append(f"export GH_TOKEN={shlex.quote(token)}")
+        else:
+            lines.append(f"export GH_ENTERPRISE_TOKEN={shlex.quote(token)}")
+    if proxy_url:
+        lines.append(f"export GITHUB_API_URL={shlex.quote(proxy_url)}")
+    else:
+        lines.append("unset GITHUB_API_URL")
+
+    update_overrides_section("github", lines)
+    owner = matched.get("owner") or prof_name
+    print(f"[use-github] Activated GitHub profile '{prof_name}' (owner={owner}, host={hostname})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+"""
+
 BOX_CONTEXT_SCRIPT = """#!/usr/bin/env python3
 import json
 import os
@@ -419,6 +589,17 @@ def build_context_summary(policy, seeded_state):
                 entry["signingKey"] = meta["signingKey"]
         elif svc_name == "github":
             entry["hosts"] = meta.get("hosts") or ["github.com"]
+            entry["defaultProfile"] = meta.get("defaultProfile", "default")
+            entry["profiles"] = [
+                {
+                    "name": p.get("name", "default"),
+                    "owner": p.get("owner") or p.get("name", "default"),
+                    "hostname": p.get("hostname", "github.com"),
+                    "user": p.get("user", ""),
+                    "gitProtocol": p.get("gitProtocol", "https"),
+                }
+                for p in (meta.get("profileDetails") or [])
+            ]
         elif svc_name == "kubectl":
             entry["mode"] = meta.get("mode", "kubeconfig")
             if meta.get("context"):
@@ -530,8 +711,22 @@ def render_context_markdown(summary):
             lines.append("  - **Switching AWS Profiles**: Run **`use-aws <profile>`** (or `use-aws --list`) to switch `AWS_PROFILE` in the current shell and persistently across subshells.")
         if "github" in svcs:
             gh = svcs["github"]
-            hosts = ", ".join(f"`{h}`" for h in (gh.get("hosts") or ["github.com"]))
-            lines.append(f"- **GitHub CLI (`gh`)**: Authenticated for {hosts}.")
+            gh_profs = gh.get("profiles") or []
+            def_gh = gh.get("defaultProfile", "default")
+            if len(gh_profs) > 1 or (len(gh_profs) == 1 and gh_profs[0].get("name") != "default"):
+                p_desc = ", ".join(
+                    f"`{p['name']}` (owner=`{p.get('owner') or p['name']}`, host=`{p.get('hostname', 'github.com')}`"
+                    + (", **default**" if p["name"] == def_gh else "")
+                    + ")"
+                    for p in gh_profs
+                )
+                lines.append(f"- **GitHub CLI (`gh`)**: Fine-grained PAT profiles: {p_desc}")
+                lines.append(
+                    "  - **Switching GitHub Profiles / Resource Owners**: Because each fine-grained GitHub PAT is scoped to one Resource Owner (personal user or organization), run **`use-github <profile-or-owner>`** (or `use-github --list`) when switching between personal and organization repositories."
+                )
+            else:
+                hosts = ", ".join(f"`{h}`" for h in (gh.get("hosts") or ["github.com"]))
+                lines.append(f"- **GitHub CLI (`gh`)**: Authenticated for {hosts}.")
         if "git" in svcs:
             gt = svcs["git"]
             hosts = ", ".join(f"`{h}`" for h in (gt.get("hosts") or ["github.com"]))
@@ -588,6 +783,16 @@ use-aws --list
 
 # Switch active AWS_PROFILE persistently across subshells:
 use-aws <profile-name>
+```
+
+### Switching GitHub Fine-Grained PAT Profiles (`use-github`)
+When separate fine-grained GitHub PATs are seeded for personal repositories and one or more GitHub Organizations (`github.profiles` in `secrets.json`):
+```bash
+# List available GitHub profiles and their Resource Owners (personal user or organization):
+use-github --list
+
+# Switch active GitHub profile (updates GH_TOKEN and ~/.config/gh/hosts.yml persistently across subshells):
+use-github <profile-name-or-owner>
 ```
 
 ### Inspecting Live Sandbox State (`box-context`)
@@ -690,6 +895,7 @@ def sync_all(policy_path, agent_home_override="", bin_dir="/usr/local/bin"):
         for bname, bcontent in (
             ("use-gcloud", USE_GCLOUD_SCRIPT),
             ("use-aws", USE_AWS_SCRIPT),
+            ("use-github", USE_GITHUB_SCRIPT),
             ("box-context", BOX_CONTEXT_SCRIPT),
         ):
             bpath = os.path.join(bin_dir, bname)

@@ -78,8 +78,18 @@ def extract_client_tokens(headers):
     return tokens
 
 
-def verify_placeholder_token(headers, route):
-    """Verify the client presented a valid per-seed placeholder token configured on this route."""
+def resolve_matched_token_profile(headers, route):
+    """Verify the client presented a valid per-seed placeholder token and return any matched profile override."""
+    presented = extract_client_tokens(headers)
+    token_profiles = route.get("tokenProfiles")
+    if isinstance(token_profiles, dict) and token_profiles:
+        for exp_tok, prof_cfg in token_profiles.items():
+            if not exp_tok or not isinstance(prof_cfg, dict):
+                continue
+            for got in presented:
+                if hmac.compare_digest(got, str(exp_tok)):
+                    return True, prof_cfg
+
     expected = []
     if route.get("expectedToken"):
         expected.append(str(route["expectedToken"]))
@@ -88,13 +98,18 @@ def verify_placeholder_token(headers, route):
             expected.append(str(t))
     if not expected:
         # Fail closed if route lacks any expected placeholder token
-        return False
-    presented = extract_client_tokens(headers)
+        return False, None
     for exp in expected:
         for got in presented:
             if hmac.compare_digest(got, exp):
-                return True
-    return False
+                return True, None
+    return False, None
+
+
+def verify_placeholder_token(headers, route):
+    """Verify the client presented a valid per-seed placeholder token configured on this route."""
+    ok, _ = resolve_matched_token_profile(headers, route)
+    return ok
 
 
 def read_chunked_body(rfile):
@@ -144,11 +159,14 @@ class CredentialProxyHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(403, f"credential-proxy: unknown or unconfigured service route '{svc}'")
             return
 
-        if not verify_placeholder_token(self.headers, route):
+        ok, matched_profile = resolve_matched_token_profile(self.headers, route)
+        if not ok:
             self.send_error(401, f"credential-proxy: missing or invalid placeholder token for '{svc}'")
             return
 
-        upstream = urlparse(route["upstreamBaseUrl"])
+        effective_upstream_url = (matched_profile or {}).get("upstreamBaseUrl") or route["upstreamBaseUrl"]
+        effective_inject_headers = (matched_profile or {}).get("injectHeaders") or route.get("injectHeaders", {})
+        upstream = urlparse(effective_upstream_url)
         allowed_schemes = ("https", "http") if ALLOW_INSECURE_HTTP_FOR_TEST else ("https",)
         if upstream.scheme not in allowed_schemes or not upstream.hostname:
             self.send_error(403, "credential-proxy: invalid upstreamBaseUrl")
@@ -182,7 +200,7 @@ class CredentialProxyHandler(http.server.BaseHTTPRequestHandler):
             headers[k] = v
         headers["Host"] = upstream.netloc
         headers["Connection"] = "close"
-        for hk, hv in route.get("injectHeaders", {}).items():
+        for hk, hv in effective_inject_headers.items():
             headers[hk] = hv
 
         if upstream.scheme == "http":

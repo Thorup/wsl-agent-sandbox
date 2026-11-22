@@ -653,44 +653,173 @@ function Build-SeedSecretsPayload {
         $script:CurrentServiceVaultSources = New-Object System.Collections.Generic.List[string]
         switch ($svcName) {
             'github' {
-                $hostname = [string](Get-ObjectProperty -Object $entry -Name 'hostname' -Default 'github.com')
-                if ($hostname -notmatch '^[A-Za-z0-9.-]+$') {
-                    throw "github.hostname '$hostname' is invalid."
+                $topHostname = [string](Get-ObjectProperty -Object $entry -Name 'hostname' -Default 'github.com')
+                if ($topHostname -notmatch '^[A-Za-z0-9.-]+$') {
+                    throw "github.hostname '$topHostname' is invalid."
                 }
-                $gitProtocol = [string](Get-ObjectProperty -Object $entry -Name 'gitProtocol' -Default 'https')
-                if ($gitProtocol -notin @('https', 'ssh')) {
+                $topGitProtocol = [string](Get-ObjectProperty -Object $entry -Name 'gitProtocol' -Default 'https')
+                if ($topGitProtocol -notin @('https', 'ssh')) {
                     throw "github.gitProtocol must be 'https' or 'ssh'."
                 }
-                $token = Resolve-SecretValue -Object $entry -BaseName 'token' -BaseDir $baseDir -Context 'github' -Required
-                $user = [string](Get-ObjectProperty -Object $entry -Name 'user' -Default '')
-                $setupGit = [bool](Get-ObjectProperty -Object $entry -Name 'setupGit' -Default $true)
-                $exportEnv = [bool](Get-ObjectProperty -Object $entry -Name 'exportEnv' -Default $true)
-                $loginOnline = [bool](Get-ObjectProperty -Object $entry -Name 'loginOnline' -Default $false)
-                $proxyInject = [bool](Get-ObjectProperty -Object $entry -Name 'proxyInject' -Default $false)
-                $agentToken = $token
-                $proxyBaseUrl = ''
-                if ($proxyInject) {
-                    $upstreamUrl = if ($hostname -eq 'github.com') { 'https://api.github.com' } else { "https://$hostname/api/v3" }
-                    $agentToken = Get-ProxyPlaceholderToken -ServicePrefix 'github'
-                    $proxyBaseUrl = 'http://127.0.0.1:3129/github'
-                    $proxyRoutes['github'] = [ordered]@{
-                        upstreamBaseUrl = $upstreamUrl
-                        expectedToken   = $agentToken
-                        injectHeaders   = [ordered]@{ Authorization = "Bearer $token" }
+                $topUser = [string](Get-ObjectProperty -Object $entry -Name 'user' -Default '')
+                $topOwner = [string](Get-ObjectProperty -Object $entry -Name 'owner' -Default '')
+                $topSetupGit = [bool](Get-ObjectProperty -Object $entry -Name 'setupGit' -Default $true)
+                $topExportEnv = [bool](Get-ObjectProperty -Object $entry -Name 'exportEnv' -Default $true)
+                $topLoginOnline = [bool](Get-ObjectProperty -Object $entry -Name 'loginOnline' -Default $false)
+                $topProxyInject = [bool](Get-ObjectProperty -Object $entry -Name 'proxyInject' -Default $false)
+
+                $rawProfiles = Get-ObjectProperty -Object $entry -Name 'profiles' -Default $null
+                $hasProfiles = ($null -ne $rawProfiles) -and (@($rawProfiles).Count -gt 0)
+                $hasTopToken = ((Test-ObjectHasProperty -Object $entry -Name 'token') -and -not [string]::IsNullOrEmpty([string](Get-ObjectProperty -Object $entry -Name 'token' -Default ''))) -or
+                               (-not [string]::IsNullOrWhiteSpace([string](Get-ObjectProperty -Object $entry -Name 'tokenFile' -Default ''))) -or
+                               (-not [string]::IsNullOrWhiteSpace([string](Get-ObjectProperty -Object $entry -Name 'tokenEnv' -Default ''))) -or
+                               (-not [string]::IsNullOrWhiteSpace([string](Get-ObjectProperty -Object $entry -Name 'tokenVault' -Default '')))
+
+                $profilesOut = New-Object System.Collections.Generic.List[object]
+                $tokenProfilesMap = [ordered]@{}
+                $expectedPlaceholderTokens = New-Object System.Collections.Generic.List[string]
+
+                if ($hasProfiles) {
+                    if ($hasTopToken) {
+                        throw "github: cannot combine top-level 'token*' with 'profiles'."
                     }
+                    $seenProfNames = @{}
+                    $profArr = @($rawProfiles)
+                    for ($idx = 0; $idx -lt $profArr.Count; $idx++) {
+                        $pObj = $profArr[$idx]
+                        $ctx = "github.profiles[$idx]"
+                        $pName = [string](Get-ObjectProperty -Object $pObj -Name 'name' -Default '')
+                        if ([string]::IsNullOrWhiteSpace($pName) -or $pName -notmatch '^[A-Za-z0-9._-]+$') {
+                            throw "${ctx}: profile name '$pName' is invalid (must match '^[A-Za-z0-9._-]+$')."
+                        }
+                        if ($seenProfNames.ContainsKey($pName.ToLowerInvariant())) {
+                            throw "github.profiles contains duplicate profile name '$pName'."
+                        }
+                        $seenProfNames[$pName.ToLowerInvariant()] = $true
+
+                        $pHost = [string](Get-ObjectProperty -Object $pObj -Name 'hostname' -Default $topHostname)
+                        if ([string]::IsNullOrWhiteSpace($pHost)) { $pHost = $topHostname }
+                        if ($pHost -notmatch '^[A-Za-z0-9.-]+$') {
+                            throw "${ctx}: hostname '$pHost' is invalid."
+                        }
+                        $pProto = [string](Get-ObjectProperty -Object $pObj -Name 'gitProtocol' -Default $topGitProtocol)
+                        if ([string]::IsNullOrWhiteSpace($pProto)) { $pProto = $topGitProtocol }
+                        if ($pProto -notin @('https', 'ssh')) {
+                            throw "${ctx}: gitProtocol must be 'https' or 'ssh'."
+                        }
+                        $pUser = [string](Get-ObjectProperty -Object $pObj -Name 'user' -Default $topUser)
+                        $pOwner = [string](Get-ObjectProperty -Object $pObj -Name 'owner' -Default '')
+                        if ([string]::IsNullOrWhiteSpace($pOwner)) {
+                            $pOwner = if ($pUser -and $pName -eq 'personal') { $pUser } else { $pName }
+                        }
+                        $pSetupGit = [bool](Get-ObjectProperty -Object $pObj -Name 'setupGit' -Default $topSetupGit)
+                        $pExportEnv = [bool](Get-ObjectProperty -Object $pObj -Name 'exportEnv' -Default $topExportEnv)
+                        $pLoginOnline = [bool](Get-ObjectProperty -Object $pObj -Name 'loginOnline' -Default $topLoginOnline)
+                        $pProxyInject = [bool](Get-ObjectProperty -Object $pObj -Name 'proxyInject' -Default $topProxyInject)
+
+                        $pRealToken = Resolve-SecretValue -Object $pObj -BaseName 'token' -BaseDir $baseDir -Context $ctx -Required
+                        $pAgentToken = $pRealToken
+                        $pProxyBaseUrl = ''
+                        if ($pProxyInject) {
+                            $pUpstreamUrl = if ($pHost -eq 'github.com') { 'https://api.github.com' } else { "https://$pHost/api/v3" }
+                            $pAgentToken = Get-ProxyPlaceholderToken -ServicePrefix 'github'
+                            $pProxyBaseUrl = 'http://127.0.0.1:3129/github'
+                            $expectedPlaceholderTokens.Add($pAgentToken)
+                            $tokenProfilesMap[$pAgentToken] = [ordered]@{
+                                profile         = $pName
+                                upstreamBaseUrl = $pUpstreamUrl
+                                injectHeaders   = [ordered]@{ Authorization = "Bearer $pRealToken" }
+                            }
+                        }
+                        $profilesOut.Add([ordered]@{
+                            name         = $pName
+                            owner        = $pOwner
+                            hostname     = $pHost
+                            token        = $pAgentToken
+                            user         = $pUser
+                            gitProtocol  = $pProto
+                            setupGit     = $pSetupGit
+                            exportEnv    = $pExportEnv
+                            loginOnline  = $pLoginOnline
+                            proxyInject  = $pProxyInject
+                            proxyBaseUrl = $pProxyBaseUrl
+                        })
+                    }
+                } else {
+                    $realToken = Resolve-SecretValue -Object $entry -BaseName 'token' -BaseDir $baseDir -Context 'github' -Required
+                    $agentToken = $realToken
+                    $proxyBaseUrl = ''
+                    if ($topProxyInject) {
+                        $upstreamUrl = if ($topHostname -eq 'github.com') { 'https://api.github.com' } else { "https://$topHostname/api/v3" }
+                        $agentToken = Get-ProxyPlaceholderToken -ServicePrefix 'github'
+                        $proxyBaseUrl = 'http://127.0.0.1:3129/github'
+                        $expectedPlaceholderTokens.Add($agentToken)
+                        $tokenProfilesMap[$agentToken] = [ordered]@{
+                            profile         = 'default'
+                            upstreamBaseUrl = $upstreamUrl
+                            injectHeaders   = [ordered]@{ Authorization = "Bearer $realToken" }
+                        }
+                    }
+                    $singleOwner = if (-not [string]::IsNullOrWhiteSpace($topOwner)) { $topOwner } elseif (-not [string]::IsNullOrWhiteSpace($topUser)) { $topUser } else { 'default' }
+                    $profilesOut.Add([ordered]@{
+                        name         = 'default'
+                        owner        = $singleOwner
+                        hostname     = $topHostname
+                        token        = $agentToken
+                        user         = $topUser
+                        gitProtocol  = $topGitProtocol
+                        setupGit     = $topSetupGit
+                        exportEnv    = $topExportEnv
+                        loginOnline  = $topLoginOnline
+                        proxyInject  = $topProxyInject
+                        proxyBaseUrl = $proxyBaseUrl
+                    })
+                }
+
+                $requestedDef = [string](Get-ObjectProperty -Object $entry -Name 'defaultProfile' -Default '')
+                $activeProf = $profilesOut[0]
+                if (-not [string]::IsNullOrWhiteSpace($requestedDef)) {
+                    $matchedProf = $profilesOut | Where-Object { $_.name -eq $requestedDef -or $_.owner -eq $requestedDef } | Select-Object -First 1
+                    if ($null -eq $matchedProf) {
+                        throw "github.defaultProfile '$requestedDef' does not match any configured profile name or owner."
+                    }
+                    $activeProf = $matchedProf
+                }
+
+                if ($expectedPlaceholderTokens.Count -gt 0) {
+                    $primaryTok = if ($activeProf.proxyInject) { $activeProf.token } else { $expectedPlaceholderTokens[0] }
+                    $primaryRouteInfo = $tokenProfilesMap[$primaryTok]
+                    $routeObj = [ordered]@{
+                        upstreamBaseUrl = $primaryRouteInfo.upstreamBaseUrl
+                        expectedToken   = $primaryTok
+                        expectedTokens  = @($expectedPlaceholderTokens.ToArray())
+                        injectHeaders   = $primaryRouteInfo.injectHeaders
+                        tokenProfiles   = $tokenProfilesMap
+                    }
+                    $proxyRoutes['github'] = $routeObj
                 }
 
                 $resolvedServices['github'] = [ordered]@{
-                    hostname     = $hostname
-                    token        = $agentToken
-                    user         = $user
-                    gitProtocol  = $gitProtocol
-                    setupGit     = $setupGit
-                    exportEnv    = $exportEnv
-                    loginOnline  = $loginOnline
-                    proxyBaseUrl = $proxyBaseUrl
+                    hostname       = $activeProf.hostname
+                    token          = $activeProf.token
+                    user           = $activeProf.user
+                    owner          = $activeProf.owner
+                    gitProtocol    = $activeProf.gitProtocol
+                    setupGit       = $activeProf.setupGit
+                    exportEnv      = $activeProf.exportEnv
+                    loginOnline    = $activeProf.loginOnline
+                    proxyBaseUrl   = $activeProf.proxyBaseUrl
+                    defaultProfile = $activeProf.name
+                    profiles       = @($profilesOut.ToArray())
                 }
-                $summary.Add("github (host=$hostname, setupGit=$setupGit, exportEnv=$exportEnv)")
+                if ($hasProfiles) {
+                    $pLabels = ($profilesOut | ForEach-Object {
+                        if ($_.name -eq $_.owner -or [string]::IsNullOrWhiteSpace($_.owner)) { $_.name } else { "$($_.name):$($_.owner)" }
+                    }) -join ', '
+                    $summary.Add("github (profiles=$pLabels; default=$($activeProf.name))")
+                } else {
+                    $summary.Add("github (host=$($activeProf.hostname), setupGit=$($activeProf.setupGit), exportEnv=$($activeProf.exportEnv))")
+                }
             }
 
             'git' {
