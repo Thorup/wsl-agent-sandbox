@@ -161,6 +161,8 @@ if [[ "${DOCKER_ENABLED}" == "false" ]]; then
       pass "Docker CLI cannot reach daemon when docker.enabled=false"
     fi
   fi
+elif ! command -v docker >/dev/null 2>&1; then
+  warn "Docker CLI is not installed (packages.installDockerCli=false); skipping Docker proxy tests"
 elif docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
   SRV_VER="$(docker version --format '{{.Server.Version}}')"
   pass "Docker Desktop reachable through policy proxy (Engine ${SRV_VER})"
@@ -245,11 +247,14 @@ fi
 echo ""
 echo "[6/6] Pre-installed Developer, Cloud & AI Agent Toolchain"
 
-if [[ -r "${VERIFY_POLICY_FILE}" ]]; then
+if [[ -r "${VERIFY_POLICY_FILE}" ]] && python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "${VERIFY_POLICY_FILE}" >/dev/null 2>&1; then
   mapfile -t EXPECTED_TOOLS < <(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("\n".join(d.get("expectedTools", [])))' "${VERIFY_POLICY_FILE}")
   CHECK_DOCKER_COMPOSE="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("true" if d.get("checkDockerCompose", False) else "false")' "${VERIFY_POLICY_FILE}")"
   CHECK_AZ_DEVOPS="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("true" if d.get("checkAzureDevopsExt", False) else "false")' "${VERIFY_POLICY_FILE}")"
 else
+  if [[ -r "${VERIFY_POLICY_FILE}" ]]; then
+    warn "Could not parse ${VERIFY_POLICY_FILE}; falling back to default toolchain checks"
+  fi
   EXPECTED_TOOLS=(git python3 uv node pnpm gemini claude docker)
   CHECK_DOCKER_COMPOSE="true"
   CHECK_AZ_DEVOPS="false"

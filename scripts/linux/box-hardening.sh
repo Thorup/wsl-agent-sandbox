@@ -239,7 +239,10 @@ os.chmod(docker_policy_file, 0o600)
 
 # --- B2. World-readable non-secret verify-policy.json for policy-aware verification ---
 pkgs = policy.get("packages", {})
-expected_tools = ["git", "python3"]
+apt_pkgs = set(pkgs.get("apt", []) or [])
+expected_tools = ["python3"]
+if "git" in apt_pkgs:
+    expected_tools.insert(0, "git")
 if pkgs.get("installDockerCli", True):
     expected_tools.append("docker")
 if pkgs.get("installUv", True):
@@ -277,9 +280,11 @@ verify_policy = {
     "checkDockerCompose": bool(pkgs.get("installDockerCli", True)),
     "checkAzureDevopsExt": bool(pkgs.get("installAzureDevopsCli", False)),
 }
-with open(verify_policy_file, "w", encoding="utf-8") as f:
+verify_tmp = f"{verify_policy_file}.tmp.{os.getpid()}"
+with open(verify_tmp, "w", encoding="utf-8") as f:
     json.dump(verify_policy, f, indent=2)
-os.chmod(verify_policy_file, 0o644)
+os.chmod(verify_tmp, 0o644)
+os.replace(verify_tmp, verify_policy_file)
 
 # --- C. Per-UID nftables firewall (table inet wsl_agent_sandbox) ---
 dns_v4, dns_v6 = set(), set()
