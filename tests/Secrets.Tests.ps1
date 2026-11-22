@@ -691,6 +691,80 @@ try {
         $svcTtlOverride.Payload.serviceTtls.github -eq 30 -and
         $svcTtlOverride.Payload.serviceTtls.gemini -eq 30
     )
+
+    # Vault backend resolver tests (mocked hook + negative scheme test)
+    $vaultManifest = Join-Path $tmpDir 'vault.json'
+    [System.IO.File]::WriteAllText($vaultManifest, (@{
+        github = @{ tokenVault = 'op://SandboxVault/GitHub/token' }
+        claude = @{ apiKeyVault = 'azkv://sandbox-kv/anthropic-key' }
+    } | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding($false)))
+    $script:VaultResolverHook = {
+        param($uri, $baseDir, $ctx)
+        $null = $baseDir
+        $null = $ctx
+        if ($uri -eq 'op://SandboxVault/GitHub/token') { return 'ghp_from_op_vault' }
+        if ($uri -eq 'azkv://sandbox-kv/anthropic-key') { return 'sk-ant-from-azkv' }
+        throw "unexpected uri: $uri"
+    }
+    try {
+        $vaultBuilt = Build-SeedSecretsPayload -ManifestPath $vaultManifest -AgentName 'agent'
+        Assert-True "Resolves github tokenVault via op:// backend" ($vaultBuilt.Payload.services.github.token -eq 'ghp_from_op_vault')
+        Assert-True "Resolves claude apiKeyVault via azkv:// backend" ($vaultBuilt.Payload.services.claude.apiKey -eq 'sk-ant-from-azkv')
+        Assert-True "DryRun summary reports vault backend schemes without leaking secrets" (
+            (($vaultBuilt.Summary | Where-Object { $_ -match '^github ' }) -match '\[vault=op://\]') -and
+            (($vaultBuilt.Summary | Where-Object { $_ -match '^claude ' }) -match '\[vault=azkv://\]') -and
+            (($vaultBuilt.Summary -join "`n") -notmatch 'ghp_from_op_vault|sk-ant-from-azkv')
+        )
+
+        # URI validation must run even when VaultResolverHook is active
+        Assert-Throws "Hook does not bypass malformed azkv:// empty secret segment" {
+            Resolve-VaultSecretUri -Uri 'azkv://myvault/' -BaseDir $tmpDir -Context 'test' | Out-Null
+        } 'azkv://<vault>/<secret>'
+        Assert-Throws "Hook does not bypass malformed gcpsm:// empty project segment" {
+            Resolve-VaultSecretUri -Uri 'gcpsm:///mysecret' -BaseDir $tmpDir -Context 'test' | Out-Null
+        } 'gcpsm://<project>/<secret>'
+        Assert-Throws "Hook does not bypass option-injection leading '-' target" {
+            Resolve-VaultSecretUri -Uri 'bw://--raw' -BaseDir $tmpDir -Context 'test' | Out-Null
+        } 'cannot start with'
+    } finally {
+        $script:VaultResolverHook = $null
+    }
+    Assert-Throws "Rejects unsupported vault URI scheme" {
+        Resolve-VaultSecretUri -Uri 'unknown://vault/item' -BaseDir $tmpDir -Context 'test' | Out-Null
+    } 'unsupported vault URI scheme'
+
+    $conflictVaultManifest = Join-Path $tmpDir 'conflict-vault.json'
+    [System.IO.File]::WriteAllText($conflictVaultManifest, (@{
+        github = @{ token = 'ghp_direct'; tokenVault = 'op://Vault/Item/token' }
+    } | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding($false)))
+    Assert-Throws "Rejects specifying both token and tokenVault without leaking token" {
+        Build-SeedSecretsPayload -ManifestPath $conflictVaultManifest -AgentName 'agent' | Out-Null
+    } 'specify only one of' 'ghp_direct'
+
+    # DPAPI round-trip and empty decrypted secret rejection (works on PS 5.1 & PS 7)
+    if (-not ('System.Security.Cryptography.ProtectedData' -as [type])) {
+        try { Add-Type -AssemblyName 'System.Security' -ErrorAction Stop } catch { Write-Verbose $_.Exception.Message }
+    }
+    if (-not ('System.Security.Cryptography.ProtectedData' -as [type])) {
+        try { Add-Type -AssemblyName 'System.Security.Cryptography.ProtectedData' -ErrorAction Stop } catch { Write-Verbose $_.Exception.Message }
+    }
+    $dpapiFile = Join-Path $tmpDir 'dpapi-secret.bin'
+    $rawDpapiBytes = [System.Text.Encoding]::UTF8.GetBytes("dpapi-protected-token-xyz`r`n")
+    $encDpapiBytes = [System.Security.Cryptography.ProtectedData]::Protect($rawDpapiBytes, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+    [System.IO.File]::WriteAllBytes($dpapiFile, $encDpapiBytes)
+    $resolvedDpapi = Resolve-VaultSecretUri -Uri 'dpapi://dpapi-secret.bin' -BaseDir $tmpDir -Context 'test.dpapi'
+    Assert-True "Resolves dpapi:// encrypted file cleanly on current user scope" ($resolvedDpapi -eq 'dpapi-protected-token-xyz')
+
+    $dpapiEmptyFile = Join-Path $tmpDir 'dpapi-empty.bin'
+    $encEmptyBytes = [System.Security.Cryptography.ProtectedData]::Protect([System.Text.Encoding]::UTF8.GetBytes("   `r`n"), $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+    [System.IO.File]::WriteAllBytes($dpapiEmptyFile, $encEmptyBytes)
+    Assert-Throws "Rejects dpapi:// file that decrypts to whitespace" {
+        Resolve-VaultSecretUri -Uri 'dpapi://dpapi-empty.bin' -BaseDir $tmpDir -Context 'test.dpapi' | Out-Null
+    } 'decrypted to an empty value'
+
+    # Invoke-VaultCliProcess separates stdout from stderr warnings without NativeCommandError
+    $cliStdout = Invoke-VaultCliProcess -FileName 'powershell.exe' -Arguments @('-NoProfile', '-Command', '[Console]::Error.WriteLine("WARNING: CLI update available"); [Console]::Out.WriteLine("clean-secret-from-stdout")') -Context 'test.cli' -Uri 'op://v/i/f'
+    Assert-True "Invoke-VaultCliProcess ignores stderr warnings and returns clean stdout" ($cliStdout -eq 'clean-secret-from-stdout')
 } finally {
     [Environment]::SetEnvironmentVariable('WSL_AGENT_SANDBOX_SECRETS_PATH', $prevEnvManifest)
     [Environment]::SetEnvironmentVariable('TEST_SANDBOX_GH_TOKEN', $prevTestToken)
