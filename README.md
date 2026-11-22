@@ -32,6 +32,7 @@ cd wsl-agent-sandbox
 
 # 2. Provision Ubuntu 26.04 LTS, build & test the Docker policy proxy, harden, and verify:
 .\box.ps1 init
+# (Or if installed globally via Scoop / packaging/scoop/wsl-agent-sandbox.json: `wsl-sandbox init`)
 
 # 3. Open an interactive shell as the sandboxed agent user:
 .\box.ps1 shell
