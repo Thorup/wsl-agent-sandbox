@@ -236,8 +236,25 @@ elif docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
   expect_docker_blocked "malicious volume create (type=none,o=bind,device=/run/desktop/mnt/host/c)" \
     docker volume create --driver local --opt type=none --opt o=bind --opt device=/run/desktop/mnt/host/c evil_box_vol
 
-  expect_docker_blocked "non-loopback PortBindings (0.0.0.0:18999:80)" \
-    docker run --rm -p 0.0.0.0:18999:80 alpine:latest true
+  VERIFY_POLICY_FILE="/etc/wsl-agent-sandbox/verify-policy.json"
+  ENFORCE_LOOPBACK_PB="true"
+  FORCE_INTERNAL_NET="false"
+  if [[ -r "${VERIFY_POLICY_FILE}" ]]; then
+    ENFORCE_LOOPBACK_PB="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("true" if (not d.get("allowPortBindings", True) or d.get("forceLoopbackPortBindings", True)) else "false")' "${VERIFY_POLICY_FILE}" 2>/dev/null || echo "true")"
+    FORCE_INTERNAL_NET="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("true" if d.get("forceInternalNetwork", False) else "false")' "${VERIFY_POLICY_FILE}" 2>/dev/null || echo "false")"
+  fi
+
+  if [[ "${ENFORCE_LOOPBACK_PB}" == "true" ]]; then
+    expect_docker_blocked "non-loopback PortBindings (0.0.0.0:18999:80)" \
+      docker run --rm -p 0.0.0.0:18999:80 alpine:latest true
+  else
+    pass "Non-loopback PortBindings allowed by policy (allowPortBindings=true, forceLoopbackPortBindings=false)"
+  fi
+
+  if [[ "${FORCE_INTERNAL_NET}" == "true" ]]; then
+    expect_docker_blocked "--network=bridge when forceInternalNetwork=true" \
+      docker run --rm --network=bridge alpine:latest true
+  fi
 
   rm -rf "${WORK_DIR}"
 else

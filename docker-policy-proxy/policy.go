@@ -36,6 +36,7 @@ type Policy struct {
 	EphemeralBindRoot         string                 `json:"ephemeralBindRoot,omitempty"`
 	EphemeralDaemonRoot       string                 `json:"ephemeralDaemonRoot,omitempty"`
 	bindManager               *EphemeralMountManager `json:"-"`
+	networkChecker            func(string) (bool, error)
 }
 
 func (p *Policy) portBindingsAllowed() bool {
@@ -225,6 +226,9 @@ func (p *Policy) ProcessJSONBodyWithMounts(method, rawPath string, body []byte) 
 	case norm == "/networks/create":
 		b, m, err := p.processNetworkCreate(body)
 		return b, m, nil, err
+	case strings.HasPrefix(norm, "/networks/") && strings.HasSuffix(norm, "/connect"):
+		b, m, err := p.processNetworkConnect(norm, body)
+		return b, m, nil, err
 	default:
 		return body, false, nil, nil
 	}
@@ -314,39 +318,102 @@ func asStringSlice(v any) ([]string, bool) {
 	return out, true
 }
 
+func (p *Policy) validateNetworkTarget(target string) error {
+	lt := strings.ToLower(strings.TrimSpace(target))
+	if lt == "none" {
+		return nil
+	}
+	if lt == "" || lt == "default" || lt == "bridge" || lt == "host" ||
+		strings.HasPrefix(lt, "host:") || strings.HasPrefix(lt, "ns:") || strings.HasPrefix(lt, "container:") {
+		return deny("network %q is forbidden when forceInternalNetwork is enabled", target)
+	}
+	if p.networkChecker == nil {
+		return deny("network %q cannot be verified as internal when forceInternalNetwork is enabled", target)
+	}
+	internal, err := p.networkChecker(target)
+	if err != nil {
+		return deny("failed verifying network %q internal status: %v", target, err)
+	}
+	if !internal {
+		return deny("non-internal network %q is forbidden when forceInternalNetwork is enabled", target)
+	}
+	return nil
+}
+
 func (p *Policy) processContainerCreate(body []byte) ([]byte, bool, []string, error) {
 	obj, err := decodeStrictObject(body)
 	if err != nil {
 		return nil, false, nil, err
 	}
+
+	hasEndpoints := false
+	ncModified := false
+	if ncKey, ncRaw, ok := getKeyCI(obj, "NetworkingConfig"); ok && ncRaw != nil {
+		ncObj, ok := ncRaw.(map[string]any)
+		if !ok {
+			return nil, false, nil, deny("NetworkingConfig must be a JSON object")
+		}
+		if ecKey, ecRaw, ok := getKeyCI(ncObj, "EndpointsConfig"); ok && ecRaw != nil {
+			ecObj, ok := ecRaw.(map[string]any)
+			if !ok {
+				return nil, false, nil, deny("NetworkingConfig.EndpointsConfig must be a JSON object")
+			}
+			for netName := range ecObj {
+				trimmedNet := strings.ToLower(strings.TrimSpace(netName))
+				if p.ForceInternalNetwork && (trimmedNet == "" || trimmedNet == "default") {
+					// Docker CLI 29+ emits EndpointsConfig: {"default": {}} when --network is omitted;
+					// strip "default" so HostConfig.NetworkMode="none" takes effect cleanly.
+					delete(ecObj, netName)
+					ncModified = true
+					continue
+				}
+				hasEndpoints = true
+				if p.ForceInternalNetwork {
+					if err := p.validateNetworkTarget(netName); err != nil {
+						return nil, false, nil, err
+					}
+				}
+			}
+			if ncModified {
+				ncObj[ecKey] = ecObj
+				obj[ncKey] = ncObj
+			}
+		}
+	}
+
 	hcKey, hcRaw, hasHC := getKeyCI(obj, "HostConfig")
 	if !hasHC || hcRaw == nil {
-		if p.ForceInternalNetwork {
+		if p.ForceInternalNetwork && !hasEndpoints {
 			obj["HostConfig"] = map[string]any{"NetworkMode": "none"}
-			out, err := json.Marshal(obj)
-			if err != nil {
-				return nil, false, nil, fmt.Errorf("re-marshaling container create body: %w", err)
-			}
-			return out, true, nil, nil
+			ncModified = true
 		}
-		return body, false, nil, nil
+		if !ncModified {
+			return body, false, nil, nil
+		}
+		out, err := json.Marshal(obj)
+		if err != nil {
+			return nil, false, nil, fmt.Errorf("re-marshaling container create body: %w", err)
+		}
+		return out, true, nil, nil
 	}
 	hc, ok := hcRaw.(map[string]any)
 	if !ok {
 		return nil, false, nil, deny("HostConfig must be a JSON object")
 	}
 
-	modified, ephemeralTargets, err := p.validateAndRewriteHostConfig(hc)
+	modified, ephemeralTargets, err := p.validateAndRewriteHostConfig(hc, hasEndpoints)
 	if err != nil {
 		if p.bindManager != nil && len(ephemeralTargets) > 0 {
 			p.bindManager.CleanupTargets(ephemeralTargets)
 		}
 		return nil, false, nil, err
 	}
-	if !modified {
+	if !modified && !ncModified {
 		return body, false, ephemeralTargets, nil
 	}
-	obj[hcKey] = hc
+	if modified {
+		obj[hcKey] = hc
+	}
 	out, err := json.Marshal(obj)
 	if err != nil {
 		if p.bindManager != nil && len(ephemeralTargets) > 0 {
@@ -422,6 +489,21 @@ func checkVolumeDriverOpts(opts map[string]any) error {
 		}
 	}
 	return nil
+}
+
+func (p *Policy) processNetworkConnect(normPath string, body []byte) ([]byte, bool, error) {
+	if _, err := decodeStrictObject(body); err != nil {
+		return nil, false, err
+	}
+	if !p.ForceInternalNetwork {
+		return body, false, nil
+	}
+	netRef := strings.TrimPrefix(normPath, "/networks/")
+	netRef = strings.TrimSuffix(netRef, "/connect")
+	if err := p.validateNetworkTarget(netRef); err != nil {
+		return nil, false, err
+	}
+	return body, false, nil
 }
 
 func (p *Policy) processNetworkCreate(body []byte) ([]byte, bool, error) {
@@ -515,7 +597,7 @@ func (p *Policy) validateAndRewritePortBindings(pbMap map[string]any) (bool, err
 	return modified, nil
 }
 
-func (p *Policy) validateAndRewriteHostConfig(hc map[string]any) (bool, []string, error) {
+func (p *Policy) validateAndRewriteHostConfig(hc map[string]any, hasEndpoints bool) (bool, []string, error) {
 	modified := false
 	var ephemeralTargets []string
 
@@ -548,16 +630,22 @@ func (p *Policy) validateAndRewriteHostConfig(hc map[string]any) (bool, []string
 	if p.ForceInternalNetwork {
 		nmKey, nmRaw, hasNM := getKeyCI(hc, "NetworkMode")
 		if !hasNM || nmRaw == nil {
-			hc["NetworkMode"] = "none"
-			modified = true
+			if !hasEndpoints {
+				hc["NetworkMode"] = "none"
+				modified = true
+			}
 		} else {
 			mode, _ := asString(nmRaw)
 			lm := strings.ToLower(strings.TrimSpace(mode))
 			if lm == "" || lm == "default" {
-				hc[nmKey] = "none"
-				modified = true
-			} else if lm == "bridge" {
-				return false, ephemeralTargets, deny("HostConfig.NetworkMode=%q is forbidden when forceInternalNetwork is enabled", mode)
+				if !hasEndpoints {
+					hc[nmKey] = "none"
+					modified = true
+				} else {
+					return false, ephemeralTargets, deny("HostConfig.NetworkMode=%q is forbidden when forceInternalNetwork is enabled", mode)
+				}
+			} else if err := p.validateNetworkTarget(mode); err != nil {
+				return false, ephemeralTargets, err
 			}
 		}
 	}
@@ -568,7 +656,7 @@ func (p *Policy) validateAndRewriteHostConfig(hc map[string]any) (bool, []string
 		if !valid {
 			return false, ephemeralTargets, deny("HostConfig.PublishAllPorts must be a boolean")
 		}
-		if b && (!p.portBindingsAllowed() || len(p.AllowedPublishedPorts) > 0) {
+		if b && (!p.portBindingsAllowed() || p.loopbackPortBindingsForced() || len(p.AllowedPublishedPorts) > 0) {
 			return false, ephemeralTargets, deny("HostConfig.PublishAllPorts is forbidden by policy")
 		}
 	}
