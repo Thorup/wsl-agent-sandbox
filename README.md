@@ -16,9 +16,10 @@ A declaratively configured, isolated **Ubuntu 26.04 LTS (Resolute Raccoon)** WSL
 | **Windows Filesystem** | `/mnt/c` automount disabled (`[automount] enabled=false`), manual `mount -t drvfs` blocked. | Declarative `sharedFolders` allowlist in `box.json` mounted at `/shared/<name>` (`ro` or `rw`). |
 | **Windows `.exe` Interop** | Disabled (`[interop] enabled=false`, `appendWindowsPath=false`). | None (Antigravity / VS Code Remote-WSL uses modern script-less startup). |
 | **WSLg / Clipboard / `/mnt/wsl`** | Unmounted per-distro (`rprivate` + `umount -l` + `chmod 000`); no X11/Wayland/clipboard/raw sockets. | Root-only `/run/box-root/mnt-wsl` (`0700 root:root`) used exclusively by `docker-policy-proxy`. |
-| **Network (WSL → Windows & LAN)** | Per-UID `nftables` (`meta skuid 26040`) drops all new outbound traffic to Windows host & RFC1918 LAN. | Optional `network.allowedHostPorts` in `box.json`; outbound internet remains open. |
+| **Network (WSL → Windows & LAN)** | Per-UID `nftables` (`meta skuid 26040`) drops all new outbound traffic to Windows host & RFC1918 LAN (`network.logDrops: true` rate-limit logs blocked connections). | Optional `network.allowedHostPorts` in `box.json`; outbound internet is `"open"` by default or restricted via `network.egressMode: "allowlist"` (`network.allowedDomains` enforced by root `egress-proxy.service` on `127.0.0.1:3128`). |
 | **Network (Windows → WSL)** | `ct state established,related accept` + WSL `localhostForwarding`. | Browse any web app hosted in WSL at `http://localhost:<port>` from Windows! |
-| **Docker Desktop** | Docker Desktop WSL Integration stays **OFF** for this distro; root-owned Go `docker-policy-proxy` mediates `/var/run/docker.sock`. | Blocks host drive bind mounts (`/run/desktop/mnt/host/c`, `/mnt/c`, `C:\`), symlink escapes, `--privileged`, dangerous `CapAdd`, `host` namespaces, devices, malicious volume options, Swarm/plugins. Automatically rewrites allowed `/home/agent` (and opted-in `/shared/*`) bind mounts! |
+| **Docker Desktop** | Docker Desktop WSL Integration stays **OFF** for this distro; root-owned Go `docker-policy-proxy` mediates `/var/run/docker.sock`. | Blocks host drive bind mounts (`/run/desktop/mnt/host/c`, `/mnt/c`, `C:\`), symlink & TOCTOU escapes (`O_NOFOLLOW` ephemeral bind pinning), `--privileged`, dangerous `CapAdd`, `host` namespaces, devices, malicious volume options, Swarm/plugins. Enforces loopback `PortBindings`, optional `forceInternalNetwork`, container `defaultLimits`/`maxLimits`, and `allowedRegistries`. Automatically rewrites allowed `/home/agent` (and opted-in `/shared/*`) bind mounts! |
+| **Resource Quotas** | Optional per-UID `systemd` slice limits on `user-<uid>.slice` (never restricts root control plane). | Declarative `resources` (`memoryMax`, `cpuQuota`, `tasksMax`) in `box.json`. |
 | **Other WSL Distros** | Zero changes to `%USERPROFILE%\.wslconfig` or other distros; `nftables` scoped strictly to UID `26040`. | Optional reference in `examples/wslconfig.optional.ini`. |
 
 ---
@@ -99,6 +100,51 @@ Use this table to determine what can reach a port forwarded to your Windows clie
    - **Mirrored mode (`networkingMode=mirrored`):** Standard `kubectl port-forward ... 8080:<target>` (bound to `127.0.0.1` on Windows) is reachable directly at `localhost:8080` from inside WSL.
    - **NAT mode (default WSL2):** Windows `127.0.0.1` is not routed into WSL NAT, so bind the forward to your Windows host/WSL interface (e.g., `kubectl port-forward --address 0.0.0.0 ... 8080:<target>` or the `vEthernet (WSL)` IP), allow the port through Windows Firewall if prompted, and connect from WSL to the Windows host gateway IP (`ip route show default | awk '{print $3}'`).
 
+### Restrict Public Internet Egress to an Allowlist (`network.egressMode`)
+
+By default (`"egressMode": "open"`), the agent has open outbound internet access while Windows host and RFC1918 LAN IPs are blocked. To restrict outbound HTTP/HTTPS traffic strictly to allowlisted domains (and block direct non-proxy egress and direct UDP/TCP port 53 DNS exfiltration in `nftables`), set `"egressMode": "allowlist"`:
+
+```json
+"network": {
+  "blockHostAndLan": true,
+  "logDrops": true,
+  "egressMode": "allowlist",
+  "allowedDomains": [
+    "llm-apis",
+    "github",
+    "npm",
+    "pypi",
+    "*.example.com"
+  ]
+}
+```
+- Built-in presets in `allowedDomains`: `llm-apis`, `github`, `npm`, `pypi`, and `apt`.
+- `box-apply-policy.sh` automatically starts the root-owned `egress-proxy.service` on `127.0.0.1:3128` (with SSRF and DNS-rebinding protection against host/LAN IPs) and exports `HTTP_PROXY`/`HTTPS_PROXY` into the agent environment.
+
+### Harden Docker Containers & Enforce Systemd Resource Quotas (`docker` & `resources`)
+
+Fine-tune `docker-policy-proxy` container network/resource policies and per-UID `systemd` slice quotas (`user-<uid>.slice`) in `box.json` (or `box.local.json`):
+
+```json
+"docker": {
+  "enabled": true,
+  "allowBindPrefixes": ["/home/agent"],
+  "allowBuildKit": true,
+  "allowPortBindings": true,
+  "forceLoopbackPortBindings": true,
+  "allowedPublishedPorts": [3000, 8080],
+  "forceInternalNetwork": false,
+  "defaultLimits": { "memoryBytes": 2147483648, "nanoCpus": 2000000000, "pidsLimit": 256 },
+  "maxLimits": { "memoryBytes": 4294967296, "nanoCpus": 4000000000, "pidsLimit": 512 },
+  "allowedRegistries": ["docker.io", "ghcr.io", "mcr.microsoft.com"]
+},
+"resources": {
+  "memoryMax": "8G",
+  "cpuQuota": "400%",
+  "tasksMax": 512
+}
+```
+
 ### Add System `apt` Packages & Cloud/Agent/Language Toolchains
 Add package names to `packages.apt` or toggle built-in installers (`installKubectl`, `installAwsCli`, `installGcloudCli`, `installAzureCli`, `installAzureDevopsCli`, `installGithubCli`, `installJiraCli`, `installUpctl`, `installDotnetSdk`, `installRust`, `installGeminiCli`, `installClaudeCode`) in `box.json` and run `.\box.ps1 apply`. (User-space tools via `uv`, `pip`, `npm`, `pnpm`, `cargo`, `rustup`, and `dotnet tool install -g` can be installed freely by the agent inside `/home/agent` without `sudo`.)
 
@@ -164,7 +210,7 @@ Manifest path resolution priority:
 | Service Key | CLI / Tool | Auth Mechanism & Linux Target |
 | :--- | :--- | :--- |
 | `github` | `gh` + `git` (HTTPS) | Machine account / fine-grained PAT → `~/.config/gh/hosts.yml`, `gh auth setup-git`, optional `GH_TOKEN` / `GH_ENTERPRISE_TOKEN` (and optional `loginOnline: true`); supports `"proxyInject": true` (`GITHUB_API_URL=http://127.0.0.1:3129/github`). |
-| `git` | `git` (SSH + signing) | Dedicated Git SSH keys (plus optional `.pub` & OpenSSH `-cert.pub` certs) → `~/.ssh/wsl-agent-sandbox-git/` (`0600`), independent Git `Host` stanzas in `~/.ssh/config`, pinned `known_hosts`, plus optional Git identity (`user.name`/`user.email`), SSH commit/tag signing (`gpg.format = ssh`, `allowed_signers`), and HTTPS-to-SSH rewrites via `~/.config/wsl-agent-sandbox/gitconfig`. |
+| `git` | `git` (SSH + signing) | Dedicated Git SSH keys (plus optional `.pub` & OpenSSH `-cert.pub` certs) → `~/.ssh/wsl-agent-sandbox-git/` (`0600`) or root-owned `ssh-agent` (`"mode": "agent-proxy"` via filtered `SSH_AUTH_SOCK=/run/ssh-agent-proxy/agent.sock`), independent Git `Host` stanzas in `~/.ssh/config`, pinned `known_hosts`, plus optional Git identity (`user.name`/`user.email`), SSH commit/tag signing (`gpg.format = ssh`, `allowed_signers`), and HTTPS-to-SSH rewrites via `~/.config/wsl-agent-sandbox/gitconfig`. |
 | `aws` | `aws` | IAM access keys / STS tokens (single or multi-profile) → `~/.aws/credentials`, `~/.aws/config`, optional `AWS_PROFILE`. |
 | `gcloud` | `gcloud` + GCP SDKs | Service Account JSON key → `~/.config/wsl-agent-sandbox/keys/gcloud-service-account.json`, `gcloud auth activate-service-account`, project/region/zone config, `GOOGLE_APPLICATION_CREDENTIALS`. |
 | `azure` | `az` + Azure SDKs | Entra ID Service Principal (client secret or PEM cert) → `az login --service-principal`, optional subscription, `AZURE_CLIENT_ID`/`AZURE_TENANT_ID`/`AZURE_CLIENT_SECRET` (or `AZURE_CLIENT_CERTIFICATE_PATH`). |
@@ -174,17 +220,17 @@ Manifest path resolution priority:
 | `kubectl` | `kubectl` | Dedicated kubeconfig file OR Service Account bearer token → `~/.kube/config` + optional context switch. |
 | `gemini` | `gemini` | `GEMINI_API_KEY` and/or Vertex AI; supports `"proxyInject": true` (`GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:3129/gemini` + placeholder token). |
 | `claude` | `claude` | `ANTHROPIC_API_KEY` and/or `CLAUDE_CODE_OAUTH_TOKEN`; supports `"proxyInject": true` (`ANTHROPIC_BASE_URL=http://127.0.0.1:3129/claude` + placeholder tokens). |
-| `ssh` | `ssh` / `scp` / `sftp` | Named SSH private keys for remote servers/bastions (plus optional `.pub` & OpenSSH user `-cert.pub` certificates) → `~/.ssh/wsl-agent-sandbox/` (`0600`), marker-delimited `Host` stanzas & optional `defaultKey` in `~/.ssh/config`, and pinned `known_hosts`. |
+| `ssh` | `ssh` / `scp` / `sftp` | Named SSH private keys for remote servers/bastions (plus optional `.pub` & OpenSSH user `-cert.pub` certificates) → `~/.ssh/wsl-agent-sandbox/` (`0600`) or root-owned `ssh-agent` (`"mode": "agent-proxy"` via filtered `SSH_AUTH_SOCK=/run/ssh-agent-proxy/agent.sock`), marker-delimited `Host` stanzas & optional `defaultKey` in `~/.ssh/config`, and pinned `known_hosts`. |
 | `env` | Any CLI | Additional custom token environment variables exported into `~/.config/wsl-agent-sandbox/secrets.env` (protected system vars like `PATH`/`DOCKER_HOST`/`LD_PRELOAD` are rejected). |
 | `files` | Any CLI | Additional secret files (e.g., `~/.npmrc`, `~/.netrc`) copied atomically with `0600` strictly inside `/home/<agent>/`. |
 
 > **Git SSH & Commit Signing Notes**:
-> - Rotate or revoke Git SSH keys independently of remote server `ssh` credentials with `.\box.ps1 seed-secrets -Service git` or `.\box.ps1 clear-secrets -Service git`. Managed Git keys live in `~/.ssh/wsl-agent-sandbox-git/` and use their own marker-delimited block in `~/.ssh/config` (ahead of `ssh`'s `Host *` defaults), so `git` and `ssh` never clobber each other.
+> - Rotate or revoke Git SSH keys independently of remote server `ssh` credentials with `.\box.ps1 seed-secrets -Service git` or `.\box.ps1 clear-secrets -Service git`. Managed Git keys live in `~/.ssh/wsl-agent-sandbox-git/` (or in a root-owned `ssh-agent` behind `/run/ssh-agent-proxy/agent.sock` when `"mode": "agent-proxy"` is set, so private keys never touch `/home/agent`) and use their own marker-delimited block in `~/.ssh/config` (ahead of `ssh`'s `Host *` defaults), so `git` and `ssh` never clobber each other.
 > - Supports both a concise single-host shorthand (`"host": "github.com"`, `"privateKeyFile": "..."`) and multi-host / per-repo deploy-key aliases (`keys[]` + `hosts[]` for GitHub, GitLab, Azure DevOps `ssh.dev.azure.com`, Bitbucket, etc.), plus optional `userName`/`userEmail`, SSH commit/tag signing (`signing` → `gpg.format = ssh` + `allowed_signers` in `~/.config/wsl-agent-sandbox/gitconfig` included from `~/.gitconfig`), and optional `rewriteHttpsToSsh`.
 > - `StrictHostKeyChecking` is computed per Git host (`yes` when pinned known hosts cover that host, `accept-new` otherwise), and `BatchMode` defaults to `true` so agents fail fast instead of hanging on interactive SSH prompts. If you also use `github` with `"gitProtocol": "ssh"`, configure `git` alongside `github` to supply the SSH key.
 
 > **SSH Remote Server Access Notes**:
-> - Rotate or revoke agent SSH keys at any time with `.\box.ps1 seed-secrets -Service ssh` or `.\box.ps1 clear-secrets -Service ssh`. Managed keys live strictly in `~/.ssh/wsl-agent-sandbox/` and `~/.ssh/config` uses marker-delimited blocks, so manual user keys and custom `~/.ssh/config` entries are never overwritten; stale managed keys are automatically pruned on rotation.
+> - Rotate or revoke agent SSH keys at any time with `.\box.ps1 seed-secrets -Service ssh` or `.\box.ps1 clear-secrets -Service ssh`. Managed keys live strictly in `~/.ssh/wsl-agent-sandbox/` (or in the root-owned `ssh-agent` behind `ssh-agent-proxy.service` when `"mode": "agent-proxy"` is configured, which filters `SSH_AGENTC_REQUEST_IDENTITIES` and `SSH_AGENTC_SIGN_REQUEST` against an allowlist of public key blobs and blocks add/remove/lock operations) and `~/.ssh/config` uses marker-delimited blocks, so manual user keys and custom `~/.ssh/config` entries are never overwritten; stale managed keys are automatically pruned on rotation.
 > - Use dedicated, least-privilege remote accounts and passphrase-less deploy keys (or short-lived OpenSSH user certificates via `certificate`/`certificateFile`) with pinned `knownHosts` / `knownHost` entries. `StrictHostKeyChecking` defaults to `yes` when pinned known hosts are provided, or `accept-new` otherwise.
 > - `seed-secrets` never weakens `box.json` network isolation: public remote SSH servers work out of the box, while RFC1918 / LAN / Tailscale targets (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10`) remain governed by `network.blockHostAndLan` and `network.blockedCidrs` in `box.json` (or reachable via a public `proxyJump` bastion / `allowedHostPorts` tunnel).
 
@@ -203,7 +249,7 @@ Manifest path resolution priority:
 ## Important Security Notes
 
 1. **Keep Docker Desktop "WSL Integration" OFF for `wsl-agent-sandbox`**: Do not toggle `wsl-agent-sandbox` on in Docker Desktop's WSL Integration settings. Our root-owned `docker-policy-proxy` already connects to Docker Desktop cleanly while preventing raw socket exposure.
-2. **Docker Desktop Container Bridge Egress**: While direct WSL processes (`agent` UID `26040`) are blocked from reaching Windows host ports by `nftables`, and containers cannot use `--network=host` or `--add-host=...:host-gateway`, containers running inside Docker Desktop's own bridge network can still resolve `host.docker.internal` unless restricted via Windows Firewall. Filesystem and privilege escapes via Docker are fully blocked by `docker-policy-proxy`.
+2. **Docker Desktop Container Bridge Egress**: While direct WSL processes (`agent` UID `26040`) are blocked from reaching Windows host ports by `nftables`, and containers cannot use `--network=host` or `--add-host=...:host-gateway`, containers running inside Docker Desktop's default bridge network can still resolve `host.docker.internal` unless you set `"docker": { "forceInternalNetwork": true }` (or `"enabled": false`) in `box.json`, or restrict Docker Desktop bridge traffic via Windows Firewall. Filesystem, symlink/TOCTOU (`O_NOFOLLOW` bind pinning), port-binding (`forceLoopbackPortBindings`), resource cap (`defaultLimits`/`maxLimits`), registry (`allowedRegistries`), and privilege escapes via Docker are enforced by `docker-policy-proxy`.
 3. **Global `.wslconfig` (`networkingMode`)**: `wsl-agent-sandbox` works cleanly in **both** `networkingMode=nat` and `networkingMode=mirrored` without modifying your global `%USERPROFILE%\.wslconfig`. In `networkingMode=mirrored`, `box-hardening.sh` installs per-UID (`uidrange 26040-26040`) policy routing + `nftables` `ct mark 0x2604` rules on `loopback0` so `agent` is blocked from reaching Windows `127.0.0.1` ports while Windows → WSL `localhost` web browsing and WSL-internal `127.0.0.1` services continue working seamlessly.
 
 ---
