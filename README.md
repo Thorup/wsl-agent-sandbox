@@ -167,6 +167,16 @@ Because every containment boundary (non-root UID `26040`, no `sudo`, no `/mnt/c`
 - **Claude Code** (`claude` — pre-installed by default; toggle `installClaudeCode` in `box.json`)
 - **OpenAI Codex CLI** (`codex` — toggle `installCodexCli: true` in `box.json`), **OpenCode** (`opencode` — toggle `installOpenCode: true`), **Aider** (`aider` — toggle `installAider: true`), or custom agents (installable via ` box.json` toggles or in user-space via `npm`/`uv`)
 
+### Dynamic Agent Instructions, `SKILL.md` & Multi-Cloud Profile Switchers (`use-gcloud`, `use-aws`, `box-context`)
+
+Whenever you run `.\box.ps1 apply`, `.\box.ps1 seed-secrets`, or `.\box.ps1 clear-secrets`, the sandbox automatically runs `/usr/local/sbin/box-sync-context.py` to keep agents aware of the active sandbox boundaries, mounts, allowed host ports, and seeded cloud profiles (with **zero secret values** written to disk):
+- **Global Agent Instruction Files (non-destructive marker blocks)**: Automatically updates `# >>> wsl-agent-sandbox >>>` blocks in `~/.gemini/GEMINI.md`, `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.config/opencode/AGENTS.md`, and `~/.config/wsl-agent-sandbox/SANDBOX_CONTEXT.md`.
+- **Supplementary Global Agent Skill (`SKILL.md`)**: Automatically generates `~/.gemini/skills/wsl-agent-sandbox/SKILL.md`, `~/.claude/skills/wsl-agent-sandbox/SKILL.md`, and `~/.codex/skills/wsl-agent-sandbox/SKILL.md` so that even when a repository has its own `GEMINI.md` / `CLAUDE.md` / `AGENTS.md`, agents can discover and activate the `wsl-agent-sandbox` skill.
+- **Persistent Multi-Cloud Switchers & Context CLI**:
+  - `use-gcloud <name>` (or `use-gcloud --list`) — Activates the named `gcloud` configuration **and** updates `GOOGLE_APPLICATION_CREDENTIALS`, `GOOGLE_CLOUD_PROJECT`, `CLOUDSDK_CORE_PROJECT`, and compute region/zone both in the current shell and persistently across subsequent non-interactive agent subshells (`~/.config/wsl-agent-sandbox/active-overrides.env`).
+  - `use-aws <profile>` (or `use-aws --list`) — Switches `AWS_PROFILE` both in the current shell and persistently across subshells.
+  - `box-context` (or `box-context --json`) — Prints the live, non-secret sandbox inventory.
+
 > **Cloud Credentials Note**: Any credentials you configure inside `/home/agent` (`~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.config/gh`, `~/.config/.jira`, `~/.config/upctl.yaml`, `~/.kube/config`) are accessible to autonomous agents running in this box. Use dedicated, least-privilege sandbox accounts/clusters or short-lived tokens rather than production admin credentials.
 
 ---
