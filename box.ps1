@@ -18,7 +18,7 @@
 #Requires -Version 5.1
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('init', 'up', 'apply', 'upgrade', 'doctor', 'compact', 'logs', 'audit', 'seed-secrets', 'clear-secrets', 'register-terminal', 'shell', 'root-shell', 'status', 'verify', 'snapshot', 'restore', 'reset', 'destroy', 'help')]
+    [ValidateSet('init', 'up', 'apply', 'upgrade', 'doctor', 'compact', 'logs', 'audit', 'push-repo', 'pull-diff', 'pull-branch', 'seed-secrets', 'clear-secrets', 'register-terminal', 'shell', 'root-shell', 'status', 'verify', 'snapshot', 'restore', 'reset', 'destroy', 'help')]
     [string]$Command = 'help',
 
     [Parameter(Position = 1)]
@@ -54,7 +54,13 @@ param(
     [string]$Since = '1 hour ago',
 
     [ValidateRange(1, 100000)]
-    [int]$Lines = 100
+    [int]$Lines = 100,
+
+    [string]$Dest = '',
+
+    [string]$Branch = 'HEAD',
+
+    [string]$RepoPath = ''
 )
 
 Set-StrictMode -Version Latest
@@ -91,6 +97,10 @@ Commands:
   compact            Trim free blocks inside WSL (fstrim) and compact the distro's ext4.vhdx.
   logs / audit       View root-owned security events (nftables drops, docker-policy-proxy denials,
                      box-hardening reloads) with optional -Source, -Since, -Lines.
+  push-repo <path>   Bundle a Windows git repo and clone/update it into ~/work/<name> on native ext4.
+  pull-diff <name>   Show git status, recent commits, and diffstat from ~/work/<name> inside WSL.
+  pull-branch <name> Fetch agent commits from ~/work/<name> into a safe local branch (sandbox/<name>)
+                     on Windows without touching working tree or .git/hooks.
   seed-secrets [path] Seed or rotate CLI tokens, service accounts, and Git/SSH credentials from a
                      central Windows manifest (default: %USERPROFILE%\.wsl-agent-sandbox\secrets.json)
                      independently of init/apply. Supports -SecretsPath, -Service <names>, -Prune, -DryRun.
@@ -809,6 +819,275 @@ function Invoke-AuditLogs {
     Invoke-WslRootBash -DistroName $distro -Script $cmd
 }
 
+function Assert-SafeBoxBranchName {
+    param([Parameter(Mandatory)][string]$Name)
+    $trimmed = $Name.Trim()
+    if ([string]::IsNullOrWhiteSpace($trimmed) -or
+        $trimmed.StartsWith('-') -or
+        $trimmed.StartsWith('/') -or
+        $trimmed.EndsWith('/') -or
+        $trimmed.EndsWith('.lock') -or
+        $trimmed.Contains('..') -or
+        $trimmed.Contains('@{') -or
+        $trimmed -notmatch '^[A-Za-z0-9._/@^-]+$') {
+        throw "Invalid git branch/ref name '$Name'."
+    }
+    return $trimmed
+}
+
+function Resolve-WslWorkRelPath {
+    param(
+        [Parameter(Mandatory)][string]$RawPath,
+        [string]$DefaultPrefix = ''
+    )
+    $norm = ($RawPath.Trim() -replace '\\', '/') -replace '^~/', ''
+    if ([string]::IsNullOrWhiteSpace($norm)) {
+        throw "Specify a non-empty relative repository path."
+    }
+    if ($DefaultPrefix -and -not $norm.Contains('/')) {
+        $norm = "$DefaultPrefix/$norm"
+    }
+    if ($norm.StartsWith('/') -or
+        $norm.Contains('..') -or
+        $norm.StartsWith('-') -or
+        $norm -notmatch '^[A-Za-z0-9._/-]+$') {
+        throw "Repository path '$RawPath' must be a safe relative path inside ~/."
+    }
+    return $norm.TrimEnd('/')
+}
+
+function Invoke-PushRepo {
+    param(
+        $Config,
+        [string]$WindowsRepoPath,
+        [string]$Dest = '',
+        [string]$Branch = 'HEAD',
+        [switch]$Force
+    )
+    $distro = $Config.distroName
+    $agent = $Config.agentUser.name
+    if (-not (Test-WslDistroExists -DistroName $distro)) { throw "Distro '$distro' does not exist." }
+    if ([string]::IsNullOrWhiteSpace($WindowsRepoPath) -or -not (Test-Path -LiteralPath $WindowsRepoPath -PathType Container)) {
+        throw "Windows repository directory not found: '$WindowsRepoPath'"
+    }
+    $resolved = (Resolve-Path -LiteralPath $WindowsRepoPath).Path
+    $isGit = (& git -C $resolved rev-parse --is-inside-work-tree 2>$null | Out-String).Trim()
+    if ($isGit -ne 'true') {
+        throw "'$resolved' is not a git repository."
+    }
+    $safeBranch = Assert-SafeBoxBranchName -Name $Branch
+    & git -C $resolved rev-parse --verify --quiet $safeBranch | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Git ref '$safeBranch' not found in '$resolved'."
+    }
+
+    $repoName = Split-Path -Leaf $resolved
+    $rawDest = if ([string]::IsNullOrWhiteSpace($Dest)) { "work/$repoName" } else { $Dest }
+    $targetRel = Resolve-WslWorkRelPath -RawPath $rawDest
+
+    $checkoutBranch = 'sandbox-base'
+    if ($safeBranch -eq 'HEAD') {
+        $headSym = (& git -C $resolved symbolic-ref --short -q HEAD 2>$null | Out-String).Trim()
+        if ($headSym -and $headSym -match '^[A-Za-z0-9._/-]+$') {
+            $checkoutBranch = $headSym
+        }
+    } elseif ($safeBranch -notmatch '^[0-9a-f]{7,40}$') {
+        $checkoutBranch = $safeBranch -replace '^refs/heads/', ''
+    }
+
+    $tmpBundle = Join-Path ([System.IO.Path]::GetTempPath()) ("wsl-push-" + [Guid]::NewGuid().ToString('N').Substring(0, 8) + ".bundle")
+    try {
+        Write-Host "[push-repo] Creating git bundle from '$resolved' ($safeBranch)..."
+        & git -C $resolved bundle create $tmpBundle $safeBranch
+        if ($LASTEXITCODE -ne 0) { throw "git bundle create failed." }
+        $bytes = [System.IO.File]::ReadAllBytes($tmpBundle)
+        $b64 = [Convert]::ToBase64String($bytes)
+
+        $scriptHead = @'
+set -euo pipefail
+target_rel="$1"
+checkout_branch="$2"
+force_flag="$3"
+tmp="$(mktemp /tmp/box-push-XXXXXX.bundle)"
+trap 'rm -f "$tmp"' EXIT
+base64 -d > "$tmp" <<'__WSL_BUNDLE__'
+'@
+        $scriptTail = @'
+__WSL_BUNDLE__
+target="$HOME/$target_rel"
+bundle_ref="$(git bundle list-heads "$tmp" | awk 'NR==1 { print $2 }')"
+if [ -z "$bundle_ref" ]; then
+  echo "[push-repo] ERROR: bundle contains no refs." >&2
+  exit 1
+fi
+if [ -d "$target/.git" ]; then
+  if [ "$force_flag" != "1" ] && [ -n "$(git -C "$target" status --porcelain)" ]; then
+    echo "[push-repo] ERROR: $target has uncommitted changes (commit/stash or pass -Force to overwrite)." >&2
+    exit 1
+  fi
+  if origin_url="$(git -C "$target" remote get-url origin 2>/dev/null || true)"; then
+    case "$origin_url" in
+      /tmp/box-push-*.bundle) git -C "$target" remote remove origin 2>/dev/null || true ;;
+    esac
+  fi
+  git -C "$target" fetch "$tmp" "$bundle_ref"
+  git -C "$target" checkout -B "$checkout_branch" FETCH_HEAD
+else
+  mkdir -p "$target"
+  git -C "$target" init -q
+  git -C "$target" fetch "$tmp" "$bundle_ref"
+  git -C "$target" checkout -B "$checkout_branch" FETCH_HEAD
+fi
+echo "[push-repo] Synced branch $checkout_branch to $target"
+'@
+        $fullScript = ($scriptHead + "`n" + $b64 + "`n" + $scriptTail + "`n").Replace("`r`n", "`n")
+        $forceArg = if ($Force) { '1' } else { '0' }
+
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = 'wsl.exe'
+        $psi.Arguments = "-d $distro -u $agent -- bash -s -- $targetRel $checkoutBranch $forceArg"
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardInput = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        $proc.StandardInput.Write($fullScript)
+        $proc.StandardInput.Close()
+        $stdout = $proc.StandardOutput.ReadToEnd()
+        $stderr = $proc.StandardError.ReadToEnd()
+        $proc.WaitForExit()
+        if ($stdout) { Write-Host $stdout.TrimEnd() }
+        if ($proc.ExitCode -ne 0) {
+            throw "Failed pushing bundle into WSL: $stderr"
+        }
+    } finally {
+        Remove-Item -LiteralPath $tmpBundle -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Invoke-WslAgentBashStdin {
+    param(
+        [Parameter(Mandatory)][string]$DistroName,
+        [Parameter(Mandatory)][string]$AgentName,
+        [Parameter(Mandatory)][string[]]$BashArgs,
+        [Parameter(Mandatory)][string]$ScriptText
+    )
+    $lfScript = ($ScriptText -replace "`r`n", "`n").TrimEnd("`n") + "`n"
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'wsl.exe'
+    $escapedArgs = ($BashArgs | ForEach-Object {
+        if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
+    }) -join ' '
+    $psi.Arguments = "-d $DistroName -u $AgentName -- bash -s -- $escapedArgs"
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $proc.StandardInput.Write($lfScript)
+    $proc.StandardInput.Close()
+    $stdout = $proc.StandardOutput.ReadToEnd()
+    $stderr = $proc.StandardError.ReadToEnd()
+    $proc.WaitForExit()
+    return [pscustomobject]@{
+        ExitCode = $proc.ExitCode
+        Stdout   = $stdout
+        Stderr   = $stderr
+    }
+}
+
+function Invoke-PullDiff {
+    param(
+        $Config,
+        [string]$RepoName
+    )
+    $distro = $Config.distroName
+    $agent = $Config.agentUser.name
+    if (-not (Test-WslDistroExists -DistroName $distro)) {
+        throw "Distro '$distro' does not exist."
+    }
+    $rel = Resolve-WslWorkRelPath -RawPath $RepoName -DefaultPrefix 'work'
+    $remoteScript = @'
+set -euo pipefail
+target="$HOME/$1"
+if ! git -C "$target" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "[pull-diff] ERROR: $target is not a git repository." >&2
+  exit 1
+fi
+echo "=== Status ==="
+git -C "$target" status --short
+echo "=== Recent Commits ==="
+git -C "$target" log --oneline -n 15
+echo "=== Diff Stat ==="
+git -C "$target" diff --stat
+'@
+    $res = Invoke-WslAgentBashStdin -DistroName $distro -AgentName $agent -BashArgs @($rel) -ScriptText $remoteScript
+    if ($res.Stdout) { Write-Host $res.Stdout.TrimEnd() }
+    if ($res.ExitCode -ne 0) {
+        throw "pull-diff failed for '~/$rel' in '$distro': $($res.Stderr)"
+    }
+}
+
+function Invoke-PullBranch {
+    param(
+        $Config,
+        [string]$RepoName,
+        [string]$WindowsRepoPath = '',
+        [string]$Branch = 'HEAD'
+    )
+    $distro = $Config.distroName
+    $agent = $Config.agentUser.name
+    if (-not (Test-WslDistroExists -DistroName $distro)) {
+        throw "Distro '$distro' does not exist."
+    }
+    $rel = Resolve-WslWorkRelPath -RawPath $RepoName -DefaultPrefix 'work'
+    $safeBranch = Assert-SafeBoxBranchName -Name $Branch
+
+    $winTargetRaw = if ([string]::IsNullOrWhiteSpace($WindowsRepoPath)) { (Get-Location).Path } else { $WindowsRepoPath }
+    if (-not (Test-Path -LiteralPath $winTargetRaw -PathType Container)) {
+        throw "Windows target repository directory not found: '$winTargetRaw'"
+    }
+    $winRepo = (Resolve-Path -LiteralPath $winTargetRaw).Path
+    $isGit = (& git -C $winRepo rev-parse --is-inside-work-tree 2>$null | Out-String).Trim()
+    if ($isGit -ne 'true') {
+        throw "Windows target '$winRepo' is not a git repository."
+    }
+
+    $safeName = (Split-Path -Leaf $rel) -replace '[^A-Za-z0-9._-]', '-'
+    $targetBranch = "sandbox/$safeName"
+    $tmpBundle = Join-Path ([System.IO.Path]::GetTempPath()) ("wsl-pull-" + [Guid]::NewGuid().ToString('N').Substring(0, 8) + ".bundle")
+    try {
+        $remoteScript = @'
+set -euo pipefail
+target="$HOME/$1"
+ref="$2"
+if ! git -C "$target" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "[pull-branch] ERROR: $target is not a git repository." >&2
+  exit 1
+fi
+tmp="$(mktemp /tmp/box-pull-XXXXXX.bundle)"
+trap 'rm -f "$tmp"' EXIT
+git -C "$target" bundle create "$tmp" "$ref" >/dev/null
+base64 -w0 "$tmp"
+'@
+        $res = Invoke-WslAgentBashStdin -DistroName $distro -AgentName $agent -BashArgs @($rel, $safeBranch) -ScriptText $remoteScript
+        $b64 = ($res.Stdout | Out-String).Trim()
+        if ($res.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($b64)) {
+            throw "Failed creating bundle from ~/$rel in '$distro': $($res.Stderr)"
+        }
+        [System.IO.File]::WriteAllBytes($tmpBundle, [Convert]::FromBase64String($b64))
+        $bundleRef = ((& git bundle list-heads $tmpBundle 2>$null | Out-String).Trim() -split '\s+' | Select-Object -Skip 1 -First 1)
+        if ([string]::IsNullOrWhiteSpace($bundleRef)) {
+            $bundleRef = $safeBranch
+        }
+        & git -C $winRepo fetch --force $tmpBundle "+${bundleRef}:refs/heads/${targetBranch}"
+        if ($LASTEXITCODE -ne 0) { throw "git fetch from bundle failed." }
+        Write-Host "[pull-branch] Imported agent commits into local branch '$targetBranch' in '$winRepo' (review with 'git diff main..$targetBranch')."
+    } finally {
+        Remove-Item -LiteralPath $tmpBundle -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Invoke-Destroy {
     param(
         $Config,
@@ -876,6 +1155,15 @@ switch ($Command) {
     }
     'audit' {
         Invoke-AuditLogs -Config $cfg -Source $Source -Since $Since -Lines $Lines
+    }
+    'push-repo' {
+        Invoke-PushRepo -Config $cfg -WindowsRepoPath $Argument -Dest $Dest -Branch $Branch -Force:$Force
+    }
+    'pull-diff' {
+        Invoke-PullDiff -Config $cfg -RepoName $Argument
+    }
+    'pull-branch' {
+        Invoke-PullBranch -Config $cfg -RepoName $Argument -WindowsRepoPath $RepoPath -Branch $Branch
     }
     'seed-secrets' {
         Invoke-SeedSecrets -Config $cfg -SecretsPath $SecretsPath -Service $Service -Prune:$Prune -DryRun:$DryRun
