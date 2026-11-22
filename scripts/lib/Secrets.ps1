@@ -1237,55 +1237,144 @@ function Build-SeedSecretsPayload {
             }
 
             'gcloud' {
-                $keyFile = [string](Get-ObjectProperty -Object $entry -Name 'serviceAccountKeyFile' -Default '')
-                $hasKeyFile = -not [string]::IsNullOrWhiteSpace($keyFile)
-                $hasKeyJson = (Test-ObjectHasProperty -Object $entry -Name 'serviceAccountKeyJson') -and ($null -ne (Get-ObjectProperty -Object $entry -Name 'serviceAccountKeyJson'))
-                if ($hasKeyFile -and $hasKeyJson) {
-                    throw "gcloud: specify only one of 'serviceAccountKeyFile' or 'serviceAccountKeyJson'."
-                }
-                if (-not $hasKeyFile -and -not $hasKeyJson) {
-                    throw "gcloud: missing required 'serviceAccountKeyFile' or 'serviceAccountKeyJson'."
-                }
-                if ($hasKeyFile) {
-                    $keyJsonText = Resolve-SecretFileContent -RawPath $keyFile -BaseDir $baseDir -Context 'gcloud.serviceAccountKeyFile'
-                } else {
-                    $rawKey = Get-ObjectProperty -Object $entry -Name 'serviceAccountKeyJson'
-                    if ($rawKey -is [string]) {
-                        $keyJsonText = $rawKey
+                $resolveGcloudEntry = {
+                    param($obj, [string]$ctx, [string]$fallbackRegion, [string]$fallbackZone, [bool]$isMulti)
+                    $hasKeyJson = (Test-ObjectHasProperty -Object $obj -Name 'serviceAccountKeyJson') -and ($null -ne (Get-ObjectProperty -Object $obj -Name 'serviceAccountKeyJson'))
+                    $hasKeyFile = (Test-ObjectHasProperty -Object $obj -Name 'serviceAccountKeyFile') -and -not [string]::IsNullOrWhiteSpace([string](Get-ObjectProperty -Object $obj -Name 'serviceAccountKeyFile' -Default ''))
+                    $hasKeyEnv = (Test-ObjectHasProperty -Object $obj -Name 'serviceAccountKeyEnv') -and -not [string]::IsNullOrWhiteSpace([string](Get-ObjectProperty -Object $obj -Name 'serviceAccountKeyEnv' -Default ''))
+                    $hasKeyVault = (Test-ObjectHasProperty -Object $obj -Name 'serviceAccountKeyVault') -and -not [string]::IsNullOrWhiteSpace([string](Get-ObjectProperty -Object $obj -Name 'serviceAccountKeyVault' -Default ''))
+                    $keySourceCount = @($hasKeyJson, $hasKeyFile, $hasKeyEnv, $hasKeyVault | Where-Object { $_ }).Count
+                    if ($keySourceCount -gt 1) {
+                        throw "${ctx}: specify only one of 'serviceAccountKeyFile', 'serviceAccountKeyJson', 'serviceAccountKeyEnv', or 'serviceAccountKeyVault'."
+                    }
+                    if ($keySourceCount -eq 0) {
+                        throw "${ctx}: missing required 'serviceAccountKeyFile', 'serviceAccountKeyJson', 'serviceAccountKeyEnv', or 'serviceAccountKeyVault'."
+                    }
+                    if ($hasKeyJson) {
+                        $rawKey = Get-ObjectProperty -Object $obj -Name 'serviceAccountKeyJson'
+                        if ($rawKey -is [string]) {
+                            $keyJsonText = $rawKey
+                        } else {
+                            $keyJsonText = ($rawKey | ConvertTo-Json -Depth 10)
+                        }
                     } else {
-                        $keyJsonText = ($rawKey | ConvertTo-Json -Depth 10)
+                        $keyJsonText = Resolve-SecretValue -Object $obj -BaseName 'serviceAccountKey' -BaseDir $baseDir -Context $ctx -Required
+                    }
+                    try {
+                        $parsedSa = $keyJsonText | ConvertFrom-Json
+                    } catch {
+                        throw "${ctx}: service account key is not valid JSON."
+                    }
+                    $saType = [string](Get-ObjectProperty -Object $parsedSa -Name 'type' -Default '')
+                    $saEmail = [string](Get-ObjectProperty -Object $parsedSa -Name 'client_email' -Default '')
+                    $saPrivKey = [string](Get-ObjectProperty -Object $parsedSa -Name 'private_key' -Default '')
+                    if ($saType -ne 'service_account' -or [string]::IsNullOrWhiteSpace($saEmail) -or [string]::IsNullOrWhiteSpace($saPrivKey)) {
+                        throw "${ctx}: service account key JSON must have type='service_account', client_email, and private_key."
+                    }
+                    $proj = [string](Get-ObjectProperty -Object $obj -Name 'project' -Default '')
+                    if ([string]::IsNullOrWhiteSpace($proj)) {
+                        $proj = [string](Get-ObjectProperty -Object $parsedSa -Name 'project_id' -Default '')
+                    }
+                    $cfgName = [string](Get-ObjectProperty -Object $obj -Name 'name' -Default '')
+                    if ([string]::IsNullOrWhiteSpace($cfgName)) {
+                        if ($isMulti) {
+                            $cfgName = if (-not [string]::IsNullOrWhiteSpace($proj)) { $proj.ToLowerInvariant() } else { '' }
+                        } else {
+                            $cfgName = 'default'
+                        }
+                    }
+                    if ([string]::IsNullOrWhiteSpace($cfgName) -or $cfgName -notmatch '^[a-z0-9][-a-z0-9]{0,62}$') {
+                        throw "${ctx}: configuration name '$cfgName' is invalid (must match '^[a-z0-9][-a-z0-9]{0,62}$', lowercase letters, digits, and hyphens)."
+                    }
+                    $reg = [string](Get-ObjectProperty -Object $obj -Name 'region' -Default '')
+                    if ([string]::IsNullOrWhiteSpace($reg)) { $reg = $fallbackRegion }
+                    $zn = [string](Get-ObjectProperty -Object $obj -Name 'zone' -Default '')
+                    if ([string]::IsNullOrWhiteSpace($zn)) { $zn = $fallbackZone }
+
+                    return [ordered]@{
+                        name                  = $cfgName
+                        project               = $proj
+                        clientEmail           = $saEmail
+                        serviceAccountKeyJson = $keyJsonText
+                        region                = $reg
+                        zone                  = $zn
                     }
                 }
-                try {
-                    $parsedSa = $keyJsonText | ConvertFrom-Json
-                } catch {
-                    throw "gcloud: service account key is not valid JSON."
-                }
-                $saType = [string](Get-ObjectProperty -Object $parsedSa -Name 'type' -Default '')
-                $saEmail = [string](Get-ObjectProperty -Object $parsedSa -Name 'client_email' -Default '')
-                $saPrivKey = [string](Get-ObjectProperty -Object $parsedSa -Name 'private_key' -Default '')
-                if ($saType -ne 'service_account' -or [string]::IsNullOrWhiteSpace($saEmail) -or [string]::IsNullOrWhiteSpace($saPrivKey)) {
-                    throw "gcloud: service account key JSON must have type='service_account', client_email, and private_key."
-                }
-                $project = [string](Get-ObjectProperty -Object $entry -Name 'project' -Default '')
-                if ([string]::IsNullOrWhiteSpace($project)) {
-                    $project = [string](Get-ObjectProperty -Object $parsedSa -Name 'project_id' -Default '')
-                }
-                $region = [string](Get-ObjectProperty -Object $entry -Name 'region' -Default '')
-                $zone = [string](Get-ObjectProperty -Object $entry -Name 'zone' -Default '')
+
+                $topRegion = [string](Get-ObjectProperty -Object $entry -Name 'region' -Default '')
+                $topZone = [string](Get-ObjectProperty -Object $entry -Name 'zone' -Default '')
                 $setAdc = [bool](Get-ObjectProperty -Object $entry -Name 'setApplicationDefaultCredentials' -Default $true)
                 $skipActivate = [bool](Get-ObjectProperty -Object $entry -Name 'skipActivate' -Default $false)
 
+                $rawProjects = Get-ObjectProperty -Object $entry -Name 'projects' -Default $null
+                $rawProfiles = Get-ObjectProperty -Object $entry -Name 'profiles' -Default $null
+                $hasProjects = ($null -ne $rawProjects) -and (@($rawProjects).Count -gt 0)
+                $hasProfiles = ($null -ne $rawProfiles) -and (@($rawProfiles).Count -gt 0)
+                if ($hasProjects -and $hasProfiles) {
+                    throw "gcloud: specify either 'projects' or 'profiles', not both."
+                }
+                $multiList = @(if ($hasProjects) { @($rawProjects) } elseif ($hasProfiles) { @($rawProfiles) })
+
+                $hasTopKey = ((Test-ObjectHasProperty -Object $entry -Name 'serviceAccountKeyJson') -and ($null -ne (Get-ObjectProperty -Object $entry -Name 'serviceAccountKeyJson'))) -or
+                             (-not [string]::IsNullOrWhiteSpace([string](Get-ObjectProperty -Object $entry -Name 'serviceAccountKeyFile' -Default ''))) -or
+                             (-not [string]::IsNullOrWhiteSpace([string](Get-ObjectProperty -Object $entry -Name 'serviceAccountKeyEnv' -Default ''))) -or
+                             (-not [string]::IsNullOrWhiteSpace([string](Get-ObjectProperty -Object $entry -Name 'serviceAccountKeyVault' -Default '')))
+
+                $projectsOut = New-Object System.Collections.Generic.List[object]
+                if ($multiList.Count -gt 0) {
+                    if ($hasTopKey) {
+                        throw "gcloud: cannot combine top-level 'serviceAccountKey*' with 'projects'/'profiles'."
+                    }
+                    $seenCfgNames = @{}
+                    for ($idx = 0; $idx -lt $multiList.Count; $idx++) {
+                        $pItem = $multiList[$idx]
+                        $resolvedItem = & $resolveGcloudEntry $pItem "gcloud.projects[$idx]" $topRegion $topZone $true
+                        if ($seenCfgNames.ContainsKey($resolvedItem.name)) {
+                            throw "gcloud.projects contains duplicate configuration/project name '$($resolvedItem.name)'."
+                        }
+                        $seenCfgNames[$resolvedItem.name] = $true
+                        $projectsOut.Add($resolvedItem)
+                    }
+                } else {
+                    $singleItem = & $resolveGcloudEntry $entry 'gcloud' $topRegion $topZone $false
+                    $projectsOut.Add($singleItem)
+                }
+
+                $defProjProp = [string](Get-ObjectProperty -Object $entry -Name 'defaultProject' -Default '')
+                $defProfProp = [string](Get-ObjectProperty -Object $entry -Name 'defaultProfile' -Default '')
+                if ($defProjProp -and $defProfProp -and ($defProjProp -ne $defProfProp)) {
+                    throw "gcloud: specify either 'defaultProject' or 'defaultProfile', not both with different values."
+                }
+                $requestedDefault = if ($defProjProp) { $defProjProp } else { $defProfProp }
+
+                $activeEntry = $projectsOut[0]
+                if (-not [string]::IsNullOrWhiteSpace($requestedDefault)) {
+                    $matched = $projectsOut | Where-Object { $_.name -eq $requestedDefault -or $_.project -eq $requestedDefault } | Select-Object -First 1
+                    if ($null -eq $matched) {
+                        throw "gcloud.defaultProject '$requestedDefault' does not match any configured project name or project ID."
+                    }
+                    $activeEntry = $matched
+                }
+
                 $resolvedServices['gcloud'] = [ordered]@{
-                    serviceAccountKeyJson            = $keyJsonText
-                    clientEmail                      = $saEmail
-                    project                          = $project
-                    region                           = $region
-                    zone                             = $zone
+                    serviceAccountKeyJson            = $activeEntry.serviceAccountKeyJson
+                    clientEmail                      = $activeEntry.clientEmail
+                    project                          = $activeEntry.project
+                    region                           = $activeEntry.region
+                    zone                             = $activeEntry.zone
+                    defaultProject                   = $activeEntry.name
+                    projects                         = @($projectsOut.ToArray())
                     setApplicationDefaultCredentials = $setAdc
                     skipActivate                     = $skipActivate
                 }
-                $summary.Add("gcloud (account=$saEmail, project=$project)")
+                if ($multiList.Count -gt 0) {
+                    $pLabels = ($projectsOut | ForEach-Object {
+                        if ($_.name -eq $_.project -or [string]::IsNullOrWhiteSpace($_.project)) { $_.name } else { "$($_.name):$($_.project)" }
+                    }) -join ', '
+                    $summary.Add("gcloud (projects=$pLabels; default=$($activeEntry.name))")
+                } else {
+                    $summary.Add("gcloud (account=$($activeEntry.clientEmail), project=$($activeEntry.project))")
+                }
             }
 
             'azure' {

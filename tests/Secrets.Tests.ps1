@@ -341,6 +341,74 @@ try {
         $gs.signing.key -eq 'default'
     )
 
+    # 3c. Multi-project gcloud mode with separate Service Accounts
+    [System.IO.File]::WriteAllText((Join-Path $tmpDir 'keys\gcp-sa-2.json'), (@{
+        type         = 'service_account'
+        project_id   = 'sandbox-gcp-staging'
+        private_key  = "-----BEGIN PRIVATE KEY-----`nMOCKKEY2`n-----END PRIVATE KEY-----`n"
+        client_email = 'staging-bot@sandbox-gcp-staging.iam.gserviceaccount.com'
+    } | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false)))
+    $gcloudMultiManifest = Join-Path $tmpDir 'gcloud-multi.json'
+    [System.IO.File]::WriteAllText($gcloudMultiManifest, (@{
+        gcloud = @{
+            defaultProject = 'staging'
+            region         = 'europe-north1'
+            skipActivate   = $true
+            projects       = @(
+                @{
+                    name                  = 'dev'
+                    serviceAccountKeyFile = 'keys\gcp-sa.json'
+                },
+                @{
+                    name                  = 'staging'
+                    serviceAccountKeyFile = 'keys\gcp-sa-2.json'
+                    region                = 'europe-west1'
+                }
+            )
+        }
+    } | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
+    $gcMultiRes = Build-SeedSecretsPayload -ManifestPath $gcloudMultiManifest -AgentName 'agent'
+    $gcm = $gcMultiRes.Payload.services['gcloud']
+    Assert-True "Builds multi-project gcloud payload with separate service accounts and active defaultProject" (
+        $gcm.projects.Count -eq 2 -and
+        $gcm.defaultProject -eq 'staging' -and
+        $gcm.project -eq 'sandbox-gcp-staging' -and
+        $gcm.clientEmail -eq 'staging-bot@sandbox-gcp-staging.iam.gserviceaccount.com' -and
+        $gcm.region -eq 'europe-west1' -and
+        $gcm.projects[0].name -eq 'dev' -and
+        $gcm.projects[0].project -eq 'sandbox-gcp-proj' -and
+        $gcm.projects[0].region -eq 'europe-north1' -and
+        $gcm.projects[1].name -eq 'staging' -and
+        $gcm.projects[1].project -eq 'sandbox-gcp-staging' -and
+        (($gcMultiRes.Summary -join ' ') -match 'projects=dev:sandbox-gcp-proj, staging:sandbox-gcp-staging; default=staging')
+    )
+
+    $badGcloudDupManifest = Join-Path $tmpDir 'gcloud-dup.json'
+    [System.IO.File]::WriteAllText($badGcloudDupManifest, (@{
+        gcloud = @{
+            projects = @(
+                @{ name = 'dev'; serviceAccountKeyFile = 'keys\gcp-sa.json' },
+                @{ name = 'dev'; serviceAccountKeyFile = 'keys\gcp-sa-2.json' }
+            )
+        }
+    } | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
+    Assert-Throws "Rejects duplicate configuration name in gcloud.projects" {
+        Build-SeedSecretsPayload -ManifestPath $badGcloudDupManifest -AgentName 'agent'
+    } 'duplicate configuration'
+
+    $badGcloudDefManifest = Join-Path $tmpDir 'gcloud-bad-def.json'
+    [System.IO.File]::WriteAllText($badGcloudDefManifest, (@{
+        gcloud = @{
+            defaultProject = 'nonexistent'
+            projects       = @(
+                @{ name = 'dev'; serviceAccountKeyFile = 'keys\gcp-sa.json' }
+            )
+        }
+    } | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
+    Assert-Throws "Rejects gcloud.defaultProject referencing unknown project" {
+        Build-SeedSecretsPayload -ManifestPath $badGcloudDefManifest -AgentName 'agent'
+    } 'does not match any configured project'
+
     # 4. kubectl service-account token mode
     $kcTokenManifest = Join-Path $tmpDir 'kc-token.json'
     [System.IO.File]::WriteAllText($kcTokenManifest, (@{

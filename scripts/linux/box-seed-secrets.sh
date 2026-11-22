@@ -435,42 +435,69 @@ def clear_aws(prev_meta):
     write_service_env("aws", {})
 
 def seed_gcloud(cfg, prev_meta):
-    key_json = cfg["serviceAccountKeyJson"]
-    register_secret(key_json)
-    try:
-        parsed = json.loads(key_json)
-        register_secret(parsed.get("private_key", ""))
-    except Exception:
-        pass
-    client_email = cfg.get("clientEmail", "")
-    project = cfg.get("project", "")
-    region = cfg.get("region", "")
-    zone = cfg.get("zone", "")
+    raw_projects = cfg.get("projects")
+    if isinstance(raw_projects, list) and len(raw_projects) > 0:
+        projects = raw_projects
+    else:
+        projects = [
+            {
+                "name": "default",
+                "serviceAccountKeyJson": cfg["serviceAccountKeyJson"],
+                "clientEmail": cfg.get("clientEmail", ""),
+                "project": cfg.get("project", ""),
+                "region": cfg.get("region", ""),
+                "zone": cfg.get("zone", ""),
+            }
+        ]
+
     set_adc = bool(cfg.get("setApplicationDefaultCredentials", True))
     skip_activate = bool(cfg.get("skipActivate", False))
+    default_cfg_name = cfg.get("defaultProject") or projects[0].get("name") or "default"
+    is_single_default = len(projects) == 1 and (projects[0].get("name") or "default") == "default"
 
-    key_path = os.path.join(KEYS_DIR, "gcloud-service-account.json")
-    write_agent_file(key_path, key_json, mode=0o600, dir_mode=0o700)
+    gcloud_dir = os.path.join(AGENT_HOME, ".config", "gcloud")
+    configs_dir = os.path.join(gcloud_dir, "configurations")
 
-    if shutil.which("gcloud") and not skip_activate:
-        cmd = ["gcloud", "auth", "activate-service-account", f"--key-file={key_path}", "--quiet"]
-        if project:
-            cmd.append(f"--project={project}")
-        run_as_agent(cmd)
-        if region:
-            run_as_agent(["gcloud", "config", "set", "compute/region", region, "--quiet"])
-        if zone:
-            run_as_agent(["gcloud", "config", "set", "compute/zone", zone, "--quiet"])
-    elif project or region or zone:
-        # Offline / skipActivate mode: write gcloud default configuration directly without API calls
-        gcloud_cfg_path = os.path.join(AGENT_HOME, ".config", "gcloud", "configurations", "config_default")
+    new_key_paths = []
+    new_cfg_names = []
+    new_emails = []
+    active_entry = projects[0]
+    active_key_path = ""
+
+    for item in projects:
+        cfg_name = (item.get("name") or "default").strip()
+        if not re.match(r"^[a-z0-9][-a-z0-9]{0,62}$", cfg_name):
+            raise RuntimeError(f"Invalid gcloud configuration name: {cfg_name}")
+        key_json = item["serviceAccountKeyJson"]
+        register_secret(key_json)
+        try:
+            parsed = json.loads(key_json)
+            register_secret(parsed.get("private_key", ""))
+        except Exception:
+            parsed = {}
+        client_email = item.get("clientEmail") or parsed.get("client_email", "")
+        project = item.get("project") or parsed.get("project_id", "")
+        region = item.get("region", "")
+        zone = item.get("zone", "")
+
+        if is_single_default:
+            key_path = os.path.join(KEYS_DIR, "gcloud-service-account.json")
+        else:
+            key_path = os.path.join(KEYS_DIR, f"gcloud-{cfg_name}.json")
+        write_agent_file(key_path, key_json, mode=0o600, dir_mode=0o700)
+
+        # Ensure the named configuration file exists with account/project/region/zone
+        gcloud_cfg_path = os.path.join(configs_dir, f"config_{cfg_name}")
         gcfg = configparser.RawConfigParser()
         if os.path.isfile(gcloud_cfg_path):
             gcfg.read(gcloud_cfg_path, encoding="utf-8")
-        if project:
+        if client_email or project:
             if not gcfg.has_section("core"):
                 gcfg.add_section("core")
-            gcfg.set("core", "project", project)
+            if client_email:
+                gcfg.set("core", "account", client_email)
+            if project:
+                gcfg.set("core", "project", project)
         if region or zone:
             if not gcfg.has_section("compute"):
                 gcfg.add_section("compute")
@@ -482,32 +509,108 @@ def seed_gcloud(cfg, prev_meta):
         gcfg.write(gbuf)
         write_agent_file(gcloud_cfg_path, gbuf.getvalue(), mode=0o600, dir_mode=0o700)
 
+        if shutil.which("gcloud") and not skip_activate:
+            cmd = [
+                "gcloud",
+                "auth",
+                "activate-service-account",
+                f"--key-file={key_path}",
+                f"--configuration={cfg_name}",
+                "--quiet",
+            ]
+            if project:
+                cmd.append(f"--project={project}")
+            run_as_agent(cmd)
+            if region:
+                run_as_agent(["gcloud", "config", "set", "compute/region", region, f"--configuration={cfg_name}", "--quiet"])
+            if zone:
+                run_as_agent(["gcloud", "config", "set", "compute/zone", zone, f"--configuration={cfg_name}", "--quiet"])
+
+        new_key_paths.append(key_path)
+        new_cfg_names.append(cfg_name)
+        if client_email and client_email not in new_emails:
+            new_emails.append(client_email)
+        if cfg_name == default_cfg_name or not active_key_path:
+            active_entry = {
+                "name": cfg_name,
+                "clientEmail": client_email,
+                "project": project,
+                "region": region,
+                "zone": zone,
+            }
+            active_key_path = key_path
+
+    # Set active_config to default_cfg_name
+    write_agent_file(os.path.join(gcloud_dir, "active_config"), default_cfg_name + "\n", mode=0o600, dir_mode=0o700)
+
+    # Prune any stale managed key files, configurations, and accounts from previous seed
+    old_key_paths = (prev_meta or {}).get("keyPaths", [])
+    if not old_key_paths and (prev_meta or {}).get("keyPath"):
+        old_key_paths = [prev_meta["keyPath"]]
+    for old_kp in old_key_paths:
+        if old_kp not in new_key_paths:
+            remove_file_quiet(old_kp)
+
+    old_cfg_names = (prev_meta or {}).get("profiles", [])
+    for old_cfg in old_cfg_names:
+        if old_cfg not in new_cfg_names and old_cfg != "default":
+            remove_file_quiet(os.path.join(configs_dir, f"config_{old_cfg}"))
+
+    old_emails = (prev_meta or {}).get("clientEmails", [])
+    if not old_emails and (prev_meta or {}).get("clientEmail"):
+        old_emails = [prev_meta["clientEmail"]]
+    if shutil.which("gcloud"):
+        for old_em in old_emails:
+            if old_em and old_em not in new_emails:
+                run_as_agent(["gcloud", "auth", "revoke", old_em, "--quiet"], check=False)
+
     env_vars = {}
-    if set_adc:
-        env_vars["GOOGLE_APPLICATION_CREDENTIALS"] = key_path
-    if project:
-        env_vars["CLOUDSDK_CORE_PROJECT"] = project
-        env_vars["GOOGLE_CLOUD_PROJECT"] = project
-    if region:
-        env_vars["CLOUDSDK_COMPUTE_REGION"] = region
-    if zone:
-        env_vars["CLOUDSDK_COMPUTE_ZONE"] = zone
+    if set_adc and active_key_path:
+        env_vars["GOOGLE_APPLICATION_CREDENTIALS"] = active_key_path
+    if active_entry.get("project"):
+        env_vars["GOOGLE_CLOUD_PROJECT"] = active_entry["project"]
+        if len(projects) == 1:
+            env_vars["CLOUDSDK_CORE_PROJECT"] = active_entry["project"]
+    if len(projects) == 1:
+        if active_entry.get("region"):
+            env_vars["CLOUDSDK_COMPUTE_REGION"] = active_entry["region"]
+        if active_entry.get("zone"):
+            env_vars["CLOUDSDK_COMPUTE_ZONE"] = active_entry["zone"]
     written_keys = write_service_env("gcloud", env_vars)
 
     return {
-        "clientEmail": client_email,
-        "project": project,
-        "keyPath": key_path,
+        "clientEmail": active_entry.get("clientEmail", ""),
+        "clientEmails": new_emails,
+        "project": active_entry.get("project", ""),
+        "profiles": new_cfg_names,
+        "defaultProject": active_entry.get("name", "default"),
+        "keyPath": active_key_path,
+        "keyPaths": new_key_paths,
         "envVars": written_keys,
         "updatedAt": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
 
 def clear_gcloud(prev_meta):
-    key_path = (prev_meta or {}).get("keyPath", os.path.join(KEYS_DIR, "gcloud-service-account.json"))
-    client_email = (prev_meta or {}).get("clientEmail", "")
-    if shutil.which("gcloud") and client_email:
-        run_as_agent(["gcloud", "auth", "revoke", client_email, "--quiet"], check=False)
-    remove_file_quiet(key_path)
+    gcloud_dir = os.path.join(AGENT_HOME, ".config", "gcloud")
+    configs_dir = os.path.join(gcloud_dir, "configurations")
+
+    key_paths = (prev_meta or {}).get("keyPaths", [])
+    if not key_paths:
+        key_paths = [(prev_meta or {}).get("keyPath", os.path.join(KEYS_DIR, "gcloud-service-account.json"))]
+    client_emails = (prev_meta or {}).get("clientEmails", [])
+    if not client_emails and (prev_meta or {}).get("clientEmail"):
+        client_emails = [prev_meta["clientEmail"]]
+    if shutil.which("gcloud"):
+        for em in client_emails:
+            if em:
+                run_as_agent(["gcloud", "auth", "revoke", em, "--quiet"], check=False)
+    for kp in key_paths:
+        remove_file_quiet(kp)
+    for cfg_name in (prev_meta or {}).get("profiles", []):
+        if cfg_name != "default":
+            remove_file_quiet(os.path.join(configs_dir, f"config_{cfg_name}"))
+    if os.path.isfile(os.path.join(gcloud_dir, "active_config")):
+        write_agent_file(os.path.join(gcloud_dir, "active_config"), "default\n", mode=0o600, dir_mode=0o700)
     write_service_env("gcloud", {})
 
 def seed_azure(cfg, prev_meta):
