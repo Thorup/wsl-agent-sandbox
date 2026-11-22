@@ -102,7 +102,7 @@ fi
 
 if has_scope "agents"; then
   if command -v npm >/dev/null 2>&1; then
-    for pkg in pnpm @google/gemini-cli @anthropic-ai/claude-code; do
+    for pkg in pnpm @google/gemini-cli @anthropic-ai/claude-code @openai/codex opencode-ai; do
       if npm list -g --depth=0 "${pkg}" >/dev/null 2>&1; then
         record_ver "npm:${pkg}" "npm list -g --depth=0 '${pkg}' --json 2>/dev/null | python3 -c \"import json,sys; d=json.load(sys.stdin); print(d.get('dependencies',{}).get('${pkg}',{}).get('version','unknown'))\"" "before"
         log "Updating global npm package ${pkg}..."
@@ -110,6 +110,14 @@ if has_scope "agents"; then
         record_ver "npm:${pkg}" "npm list -g --depth=0 '${pkg}' --json 2>/dev/null | python3 -c \"import json,sys; d=json.load(sys.stdin); print(d.get('dependencies',{}).get('${pkg}',{}).get('version','unknown'))\"" "after"
       fi
     done
+  fi
+  if command -v uv >/dev/null 2>&1 && [[ -x "/home/${AGENT_NAME}/.local/bin/aider" ]]; then
+    # shellcheck disable=SC2016 # $HOME expands inside the target user's shell
+    record_ver "uv:aider-chat" "su -s /bin/bash - '${AGENT_NAME}' -c '\"\$HOME/.local/bin/aider\" --version'" "before"
+    log "Updating aider-chat via uv for '${AGENT_NAME}'..."
+    su -s /bin/bash - "${AGENT_NAME}" -c 'uv tool upgrade aider-chat'
+    # shellcheck disable=SC2016 # $HOME expands inside the target user's shell
+    record_ver "uv:aider-chat" "su -s /bin/bash - '${AGENT_NAME}' -c '\"\$HOME/.local/bin/aider\" --version'" "after"
   fi
 fi
 
@@ -185,6 +193,31 @@ if has_scope "toolchains"; then
     install -o root -g root -m 0755 "${JIRA_BIN}" /usr/local/bin/jira
     rm -rf "${TMP_DIR}"
     record_ver "jira" "jira version" "after"
+  fi
+  if command -v helm >/dev/null 2>&1; then
+    record_ver "helm" "helm version --short" "before"
+    log "Updating Helm (${ARCH}) with SHA256 verification..."
+    TMP_DIR="$(mktemp -d)"
+    HELM_VER="$(curl -fsSL -H 'Accept: application/vnd.github+json' https://api.github.com/repos/helm/helm/releases/latest | python3 -c "import json,sys; print(json.load(sys.stdin)['tag_name'])")"
+    HELM_TAR="helm-${HELM_VER}-linux-${ARCH}.tar.gz"
+    curl -fsSL "https://get.helm.sh/${HELM_TAR}" -o "${TMP_DIR}/${HELM_TAR}"
+    curl -fsSL "https://get.helm.sh/${HELM_TAR}.sha256sum" -o "${TMP_DIR}/${HELM_TAR}.sha256sum"
+    (cd "${TMP_DIR}" && sha256sum --check "${HELM_TAR}.sha256sum")
+    tar -xzf "${TMP_DIR}/${HELM_TAR}" -C "${TMP_DIR}"
+    install -o root -g root -m 0755 "${TMP_DIR}/linux-${ARCH}/helm" /usr/local/bin/helm
+    rm -rf "${TMP_DIR}"
+    record_ver "helm" "helm version --short" "after"
+  fi
+  if command -v npm >/dev/null 2>&1 && npm list -g --depth=0 playwright >/dev/null 2>&1; then
+    record_ver "npm:playwright" "playwright --version" "before"
+    log "Updating global playwright CLI..."
+    npm install -g playwright@latest
+    if [[ -d "/home/${AGENT_NAME}/.cache/ms-playwright" ]]; then
+      log "Updating Playwright Chromium + system dependencies..."
+      playwright install-deps chromium
+      su -s /bin/bash - "${AGENT_NAME}" -c 'playwright install chromium'
+    fi
+    record_ver "npm:playwright" "playwright --version" "after"
   fi
 fi
 

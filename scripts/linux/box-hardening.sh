@@ -259,6 +259,8 @@ if pkgs.get("installDockerCli", True):
     expected_tools.append("docker")
 if pkgs.get("installUv", True):
     expected_tools.append("uv")
+    if pkgs.get("installAider", False):
+        expected_tools.append("aider")
 if pkgs.get("installNodeLts", True):
     expected_tools.append("node")
     if pkgs.get("installPnpm", True):
@@ -267,8 +269,18 @@ if pkgs.get("installNodeLts", True):
         expected_tools.append("gemini")
     if pkgs.get("installClaudeCode", True):
         expected_tools.append("claude")
+    if pkgs.get("installCodexCli", False):
+        expected_tools.append("codex")
+    if pkgs.get("installOpenCode", False):
+        expected_tools.append("opencode")
+    if pkgs.get("installPlaywrightChromium", False):
+        expected_tools.append("playwright")
 if pkgs.get("installKubectl", False):
     expected_tools.append("kubectl")
+if pkgs.get("installHelm", False):
+    expected_tools.append("helm")
+if pkgs.get("installOpenTofu", False):
+    expected_tools.append("tofu")
 if pkgs.get("installAwsCli", False):
     expected_tools.append("aws")
 if pkgs.get("installGcloudCli", False):
