@@ -1475,6 +1475,17 @@ def sync_credential_proxy(routes):
             subprocess.run(["systemctl", "stop", "credential-proxy.service"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             subprocess.run(["systemctl", "disable", "credential-proxy.service"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+def cancel_ttl_timer(svc_name):
+    if not os.path.isdir("/run/systemd/system"):
+        return
+    unit = f"wsl-box-ttl-{svc_name}"
+    active_unit = os.environ.get("WSL_BOX_TTL_ACTIVE_UNIT", "")
+    suffixes = (".timer",) if active_unit == f"{unit}.service" else (".timer", ".service")
+    for suffix in suffixes:
+        subprocess.run(["systemctl", "stop", f"{unit}{suffix}"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if suffix == ".timer" or active_unit != f"{unit}.service":
+            subprocess.run(["systemctl", "reset-failed", f"{unit}{suffix}"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
 # ------------------------------------------------------------------
 # Modes: --status, --clear, --apply
 # ------------------------------------------------------------------
@@ -1484,6 +1495,7 @@ if args.status:
     if not svcs:
         print("  (none)")
     else:
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
         for name in sorted(svcs.keys()):
             meta = svcs[name] or {}
             ts = meta.get("updatedAt", "unknown")
@@ -1510,8 +1522,28 @@ if args.status:
                 extras.append("org=" + meta["organization"])
             if meta.get("paths"):
                 extras.append("files=" + str(len(meta["paths"])))
+            exp_info = ""
+            exp_raw = meta.get("expiresAt")
+            if exp_raw:
+                try:
+                    exp_dt = datetime.datetime.strptime(exp_raw, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+                    rem_sec = int((exp_dt - now_utc).total_seconds())
+                    if rem_sec <= 0:
+                        exp_info = f", expires {exp_raw} (expired)"
+                    else:
+                        hrs, rem = divmod(rem_sec, 3600)
+                        mins, secs = divmod(rem, 60)
+                        if hrs > 0:
+                            rem_fmt = f"{hrs}h{mins}m{secs}s"
+                        elif mins > 0:
+                            rem_fmt = f"{mins}m{secs}s"
+                        else:
+                            rem_fmt = f"{secs}s"
+                        exp_info = f", expires {exp_raw} ({rem_fmt} remaining)"
+                except ValueError:
+                    exp_info = f", expires {exp_raw}"
             detail = f" ({'; '.join(extras)})" if extras else ""
-            print(f"  - {name}{detail} [updated {ts}]")
+            print(f"  - {name}{detail} [updated {ts}{exp_info}]")
     sys.exit(0)
 
 if args.clear:
@@ -1533,6 +1565,7 @@ if args.clear:
             print(f"[seed-secrets] [FAIL] Unknown service: {name}", file=sys.stderr)
             sys.exit(1)
         prev_meta = svcs.get(name)
+        cancel_ttl_timer(name)
         CLEARERS[name](prev_meta)
         if name in proxy_routes_state:
             proxy_routes_state.pop(name, None)
@@ -1574,6 +1607,8 @@ filter_services = payload.get("filterServices", [])
 if isinstance(filter_services, str):
     filter_services = [filter_services]
 prune = bool(payload.get("prune", False))
+ttl_seconds = int(payload.get("ttlSeconds", 0) or 0)
+service_ttls = payload.get("serviceTtls", {}) or {}
 
 ensure_profile_hook()
 ensure_agent_dir(STATE_DIR, mode=0o700)
@@ -1591,6 +1626,36 @@ for svc_name, svc_cfg in services_payload.items():
         continue
     try:
         meta = SEEDERS[svc_name](svc_cfg, state_services.get(svc_name))
+        svc_ttl = int(service_ttls.get(svc_name, ttl_seconds) or 0)
+        cancel_ttl_timer(svc_name)
+        if svc_ttl > 0:
+            exp_dt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=svc_ttl)
+            meta["expiresAt"] = exp_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            if os.path.isdir("/run/systemd/system"):
+                unit = f"wsl-box-ttl-{svc_name}"
+                proc = subprocess.run(
+                    [
+                        "systemd-run",
+                        "--collect",
+                        f"--unit={unit}",
+                        f"--on-active={svc_ttl}s",
+                        "--timer-property=AccuracySec=1s",
+                        f"--setenv=WSL_BOX_TTL_ACTIVE_UNIT={unit}.service",
+                        "/usr/local/sbin/box-seed-secrets.sh",
+                        "--clear",
+                        "--services",
+                        svc_name,
+                    ],
+                    check=False,
+                    text=True,
+                    capture_output=True,
+                )
+                if proc.returncode != 0:
+                    raise RuntimeError(
+                        f"systemd-run TTL timer failed for {svc_name}: {(proc.stderr or proc.stdout).strip()}"
+                    )
+        else:
+            meta.pop("expiresAt", None)
         state_services[svc_name] = meta
         if svc_name in new_proxy_routes:
             merged_proxy_routes[svc_name] = new_proxy_routes[svc_name]
@@ -1606,6 +1671,7 @@ if prune:
     candidates = filter_services if filter_services else list(state_services.keys())
     for svc_name in list(candidates):
         if svc_name not in services_payload and svc_name in state_services:
+            cancel_ttl_timer(svc_name)
             if svc_name in CLEARERS:
                 CLEARERS[svc_name](state_services.get(svc_name))
             state_services.pop(svc_name, None)

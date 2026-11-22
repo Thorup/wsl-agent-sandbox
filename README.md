@@ -218,7 +218,7 @@ Manifest path resolution priority:
 - `.\box.ps1 compact` — Run `fstrim` inside WSL and compact `ext4.vhdx` to reclaim disk space.
 - `.\box.ps1 logs` / `.\box.ps1 audit` — View root-owned security events (`nftables` drops, `docker-policy-proxy` denials, `box-hardening` reloads) filtered by `-Source` and `-Since`.
 - `.\box.ps1 push-repo <path>` / `pull-diff <name>` / `pull-branch <name>` — Transfer git repos via bundle onto native Linux `ext4` (`~/work/<name>`) and pull reviewable branches back without `rw` `/shared` mounts.
-- `.\box.ps1 seed-secrets [path]` — Seed or rotate CLI service tokens and service account credentials from a central Windows manifest (independently of `init`/`apply`); supports `-SecretsPath`, `-Service <names>`, `-Prune`, and `-DryRun`.
+- `.\box.ps1 seed-secrets [path]` — Seed or rotate CLI service tokens and service account credentials from a central Windows manifest (independently of `init`/`apply`); supports `-SecretsPath`, `-Service <names>`, `-Ttl <dur>` (ephemeral auto-expiration enforced by root systemd timers, also configurable per service via `ttl`), `-Prune`, and `-DryRun`.
 - `.\box.ps1 clear-secrets` — Revoke managed seeded CLI credentials inside WSL (optionally scoped via `-Service <names>`).
 - `.\box.ps1 verify` — Run full red-team isolation audit + Windows ↔ WSL `localhost` web test.
 - `.\box.ps1 status` — Inspect systemd services, active `/shared` mounts, seeded CLI secrets, and `nftables` rules.

@@ -391,16 +391,44 @@ function Get-ProxyPlaceholderToken {
     return "sandbox-proxy-$ServicePrefix-$hex"
 }
 
+function ConvertTo-TtlSeconds {
+    param([Parameter(Mandatory)][string]$Ttl)
+    $trimmed = $Ttl.Trim().ToLowerInvariant()
+    if ($trimmed -notmatch '^([0-9]+)\s*([smhd])$') {
+        throw "Invalid -Ttl '$Ttl'. Expected duration like '30m', '2h', '1d', or '90s'."
+    }
+    [int64]$num = 0
+    if (-not [int64]::TryParse($Matches[1], [ref]$num) -or $num -le 0) {
+        throw "TTL duration must be a positive integer between 1s and 365d (got '$Ttl')."
+    }
+    $mult = switch ($Matches[2]) {
+        's' { 1 }
+        'm' { 60 }
+        'h' { 3600 }
+        'd' { 86400 }
+    }
+    $maxSeconds = [int64]31536000 # 365 days
+    if ($num -gt [int64]($maxSeconds / $mult)) {
+        throw "TTL duration '$Ttl' exceeds maximum allowed 365d (31536000s)."
+    }
+    return [int64]($num * $mult)
+}
+
 function Build-SeedSecretsPayload {
     param(
         [Parameter(Mandatory)][string]$ManifestPath,
         [Parameter(Mandatory)][string]$AgentName,
         [string[]]$Services = @(),
-        [switch]$Prune
+        [switch]$Prune,
+        [string]$Ttl = ''
     )
 
     if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
         throw "Secrets manifest not found at '$ManifestPath'. Create it from 'examples\secrets.example.json' (default path: %USERPROFILE%\.wsl-agent-sandbox\secrets.json) or pass -SecretsPath."
+    }
+    $ttlSeconds = 0
+    if (-not [string]::IsNullOrWhiteSpace($Ttl)) {
+        $ttlSeconds = ConvertTo-TtlSeconds -Ttl $Ttl
     }
 
     $rawJson = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8
@@ -427,6 +455,7 @@ function Build-SeedSecretsPayload {
     $filterServices = @(Resolve-RequestedServiceFilter -Services $Services)
     $resolvedServices = [ordered]@{}
     $proxyRoutes = [ordered]@{}
+    $serviceTtls = [ordered]@{}
     $summary = New-Object System.Collections.Generic.List[string]
     $skippedDisabled = New-Object System.Collections.Generic.List[string]
 
@@ -451,6 +480,7 @@ function Build-SeedSecretsPayload {
             }
         }
 
+        $summaryCountBefore = $summary.Count
         switch ($svcName) {
             'github' {
                 $hostname = [string](Get-ObjectProperty -Object $entry -Name 'hostname' -Default 'github.com')
@@ -1693,13 +1723,34 @@ function Build-SeedSecretsPayload {
                 }
             }
         }
+
+        if ($resolvedServices.Contains($svcName)) {
+            $effSvcTtl = [int64]0
+            if ($ttlSeconds -gt 0) {
+                $effSvcTtl = $ttlSeconds
+            } elseif ($svcName -notin @('env', 'files') -and (Test-ObjectHasProperty -Object $entry -Name 'ttl')) {
+                $rawSvcTtl = [string](Get-ObjectProperty -Object $entry -Name 'ttl' -Default '')
+                if (-not [string]::IsNullOrWhiteSpace($rawSvcTtl)) {
+                    $effSvcTtl = ConvertTo-TtlSeconds -Ttl $rawSvcTtl
+                }
+            }
+            if ($effSvcTtl -gt 0) {
+                $serviceTtls[$svcName] = [int64]$effSvcTtl
+                if ($summary.Count -gt $summaryCountBefore) {
+                    $lastIdx = $summary.Count - 1
+                    $summary[$lastIdx] = "$($summary[$lastIdx]) [ttl=${effSvcTtl}s]"
+                }
+            }
+        }
     }
 
     $payload = [ordered]@{
         services       = $resolvedServices
         proxyRoutes    = $proxyRoutes
+        serviceTtls    = $serviceTtls
         filterServices = @($filterServices)
         prune          = [bool]$Prune
+        ttlSeconds     = [int64]$ttlSeconds
     }
 
     return [pscustomobject]@{
