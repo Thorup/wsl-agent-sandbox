@@ -87,8 +87,8 @@ function Sync-AssetsToWsl {
     )
     $distro = $Config.distroName
 
-    # Push policy.json and Windows host IPs
-    $policyJson = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8
+    # Push merged policy.json and Windows host IPs
+    $policyJson = $Config | ConvertTo-Json -Depth 20
     Copy-TextToWsl -DistroName $distro -Content $policyJson -RemotePath '/etc/wsl-agent-sandbox/policy.json' -Mode '0600'
 
     $hostIps = (Get-WindowsHostIPs) -join "`n"
@@ -282,11 +282,18 @@ function Invoke-ClearSecrets {
 function Invoke-Status {
     param($Config)
     $distro = $Config.distroName
+    $localOverride = Get-BoxLocalOverridePath -ConfigPath $ConfigPath
     if (-not (Test-WslDistroExists -DistroName $distro)) {
         Write-Host "Distro '$distro': NOT INSTALLED"
+        if ($localOverride) {
+            Write-Host "Local override: $localOverride (active)"
+        }
         return
     }
     Write-Host "=== Status: $distro ==="
+    if ($localOverride) {
+        Write-Host "Local override: $localOverride (active)"
+    }
     $statusScript = @'
 echo "OS:          $(. /etc/os-release && echo "$PRETTY_NAME")"
 echo "Systemd:     $(systemctl is-system-running 2>/dev/null || echo inactive)"

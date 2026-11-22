@@ -143,6 +143,75 @@ Assert-Throws "Rejects storing raw credential keys inside box.json secrets secti
     Assert-BoxConfigValid -Config $c
 } 'only allows non-secret pointer property'
 
+# Deep-merge box.local.json override tests
+$tmpCfgDir = Join-Path ([System.IO.Path]::GetTempPath()) ("wsl-box-cfg-test-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Path $tmpCfgDir -Force | Out-Null
+try {
+    $baseFile = Join-Path $tmpCfgDir 'box.json'
+    $localFile = Join-Path $tmpCfgDir 'box.local.json'
+    Copy-Item -LiteralPath (Join-Path $RepoRoot 'box.json') -Destination $baseFile
+
+    $overrideObj = @{
+        sharedFolders = @(
+            @{ name = 'work'; windowsPath = 'C:\Users\demo\work'; mode = 'ro'; allowDockerBind = $true }
+        )
+        network = @{
+            allowedHostPorts = @(
+                @{ port = 8080; protocol = 'tcp'; comment = 'local test' }
+            )
+        }
+        packages = @{
+            installKubectl = $false
+        }
+    }
+    [System.IO.File]::WriteAllText($localFile, ($overrideObj | ConvertTo-Json -Depth 10), (New-Object System.Text.UTF8Encoding($false)))
+
+    $mergedCfg = Read-BoxConfig -ConfigPath $baseFile
+    Assert-True "box.local.json overrides array (sharedFolders)" (@($mergedCfg.sharedFolders).Count -eq 1 -and $mergedCfg.sharedFolders[0].name -eq 'work')
+    Assert-True "box.local.json deep-merges nested object while preserving sibling keys (network.blockHostAndLan)" ([bool]$mergedCfg.network.blockHostAndLan -and @($mergedCfg.network.allowedHostPorts).Count -eq 1 -and $mergedCfg.network.allowedHostPorts[0].port -eq 8080)
+    Assert-True "box.local.json overrides nested boolean while preserving other package flags" (-not [bool]$mergedCfg.packages.installKubectl -and [bool]$mergedCfg.packages.installNodeLts)
+    Assert-True "Get-BoxLocalOverridePath detects adjacent box.local.json" ((Get-BoxLocalOverridePath -ConfigPath $baseFile) -eq $localFile)
+
+    [System.IO.File]::WriteAllText($localFile, (@{ agentUser = @{ uid = 1000 } } | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding($false)))
+    Assert-Throws "Rejects invalid agentUser.uid introduced via box.local.json" {
+        Read-BoxConfig -ConfigPath $baseFile | Out-Null
+    } 'between 10000 and 60000'
+
+    # Finding 1: Hashtable input to Merge-BoxConfigObject must not leak .Keys/.Values/.Count
+    $htMerged = Merge-BoxConfigObject -Base $baseCfg -Override @{ packages = @{ installKubectl = $false }; customSection = @{ enabled = $true } }
+    $leakedProps = @($htMerged.PSObject.Properties.Name | Where-Object { $_ -in @('Keys', 'Values', 'Count', 'IsReadOnly', 'SyncRoot') })
+    Assert-True "Merge-BoxConfigObject supports Hashtable overrides without corrupting properties" ($leakedProps.Count -eq 0 -and -not [bool]$htMerged.packages.installKubectl -and [bool]$htMerged.packages.installNodeLts -and [bool]$htMerged.customSection.enabled)
+
+    # Finding 2: Reject non-object box.local.json (array and scalar)
+    [System.IO.File]::WriteAllText($localFile, '["oops"]', (New-Object System.Text.UTF8Encoding($false)))
+    Assert-Throws "Rejects JSON array in box.local.json" {
+        Read-BoxConfig -ConfigPath $baseFile | Out-Null
+    } 'must be a JSON object'
+
+    [System.IO.File]::WriteAllText($localFile, '"oops"', (New-Object System.Text.UTF8Encoding($false)))
+    Assert-Throws "Rejects JSON scalar string in box.local.json" {
+        Read-BoxConfig -ConfigPath $baseFile | Out-Null
+    } 'must be a JSON object'
+
+    # Finding 3: Explicit missing -LocalOverridePath must fail clearly
+    $missingOv = Join-Path $tmpCfgDir 'missing.local.json'
+    Assert-Throws "Rejects missing explicit -LocalOverridePath" {
+        Read-BoxConfig -ConfigPath $baseFile -LocalOverridePath $missingOv | Out-Null
+    } 'override file not found'
+
+    # Finding 4: Custom -ConfigPath must not auto-discover adjacent box.local.json
+    $customFile = Join-Path $tmpCfgDir 'custom.json'
+    Copy-Item -LiteralPath (Join-Path $RepoRoot 'box.json') -Destination $customFile
+    [System.IO.File]::WriteAllText($localFile, (@{ distroName = 'should-not-apply' } | ConvertTo-Json -Depth 3), (New-Object System.Text.UTF8Encoding($false)))
+    Assert-True "Get-BoxLocalOverridePath ignores box.local.json for non-box.json ConfigPath" ($null -eq (Get-BoxLocalOverridePath -ConfigPath $customFile))
+    $customCfg = Read-BoxConfig -ConfigPath $customFile
+    Assert-True "Read-BoxConfig on custom.json does not merge adjacent box.local.json" ($customCfg.distroName -eq 'wsl-agent-sandbox')
+} finally {
+    if (Test-Path -LiteralPath $tmpCfgDir) {
+        Remove-Item -LiteralPath $tmpCfgDir -Recurse -Force
+    }
+}
+
 Write-Host ""
 Write-Host "=== Config.Tests.ps1 Summary: PASS=$script:Passed FAIL=$script:Failed ==="
 if ($script:Failed -gt 0) {

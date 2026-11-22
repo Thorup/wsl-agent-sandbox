@@ -45,9 +45,11 @@ cd wsl-agent-sandbox
 
 ---
 
-## Controlling What WSL Can Access on Windows (`box.json`)
+## Controlling What WSL Can Access on Windows (`box.json` & `box.local.json`)
 
-Edit `box.json` on Windows (invisible to the agent inside WSL), then run `.\box.ps1 apply` to live-reload without rebuilding.
+> **Recommended:** Create a gitignored `box.local.json` next to `box.json` for your local `sharedFolders`, `allowedHostPorts`, or package overrides. `box.ps1` automatically deep-merges `box.local.json` over `box.json` (objects merge recursively; arrays replace cleanly) without leaving a dirty git working tree.
+
+Edit `box.local.json` (or `box.json`) on Windows (invisible to the agent inside WSL), then run `.\box.ps1 apply` to live-reload without rebuilding.
 
 ### Share a Specific Windows Folder (Read-Only or Read-Write)
 ```json
