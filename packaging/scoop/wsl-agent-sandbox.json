@@ -1,0 +1,26 @@
+{
+  "version": "0.1.0",
+  "description": "Hardened Ubuntu 26.04 LTS WSL2 Sandbox for Autonomous AI Agents",
+  "homepage": "https://github.com/Thorup/wsl-agent-sandbox",
+  "license": "GPL-3.0-only",
+  "url": "https://github.com/Thorup/wsl-agent-sandbox/releases/download/v0.1.0/wsl-agent-sandbox-v0.1.0.zip",
+  "extract_dir": "wsl-agent-sandbox-v0.1.0",
+  "hash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "bin": [
+    [
+      "wsl-sandbox.ps1",
+      "wsl-sandbox"
+    ]
+  ],
+  "checkver": {
+    "github": "https://github.com/Thorup/wsl-agent-sandbox"
+  },
+  "autoupdate": {
+    "url": "https://github.com/Thorup/wsl-agent-sandbox/releases/download/v$version/wsl-agent-sandbox-v$version.zip",
+    "extract_dir": "wsl-agent-sandbox-v$version",
+    "hash": {
+      "url": "$baseurl/SHA256SUMS.txt"
+    }
+  },
+  "notes": "Run 'wsl-sandbox init' from any directory, or place a custom box.json in %USERPROFILE%\\.wsl-agent-sandbox\\box.json. Update 'hash' from SHA256SUMS.txt for the target GitHub release tag."
+}

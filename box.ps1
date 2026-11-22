@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Manage the hardened Ubuntu 26.04 LTS WSL2 Agent Sandbox (wsl-agent-sandbox).
 
@@ -69,15 +69,33 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$RepoRoot = $PSScriptRoot
+$AppRoot = $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
-    $ConfigPath = Join-Path $RepoRoot 'box.json'
+    $cwdConfig = Join-Path (Get-Location).Path 'box.json'
+    $userConfig = Join-Path $env:USERPROFILE '.wsl-agent-sandbox\box.json'
+    if (Test-Path -LiteralPath $cwdConfig -PathType Leaf) {
+        $ConfigPath = $cwdConfig
+        $StateRoot = (Get-Location).Path
+    } elseif (Test-Path -LiteralPath $userConfig -PathType Leaf) {
+        $ConfigPath = $userConfig
+        $StateRoot = Split-Path -Parent $userConfig
+    } else {
+        $ConfigPath = Join-Path $AppRoot 'box.json'
+        $StateRoot = if (Test-Path -LiteralPath (Join-Path $AppRoot '.git')) {
+            $AppRoot
+        } else {
+            Join-Path $env:USERPROFILE '.wsl-agent-sandbox'
+        }
+    }
+} else {
+    $fullConfigPath = [System.IO.Path]::GetFullPath($ConfigPath)
+    $StateRoot = Split-Path -Parent $fullConfigPath
 }
-. (Join-Path $RepoRoot 'scripts\lib\Config.ps1')
-. (Join-Path $RepoRoot 'scripts\lib\Image.ps1')
-. (Join-Path $RepoRoot 'scripts\lib\Wsl.ps1')
-. (Join-Path $RepoRoot 'scripts\lib\Secrets.ps1')
-. (Join-Path $RepoRoot 'scripts\lib\Terminal.ps1')
+. (Join-Path $AppRoot 'scripts\lib\Config.ps1')
+. (Join-Path $AppRoot 'scripts\lib\Image.ps1')
+. (Join-Path $AppRoot 'scripts\lib\Wsl.ps1')
+. (Join-Path $AppRoot 'scripts\lib\Secrets.ps1')
+. (Join-Path $AppRoot 'scripts\lib\Terminal.ps1')
 
 function Show-Usage {
     @"
@@ -139,26 +157,26 @@ function Sync-AssetsToWsl {
     Copy-TextToWsl -DistroName $distro -Content ($hostIps + "`n") -RemotePath '/etc/wsl-agent-sandbox/host_ips.txt' -Mode '0600'
 
     # Push Linux scripts & systemd units
-    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot 'scripts\linux\box-hardening.sh') -RemotePath '/usr/local/sbin/box-hardening.sh' -Mode '0755' -NormalizeLF
-    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot 'scripts\linux\install-tools.sh') -RemotePath '/usr/local/sbin/box-install-tools.sh' -Mode '0755' -NormalizeLF
-    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot 'scripts\linux\provision.sh') -RemotePath '/usr/local/sbin/box-provision.sh' -Mode '0755' -NormalizeLF
-    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot 'scripts\linux\apply-policy.sh') -RemotePath '/usr/local/sbin/box-apply-policy.sh' -Mode '0755' -NormalizeLF
-    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot 'scripts\linux\box-seed-secrets.sh') -RemotePath '/usr/local/sbin/box-seed-secrets.sh' -Mode '0755' -NormalizeLF
-    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot 'scripts\linux\verify-isolation.sh') -RemotePath '/usr/local/bin/box-verify-isolation.sh' -Mode '0755' -NormalizeLF
-    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot 'systemd\box-hardening.service') -RemotePath '/etc/systemd/system/box-hardening.service' -Mode '0644' -NormalizeLF
-    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot 'systemd\docker-policy-proxy.service') -RemotePath '/etc/systemd/system/docker-policy-proxy.service' -Mode '0644' -NormalizeLF
+    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'scripts\linux\box-hardening.sh') -RemotePath '/usr/local/sbin/box-hardening.sh' -Mode '0755' -NormalizeLF
+    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'scripts\linux\install-tools.sh') -RemotePath '/usr/local/sbin/box-install-tools.sh' -Mode '0755' -NormalizeLF
+    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'scripts\linux\provision.sh') -RemotePath '/usr/local/sbin/box-provision.sh' -Mode '0755' -NormalizeLF
+    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'scripts\linux\apply-policy.sh') -RemotePath '/usr/local/sbin/box-apply-policy.sh' -Mode '0755' -NormalizeLF
+    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'scripts\linux\box-seed-secrets.sh') -RemotePath '/usr/local/sbin/box-seed-secrets.sh' -Mode '0755' -NormalizeLF
+    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'scripts\linux\verify-isolation.sh') -RemotePath '/usr/local/bin/box-verify-isolation.sh' -Mode '0755' -NormalizeLF
+    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'systemd\box-hardening.service') -RemotePath '/etc/systemd/system/box-hardening.service' -Mode '0644' -NormalizeLF
+    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'systemd\docker-policy-proxy.service') -RemotePath '/etc/systemd/system/docker-policy-proxy.service' -Mode '0644' -NormalizeLF
 
     if ($IncludeProxySource) {
         $proxyFiles = @('go.mod', 'main.go', 'policy.go', 'proxy.go', 'policy_test.go')
         foreach ($pf in $proxyFiles) {
-            Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot "docker-policy-proxy\$pf") -RemotePath "/usr/local/src/docker-policy-proxy/$pf" -Mode '0644' -NormalizeLF
+            Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot "docker-policy-proxy\$pf") -RemotePath "/usr/local/src/docker-policy-proxy/$pf" -Mode '0644' -NormalizeLF
         }
     }
 }
 
 function Get-GoldenSnapshotPath {
     param([Parameter(Mandatory)]$Config)
-    $cacheDir = Expand-BoxPath -RawPath $Config.image.cacheDir -BaseDir $RepoRoot
+    $cacheDir = Expand-BoxPath -RawPath $Config.image.cacheDir -BaseDir $StateRoot
     return (Join-Path $cacheDir "$($Config.distroName)-golden.tar")
 }
 
@@ -171,14 +189,14 @@ function Invoke-Snapshot {
     if (-not (Test-WslDistroExists -DistroName $Config.distroName)) {
         throw "Distro '$($Config.distroName)' does not exist."
     }
-    $cacheDir = Expand-BoxPath -RawPath $Config.image.cacheDir -BaseDir $RepoRoot
+    $cacheDir = Expand-BoxPath -RawPath $Config.image.cacheDir -BaseDir $StateRoot
     if ($Golden) {
         $OutFile = Get-GoldenSnapshotPath -Config $Config
     } elseif ([string]::IsNullOrWhiteSpace($OutFile)) {
         $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
         $OutFile = Join-Path $cacheDir "$($Config.distroName)-$stamp.tar"
     } else {
-        $OutFile = Expand-BoxPath -RawPath $OutFile -BaseDir $RepoRoot
+        $OutFile = Expand-BoxPath -RawPath $OutFile -BaseDir $StateRoot
     }
 
     $outParent = Split-Path -Parent $OutFile
@@ -211,12 +229,12 @@ function Invoke-Restore {
     if ([string]::IsNullOrWhiteSpace($SnapshotPath)) {
         throw "Snapshot path is required. Usage: .\box.ps1 restore <path-to-snapshot.tar>"
     }
-    $SnapshotPath = Expand-BoxPath -RawPath $SnapshotPath -BaseDir $RepoRoot
+    $SnapshotPath = Expand-BoxPath -RawPath $SnapshotPath -BaseDir $StateRoot
     if (-not (Test-Path -LiteralPath $SnapshotPath -PathType Leaf)) {
         throw "Snapshot file not found: '$SnapshotPath'"
     }
     $distro = $Config.distroName
-    $installDir = Expand-BoxPath -RawPath $Config.installDir -BaseDir $RepoRoot
+    $installDir = Expand-BoxPath -RawPath $Config.installDir -BaseDir $StateRoot
 
     if (Test-WslDistroExists -DistroName $distro) {
         Invoke-Destroy -Config $Config -Force:$Force
@@ -253,14 +271,14 @@ function Invoke-Init {
         [switch]$SaveGolden
     )
     $distro = $Config.distroName
-    $installDir = Expand-BoxPath -RawPath $Config.installDir -BaseDir $RepoRoot
+    $installDir = Expand-BoxPath -RawPath $Config.installDir -BaseDir $StateRoot
 
     if (Test-WslDistroExists -DistroName $distro) {
         Write-Host "[init] Distro '$distro' already exists. Use '.\box.ps1 apply' to update policy or '.\box.ps1 reset' to rebuild."
         return
     }
 
-    $imagePath = Resolve-UbuntuWslImage -Config $Config -RepoRoot $RepoRoot
+    $imagePath = Resolve-UbuntuWslImage -Config $Config -RepoRoot $StateRoot
 
     if (-not (Test-Path -LiteralPath $installDir)) {
         New-Item -ItemType Directory -Path $installDir -Force | Out-Null
@@ -362,7 +380,7 @@ function Invoke-SeedSecrets {
     }
 
     $explicitPath = if (-not [string]::IsNullOrWhiteSpace($SecretsPath)) { $SecretsPath } else { $Argument }
-    $manifestPath = Resolve-SecretsManifestPath -ExplicitPath $explicitPath -Config $Config -RepoRoot $RepoRoot
+    $manifestPath = Resolve-SecretsManifestPath -ExplicitPath $explicitPath -Config $Config -RepoRoot $StateRoot
 
     $built = Build-SeedSecretsPayload -ManifestPath $manifestPath -AgentName $Config.agentUser.name -Services $Service -Prune:$Prune
 
@@ -393,7 +411,7 @@ function Invoke-SeedSecrets {
     }
 
     # Always sync the seeder script directly so seed-secrets works independently of init/apply
-    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot 'scripts\linux\box-seed-secrets.sh') -RemotePath '/usr/local/sbin/box-seed-secrets.sh' -Mode '0755' -NormalizeLF
+    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'scripts\linux\box-seed-secrets.sh') -RemotePath '/usr/local/sbin/box-seed-secrets.sh' -Mode '0755' -NormalizeLF
 
     $payloadJson = $built.Payload | ConvertTo-Json -Depth 10 -Compress
     Write-Host "[seed-secrets] Pushing resolved credentials to '$distro' via root control plane (stdin only)..."
@@ -411,7 +429,7 @@ function Invoke-ClearSecrets {
     }
 
     $filterServices = @(Resolve-RequestedServiceFilter -Services $Service)
-    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot 'scripts\linux\box-seed-secrets.sh') -RemotePath '/usr/local/sbin/box-seed-secrets.sh' -Mode '0755' -NormalizeLF
+    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'scripts\linux\box-seed-secrets.sh') -RemotePath '/usr/local/sbin/box-seed-secrets.sh' -Mode '0755' -NormalizeLF
 
     if ($filterServices.Count -gt 0) {
         $svcArg = $filterServices -join ','
@@ -469,7 +487,7 @@ if nft list table inet wsl_agent_sandbox_shared >/dev/null 2>&1; then
 fi
 '@
     Invoke-WslRootBash -DistroName $distro -Script $statusScript
-    $installDir = Expand-BoxPath -RawPath $Config.installDir -BaseDir $RepoRoot
+    $installDir = Expand-BoxPath -RawPath $Config.installDir -BaseDir $StateRoot
     $vhdx = Join-Path $installDir 'ext4.vhdx'
     if (Test-Path -LiteralPath $vhdx -PathType Leaf) {
         $sizeGB = [Math]::Round(((Get-Item -LiteralPath $vhdx).Length / 1GB), 2)
@@ -662,7 +680,7 @@ function Invoke-Upgrade {
         }
     }
     $scopeArg = if ($normalized.Count -gt 0) { $normalized -join ',' } else { 'all' }
-    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot 'scripts\linux\upgrade-tools.sh') -RemotePath '/usr/local/sbin/box-upgrade-tools.sh' -Mode '0755' -NormalizeLF
+    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'scripts\linux\upgrade-tools.sh') -RemotePath '/usr/local/sbin/box-upgrade-tools.sh' -Mode '0755' -NormalizeLF
     Write-Host "[upgrade] Running in-place upgrade in '$distro' (scope=$scopeArg)..."
     & wsl.exe -d $distro -u root -- /usr/local/sbin/box-upgrade-tools.sh $scopeArg
     if ($LASTEXITCODE -ne 0) {
@@ -761,13 +779,13 @@ function Invoke-Doctor {
     }
 
     # 5. VHDX disk size & image cache
-    $installDir = Expand-BoxPath -RawPath $Config.installDir -BaseDir $RepoRoot
+    $installDir = Expand-BoxPath -RawPath $Config.installDir -BaseDir $StateRoot
     $vhdx = Join-Path $installDir 'ext4.vhdx'
     if (Test-Path -LiteralPath $vhdx -PathType Leaf) {
         $sizeGB = [Math]::Round(((Get-Item -LiteralPath $vhdx).Length / 1GB), 2)
         Write-Host "  [PASS] VHDX footprint: ${sizeGB} GB ($vhdx)"
     }
-    $cacheDir = Expand-BoxPath -RawPath $Config.image.cacheDir -BaseDir $RepoRoot
+    $cacheDir = Expand-BoxPath -RawPath $Config.image.cacheDir -BaseDir $StateRoot
     $cachedImages = @(Get-ChildItem -Path $cacheDir -Filter 'ubuntu-*.wsl' -ErrorAction SilentlyContinue)
     if ($cachedImages.Count -gt 0) {
         Write-Host "  [PASS] Cached Ubuntu WSL image(s): $($cachedImages.Name -join ', ')"
@@ -786,7 +804,7 @@ function Invoke-Compact {
     if (-not (Test-WslDistroExists -DistroName $distro)) {
         throw "Distro '$distro' does not exist."
     }
-    $installDir = Expand-BoxPath -RawPath $Config.installDir -BaseDir $RepoRoot
+    $installDir = Expand-BoxPath -RawPath $Config.installDir -BaseDir $StateRoot
     $vhdx = Join-Path $installDir 'ext4.vhdx'
     if (-not (Test-Path -LiteralPath $vhdx -PathType Leaf)) {
         throw "VHDX file not found at '$vhdx'."
@@ -1134,7 +1152,7 @@ function Invoke-Destroy {
         [switch]$Force
     )
     $distro = $Config.distroName
-    $installDir = Expand-BoxPath -RawPath $Config.installDir -BaseDir $RepoRoot
+    $installDir = Expand-BoxPath -RawPath $Config.installDir -BaseDir $StateRoot
 
     if (-not $Force) {
         $answer = Read-Host "Unregister WSL distro '$distro' and delete '$installDir'? Type YES to confirm"
@@ -1161,10 +1179,11 @@ if ($Command -eq 'help') {
 
 if ($Command -eq 'list') {
     $registered = @(Get-WslDistroList)
-    $profileNames = @('') + @(Get-ManagedBoxProfileNames -RepoRoot $RepoRoot -WarnOnInvalid)
+    $profileNames = @('') + @(Get-ManagedBoxProfileNames -RepoRoot $StateRoot -WarnOnInvalid)
+    $listExplicitCfg = if ($ConfigPath -ne (Join-Path $StateRoot 'box.json')) { $ConfigPath } else { '' }
     Write-Host "=== Managed Sandbox Profiles ==="
     foreach ($pName in $profileNames) {
-        $c = Resolve-BoxProfileConfig -RepoRoot $RepoRoot -Profile $pName
+        $c = Resolve-BoxProfileConfig -RepoRoot $StateRoot -ProfileName $pName -ExplicitConfigPath $listExplicitCfg
         $state = if ($registered -contains $c.distroName) { 'Installed' } else { 'Not Installed' }
         $label = if ($pName) { $pName } else { 'default' }
         Write-Host ("  - {0,-15} distro={1,-28} uid={2} state={3}" -f $label, $c.distroName, $c.agentUser.uid, $state)
@@ -1172,7 +1191,7 @@ if ($Command -eq 'list') {
     exit 0
 }
 
-$cfg = Resolve-BoxProfileConfig -RepoRoot $RepoRoot -ProfileName $ProfileName -ExplicitConfigPath $(if ($ConfigPath -ne (Join-Path $RepoRoot 'box.json')) { $ConfigPath } else { '' })
+$cfg = Resolve-BoxProfileConfig -RepoRoot $StateRoot -ProfileName $ProfileName -ExplicitConfigPath $(if ($ConfigPath -ne (Join-Path $StateRoot 'box.json')) { $ConfigPath } else { '' })
 
 switch ($Command) {
     'init' {
