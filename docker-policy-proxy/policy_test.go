@@ -12,8 +12,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
+	"time"
 )
 
 func setupTestEnv(t *testing.T) (*PolicyProxy, string, string, *map[string]any, func()) {
@@ -107,6 +109,7 @@ func setupTestEnv(t *testing.T) (*PolicyProxy, string, string, *map[string]any, 
 	go func() { _ = pSrv.Serve(pLn) }()
 
 	cleanup := func() {
+		proxy.Close()
 		_ = pSrv.Close()
 		_ = upSrv.Close()
 	}
@@ -505,6 +508,7 @@ type mockBindRecord struct {
 }
 
 type mockBindMounter struct {
+	mu        sync.Mutex
 	bound     []mockBindRecord
 	unmounted []string
 }
@@ -514,18 +518,28 @@ func (m *mockBindMounter) BindFD(fd int, target string, isDir bool, readOnly boo
 	if err := syscall.Fstat(fd, &st); err != nil {
 		return err
 	}
+	m.mu.Lock()
 	m.bound = append(m.bound, mockBindRecord{
 		target:   target,
 		ino:      st.Ino,
 		isDir:    isDir,
 		readOnly: readOnly,
 	})
+	m.mu.Unlock()
 	return nil
 }
 
 func (m *mockBindMounter) UnmountAndRemove(target string) error {
+	m.mu.Lock()
 	m.unmounted = append(m.unmounted, target)
+	m.mu.Unlock()
 	return nil
+}
+
+func (m *mockBindMounter) counts() (int, int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.bound), len(m.unmounted)
 }
 
 func TestBindPinningTOCTOUMitigation(t *testing.T) {
@@ -593,14 +607,207 @@ func TestBindPinningTOCTOUMitigation(t *testing.T) {
 		t.Fatalf("expected symlink-swapped path to be rejected by openat(O_NOFOLLOW)")
 	}
 
-	// 2. Verify container tracking and cleanup on delete.
+	// 2. Verify container tracking and cleanup on full ID, name, short ID, and absent reconciliation.
 	var parsed map[string]any
 	if err := json.Unmarshal(newBody, &parsed); err != nil {
 		t.Fatal(err)
 	}
-	bm.Track("cid-123", targets)
-	bm.CleanupContainer("cid-123")
+	bm.Track("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789", "/my-box", targets)
+	bm.CleanupContainer("my-box")
 	if len(mounter.unmounted) != 2 {
-		t.Fatalf("expected 2 ephemeral mounts unmounted on container delete, got %d", len(mounter.unmounted))
+		t.Fatalf("expected 2 ephemeral mounts unmounted by container name, got %d", len(mounter.unmounted))
+	}
+
+	bm.Track("11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff", "", []string{"/eph/short"})
+	bm.CleanupContainer("112233445566")
+	if len(mounter.unmounted) != 3 {
+		t.Fatalf("expected short-ID prefix cleanup to unmount /eph/short, got %d", len(mounter.unmounted))
+	}
+
+	// 3. Read-only prefix must NOT create non-existent subdirectories via Mkdirat.
+	roMissing := filepath.Join(sharedRO, "missing-subdir")
+	roBody, _ := json.Marshal(map[string]any{
+		"Image":      "alpine",
+		"HostConfig": map[string]any{"Binds": []string{roMissing + ":/ro"}},
+	})
+	if _, _, _, err := pol.ProcessJSONBodyWithMounts(http.MethodPost, "/containers/create", roBody); err == nil {
+		t.Fatalf("expected missing subdir under read-only prefix to fail instead of calling Mkdirat")
+	}
+	if _, statErr := os.Stat(roMissing); !os.IsNotExist(statErr) {
+		t.Fatalf("expected missing subdir under read-only prefix not to be created, statErr=%v", statErr)
+	}
+
+	// 4. FIFO special file must fail immediately (O_NONBLOCK) without hanging.
+	fifoPath := filepath.Join(homeDir, "my-fifo")
+	if err := syscall.Mkfifo(fifoPath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fifoBody, _ := json.Marshal(map[string]any{
+		"Image":      "alpine",
+		"HostConfig": map[string]any{"Binds": []string{fifoPath + ":/fifo"}},
+	})
+	if _, _, _, err := pol.ProcessJSONBodyWithMounts(http.MethodPost, "/containers/create", fifoBody); err == nil {
+		t.Fatalf("expected FIFO bind source to be rejected")
+	}
+
+	// 5. UnmountAndRemove must use os.Remove (never os.RemoveAll) so non-empty target contents survive on EINVAL.
+	nonEmpty := filepath.Join(tmp, "keep-contents")
+	if err := os.MkdirAll(nonEmpty, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(nonEmpty, "precious.txt")
+	if err := os.WriteFile(sentinel, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := (linuxBindMounter{}).UnmountAndRemove(nonEmpty); err == nil {
+		t.Fatalf("expected UnmountAndRemove on non-empty directory to fail instead of deleting contents")
+	}
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Fatalf("UnmountAndRemove deleted precious file inside directory: %v", err)
+	}
+}
+
+func TestEphemeralCleanupOnEmptyIDAndPruneAndMissing(t *testing.T) {
+	tmp := t.TempDir()
+	homeDir := filepath.Join(tmp, "home-agent")
+	ephRoot := filepath.Join(tmp, "ephemeral")
+	for _, d := range []string{filepath.Join(homeDir, "proj"), ephRoot} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	upstreamSock := filepath.Join(tmp, "upstream.sock")
+	proxySock := filepath.Join(tmp, "proxy.sock")
+	var stateMu sync.Mutex
+	returnEmptyID := false
+	activeContainers := []map[string]any{}
+	eventCh := make(chan string, 4)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1.47/containers/create", func(w http.ResponseWriter, r *http.Request) {
+		stateMu.Lock()
+		empty := returnEmptyID
+		stateMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		if empty {
+			_, _ = w.Write([]byte(`{"Warnings":[]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"Id":"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"}`))
+	})
+	mux.HandleFunc("/v1.47/containers/prune", func(w http.ResponseWriter, r *http.Request) {
+		stateMu.Lock()
+		activeContainers = nil
+		stateMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ContainersDeleted":["abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"]}`))
+	})
+	mux.HandleFunc("/containers/json", func(w http.ResponseWriter, r *http.Request) {
+		stateMu.Lock()
+		list := append([]map[string]any(nil), activeContainers...)
+		stateMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(list)
+	})
+	mux.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if fl, ok := w.(http.Flusher); ok {
+			fl.Flush()
+		}
+		select {
+		case <-r.Context().Done():
+		case ev := <-eventCh:
+			_, _ = w.Write([]byte(ev + "\n"))
+		}
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	upLn, err := net.Listen("unix", upstreamSock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upSrv := &http.Server{Handler: mux}
+	go func() { _ = upSrv.Serve(upLn) }()
+	defer upSrv.Close()
+
+	mounter := &mockBindMounter{}
+	pol := &Policy{
+		Enabled:             true,
+		EphemeralBindRoot:   ephRoot,
+		EphemeralDaemonRoot: "/daemon/ephemeral",
+		BindMappings: []BindMapping{
+			{GuestPrefix: homeDir, DaemonPrefix: "/daemon/home", ReadOnly: false},
+		},
+	}
+	proxy := NewPolicyProxy(upstreamSock, pol, log.New(io.Discard, "", 0))
+	proxy.bindManager.mounter = mounter
+	pLn, err := net.Listen("unix", proxySock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pSrv := &http.Server{Handler: proxy}
+	go func() { _ = pSrv.Serve(pLn) }()
+	defer func() {
+		proxy.Close()
+		_ = pSrv.Close()
+	}()
+
+	client := unixHTTPClient(proxySock)
+	createPayload := map[string]any{
+		"Image":      "alpine",
+		"HostConfig": map[string]any{"Binds": []string{filepath.Join(homeDir, "proj") + ":/app"}},
+	}
+
+	// 1. 2xx response without Id must immediately clean up ephemeral targets.
+	stateMu.Lock()
+	returnEmptyID = true
+	stateMu.Unlock()
+	resp := postJSON(t, client, "/v1.47/containers/create", createPayload)
+	resp.Body.Close()
+	if b, u := mounter.counts(); b != 1 || u != 1 {
+		t.Fatalf("expected empty-Id 2xx create to unmount immediately; bound=%d unmounted=%d", b, u)
+	}
+
+	// 2. Normal create followed by POST /containers/prune must clean up tracked container.
+	stateMu.Lock()
+	returnEmptyID = false
+	activeContainers = []map[string]any{{"Id": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"}}
+	stateMu.Unlock()
+	resp = postJSON(t, client, "/v1.47/containers/create?name=pruneme", createPayload)
+	resp.Body.Close()
+	if !proxy.bindManager.HasTracked() {
+		t.Fatalf("expected tracked container after create")
+	}
+	resp = postJSON(t, client, "/v1.47/containers/prune", map[string]any{})
+	resp.Body.Close()
+	if proxy.bindManager.HasTracked() {
+		t.Fatalf("expected POST /containers/prune to clean up tracked ephemeral mounts")
+	}
+	if _, u := mounter.counts(); u != 2 {
+		t.Fatalf("expected 2 unmounted targets total after prune, got %d", u)
+	}
+
+	// 3. AutoRemove (--rm) destroy event on /events must automatically clean up ephemeral mounts.
+	resp = postJSON(t, client, "/v1.47/containers/create?name=rmme", createPayload)
+	resp.Body.Close()
+	if !proxy.bindManager.HasTracked() {
+		t.Fatalf("expected tracked container before AutoRemove destroy event")
+	}
+	eventCh <- `{"Type":"container","Action":"destroy","Actor":{"ID":"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"}}`
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && proxy.bindManager.HasTracked() {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if proxy.bindManager.HasTracked() {
+		t.Fatalf("expected /events container destroy to clean up tracked ephemeral mounts")
+	}
+	if _, u := mounter.counts(); u != 3 {
+		t.Fatalf("expected 3 unmounted targets total after AutoRemove event, got %d", u)
 	}
 }

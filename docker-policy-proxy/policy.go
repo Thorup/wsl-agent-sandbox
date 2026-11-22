@@ -801,7 +801,7 @@ func (p *Policy) validateAndPinHostPath(rawSrc string) (string, bool, string, er
 	rel = strings.TrimPrefix(rel, "/")
 
 	if p.EphemeralBindRoot != "" && p.EphemeralDaemonRoot != "" && p.bindManager != nil {
-		fd, isDir, err := openPinnedNoFollow(gp, rel)
+		fd, isDir, err := openPinnedNoFollow(gp, rel, !matched.ReadOnly)
 		if err != nil {
 			return "", false, "", err
 		}

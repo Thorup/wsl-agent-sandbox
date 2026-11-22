@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -38,22 +37,32 @@ func (linuxBindMounter) BindFD(fd int, target string, isDir bool, readOnly bool)
 	}
 
 	fdPath := fmt.Sprintf("/proc/self/fd/%d", fd)
-	if out, err := exec.Command("mount", "--bind", fdPath, target).CombinedOutput(); err != nil {
-		return fmt.Errorf("mount --bind %s %s: %w (%s)", fdPath, target, err, strings.TrimSpace(string(out)))
+	if err := syscall.Mount(fdPath, target, "", syscall.MS_BIND, ""); err != nil {
+		_ = os.Remove(target)
+		return fmt.Errorf("syscall.Mount bind %s -> %s: %w", fdPath, target, err)
 	}
 	if readOnly {
-		if out, err := exec.Command("mount", "-o", "remount,ro,bind", target).CombinedOutput(); err != nil {
-			_ = exec.Command("umount", "-l", target).Run()
-			return fmt.Errorf("remount ro %s: %w (%s)", target, err, strings.TrimSpace(string(out)))
+		if err := syscall.Mount("", target, "", syscall.MS_BIND|syscall.MS_REMOUNT|syscall.MS_RDONLY, ""); err != nil {
+			_ = linuxBindMounter{}.UnmountAndRemove(target)
+			return fmt.Errorf("syscall.Mount remount ro %s: %w", target, err)
 		}
 	}
 	return nil
 }
 
 func (linuxBindMounter) UnmountAndRemove(target string) error {
-	_ = exec.Command("mount", "--make-rprivate", target).Run()
-	_ = exec.Command("umount", "-l", target).Run()
-	return os.RemoveAll(target)
+	_ = syscall.Mount("", target, "", syscall.MS_PRIVATE, "")
+	if err := syscall.Unmount(target, syscall.MNT_DETACH); err != nil {
+		if !errors.Is(err, syscall.EINVAL) && !errors.Is(err, syscall.ENOENT) {
+			if err2 := syscall.Unmount(target, 0); err2 != nil && !errors.Is(err2, syscall.EINVAL) && !errors.Is(err2, syscall.ENOENT) {
+				return fmt.Errorf("unmount %s failed: %w", target, err2)
+			}
+		}
+	}
+	if err := os.Remove(target); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 // EphemeralMountManager tracks root-owned ephemeral bind mounts created to
@@ -63,6 +72,7 @@ type EphemeralMountManager struct {
 	seq     atomic.Uint64
 	mu      sync.Mutex
 	byID    map[string][]string
+	aliases map[string]string
 }
 
 func NewEphemeralMountManager(m BindMounter) *EphemeralMountManager {
@@ -72,6 +82,7 @@ func NewEphemeralMountManager(m BindMounter) *EphemeralMountManager {
 	return &EphemeralMountManager{
 		mounter: m,
 		byID:    make(map[string][]string),
+		aliases: make(map[string]string),
 	}
 }
 
@@ -80,13 +91,23 @@ func (m *EphemeralMountManager) NextMountName() string {
 	return fmt.Sprintf("bind-%d", id)
 }
 
-func (m *EphemeralMountManager) Track(containerID string, targets []string) {
+func (m *EphemeralMountManager) Track(containerID, containerName string, targets []string) {
 	if containerID == "" || len(targets) == 0 {
 		return
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.byID[containerID] = append(m.byID[containerID], targets...)
+	cleanName := strings.TrimPrefix(strings.TrimSpace(containerName), "/")
+	if cleanName != "" {
+		m.aliases[cleanName] = containerID
+	}
+}
+
+func (m *EphemeralMountManager) HasTracked() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.byID) > 0
 }
 
 func (m *EphemeralMountManager) CleanupTargets(targets []string) {
@@ -95,15 +116,60 @@ func (m *EphemeralMountManager) CleanupTargets(targets []string) {
 	}
 }
 
-func (m *EphemeralMountManager) CleanupContainer(containerID string) {
-	if containerID == "" {
+func (m *EphemeralMountManager) deleteLocked(id string) []string {
+	targets := m.byID[id]
+	delete(m.byID, id)
+	for name, targetID := range m.aliases {
+		if targetID == id {
+			delete(m.aliases, name)
+		}
+	}
+	return targets
+}
+
+func (m *EphemeralMountManager) CleanupContainer(ref string) {
+	ref = strings.TrimPrefix(strings.TrimSpace(ref), "/")
+	if ref == "" {
 		return
 	}
 	m.mu.Lock()
-	targets := m.byID[containerID]
-	delete(m.byID, containerID)
+	var targets []string
+	if t, ok := m.byID[ref]; ok {
+		targets = t
+		m.deleteLocked(ref)
+	} else if fullID, ok := m.aliases[ref]; ok {
+		targets = m.deleteLocked(fullID)
+	} else if len(ref) >= 6 {
+		var matchedID string
+		matches := 0
+		for id := range m.byID {
+			if strings.HasPrefix(id, ref) {
+				matchedID = id
+				matches++
+			}
+		}
+		if matches == 1 {
+			targets = m.deleteLocked(matchedID)
+		}
+	}
 	m.mu.Unlock()
 	m.CleanupTargets(targets)
+}
+
+func (m *EphemeralMountManager) CleanupAbsent(activeIDs map[string]bool) {
+	m.mu.Lock()
+	var staleTargets []string
+	var gone []string
+	for id := range m.byID {
+		if !activeIDs[id] {
+			gone = append(gone, id)
+		}
+	}
+	for _, id := range gone {
+		staleTargets = append(staleTargets, m.deleteLocked(id)...)
+	}
+	m.mu.Unlock()
+	m.CleanupTargets(staleTargets)
 }
 
 // CleanupStale removes any leftover ephemeral mounts from prior proxy runs.
@@ -123,8 +189,8 @@ func (m *EphemeralMountManager) CleanupStale(root string) {
 // openPinnedNoFollow walks from root through rel using openat(O_NOFOLLOW) so no
 // symlink component can ever be traversed, returning the pinned file descriptor
 // and whether it is a directory. Caller must close the returned fd.
-func openPinnedNoFollow(root, rel string) (int, bool, error) {
-	flags := syscall.O_RDONLY | syscall.O_NOFOLLOW | syscall.O_CLOEXEC
+func openPinnedNoFollow(root, rel string, allowCreate bool) (int, bool, error) {
+	flags := syscall.O_RDONLY | syscall.O_NOFOLLOW | syscall.O_CLOEXEC | syscall.O_NONBLOCK
 	curFD, err := syscall.Open(root, flags, 0)
 	if err != nil {
 		return -1, false, deny("allowed bind root %q is not accessible: %v", root, err)
@@ -152,12 +218,16 @@ func openPinnedNoFollow(root, rel string) (int, bool, error) {
 				_ = syscall.Close(curFD)
 				return -1, false, deny("symlink %q is forbidden in bind mount source", filepath.Join(root, strings.Join(parts[:i+1], "/")))
 			}
-			if errors.Is(err, syscall.ENOENT) {
-				// Create missing directory inside the already-pinned parent fd to match Docker's mkdir-on-bind
-				// semantics while still pinning the exact inode.
-				if i == len(parts)-1 {
-					if mkErr := syscall.Mkdirat(curFD, part, 0o755); mkErr == nil || errors.Is(mkErr, syscall.EEXIST) {
-						nextFD, err = syscall.Openat(curFD, part, flags, 0)
+			if errors.Is(err, syscall.ENOENT) && allowCreate && i == len(parts)-1 {
+				var parentSt syscall.Stat_t
+				hasParentSt := syscall.Fstat(curFD, &parentSt) == nil
+				// Create missing leaf directory inside the already-pinned parent fd while matching
+				// the parent directory's owner/group so the agent can still write into it.
+				mkErr := syscall.Mkdirat(curFD, part, 0o755)
+				if mkErr == nil || errors.Is(mkErr, syscall.EEXIST) {
+					nextFD, err = syscall.Openat(curFD, part, flags, 0)
+					if err == nil && mkErr == nil && hasParentSt {
+						_ = syscall.Fchown(nextFD, int(parentSt.Uid), int(parentSt.Gid))
 					}
 				}
 			}
