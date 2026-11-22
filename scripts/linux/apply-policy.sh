@@ -63,6 +63,12 @@ use-aws() {
     . "$HOME/.config/wsl-agent-sandbox/active-overrides.env"
   fi
 }
+use-github() {
+  /usr/local/bin/use-github "$@" || return $?
+  if [ -r "$HOME/.config/wsl-agent-sandbox/active-overrides.env" ]; then
+    . "$HOME/.config/wsl-agent-sandbox/active-overrides.env"
+  fi
+}
 EOF
 chmod 0644 /etc/profile.d/99-agent-box.sh
 

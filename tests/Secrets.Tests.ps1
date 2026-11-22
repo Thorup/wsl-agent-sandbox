@@ -409,6 +409,65 @@ try {
         Build-SeedSecretsPayload -ManifestPath $badGcloudDefManifest -AgentName 'agent'
     } 'does not match any configured project'
 
+    # 3d. Multi-profile GitHub fine-grained PAT mode (with proxyInject)
+    $ghMultiManifest = Join-Path $tmpDir 'github-multi.json'
+    [System.IO.File]::WriteAllText($ghMultiManifest, (@{
+        github = @{
+            defaultProfile = 'work-org'
+            user           = 'Thorup'
+            gitProtocol    = 'ssh'
+            setupGit       = $false
+            proxyInject    = $true
+            profiles       = @(
+                @{
+                    name  = 'personal'
+                    owner = 'Thorup'
+                    token = 'github_pat_personal_secret_111'
+                },
+                @{
+                    name  = 'work-org'
+                    owner = 'acme-org'
+                    token = 'github_pat_org_secret_222'
+                }
+            )
+        }
+    } | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
+    $ghMultiRes = Build-SeedSecretsPayload -ManifestPath $ghMultiManifest -AgentName 'agent'
+    $ghm = $ghMultiRes.Payload.services['github']
+    $ghRoute = $ghMultiRes.Payload.proxyRoutes['github']
+    $ghSvcJson = ($ghm | ConvertTo-Json -Depth 6)
+    Assert-True "Builds multi-profile github payload with per-profile proxyInject placeholders and tokenProfiles map" (
+        $ghm.profiles.Count -eq 2 -and
+        $ghm.defaultProfile -eq 'work-org' -and
+        $ghm.owner -eq 'acme-org' -and
+        $ghm.profiles[0].name -eq 'personal' -and
+        $ghm.profiles[0].owner -eq 'Thorup' -and
+        $ghm.profiles[0].token -match '^sandbox-proxy-github-[0-9a-f]{48}$' -and
+        $ghm.profiles[1].name -eq 'work-org' -and
+        $ghm.profiles[1].owner -eq 'acme-org' -and
+        $ghm.profiles[1].token -match '^sandbox-proxy-github-[0-9a-f]{48}$' -and
+        $ghm.profiles[0].token -ne $ghm.profiles[1].token -and
+        $ghm.token -eq $ghm.profiles[1].token -and
+        $ghRoute.expectedTokens.Count -eq 2 -and
+        $ghRoute.tokenProfiles[$ghm.profiles[0].token].injectHeaders['Authorization'] -eq 'Bearer github_pat_personal_secret_111' -and
+        $ghRoute.tokenProfiles[$ghm.profiles[1].token].injectHeaders['Authorization'] -eq 'Bearer github_pat_org_secret_222' -and
+        $ghSvcJson -notmatch 'github_pat_personal_secret_111|github_pat_org_secret_222' -and
+        (($ghMultiRes.Summary -join ' ') -match 'profiles=personal:Thorup, work-org:acme-org; default=work-org')
+    )
+
+    $badGhDupManifest = Join-Path $tmpDir 'github-dup.json'
+    [System.IO.File]::WriteAllText($badGhDupManifest, (@{
+        github = @{
+            profiles = @(
+                @{ name = 'personal'; token = 'github_pat_1' },
+                @{ name = 'personal'; token = 'github_pat_2' }
+            )
+        }
+    } | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
+    Assert-Throws "Rejects duplicate profile name in github.profiles" {
+        Build-SeedSecretsPayload -ManifestPath $badGhDupManifest -AgentName 'agent'
+    } 'duplicate profile name'
+
     # 4. kubectl service-account token mode
     $kcTokenManifest = Join-Path $tmpDir 'kc-token.json'
     [System.IO.File]::WriteAllText($kcTokenManifest, (@{

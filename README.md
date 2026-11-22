@@ -167,7 +167,7 @@ Because every containment boundary (non-root UID `26040`, no `sudo`, no `/mnt/c`
 - **Claude Code** (`claude` — pre-installed by default; toggle `installClaudeCode` in `box.json`)
 - **OpenAI Codex CLI** (`codex` — toggle `installCodexCli: true` in `box.json`), **OpenCode** (`opencode` — toggle `installOpenCode: true`), **Aider** (`aider` — toggle `installAider: true`), or custom agents (installable via ` box.json` toggles or in user-space via `npm`/`uv`)
 
-### Dynamic Agent Instructions, `SKILL.md` & Multi-Cloud Profile Switchers (`use-gcloud`, `use-aws`, `box-context`)
+### Dynamic Agent Instructions, `SKILL.md` & Multi-Cloud Profile Switchers (`use-gcloud`, `use-aws`, `use-github`, `box-context`)
 
 Whenever you run `.\box.ps1 apply`, `.\box.ps1 seed-secrets`, or `.\box.ps1 clear-secrets`, the sandbox automatically runs `/usr/local/sbin/box-sync-context.py` to keep agents aware of the active sandbox boundaries, mounts, allowed host ports, and seeded cloud profiles (with **zero secret values** written to disk):
 - **Global Agent Instruction Files (non-destructive marker blocks)**: Automatically updates `# >>> wsl-agent-sandbox >>>` blocks in `~/.gemini/GEMINI.md`, `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.config/opencode/AGENTS.md`, and `~/.config/wsl-agent-sandbox/SANDBOX_CONTEXT.md`.
@@ -175,6 +175,7 @@ Whenever you run `.\box.ps1 apply`, `.\box.ps1 seed-secrets`, or `.\box.ps1 clea
 - **Persistent Multi-Cloud Switchers & Context CLI**:
   - `use-gcloud <name>` (or `use-gcloud --list`) — Activates the named `gcloud` configuration **and** updates `GOOGLE_APPLICATION_CREDENTIALS`, `GOOGLE_CLOUD_PROJECT`, `CLOUDSDK_CORE_PROJECT`, and compute region/zone both in the current shell and persistently across subsequent non-interactive agent subshells (`~/.config/wsl-agent-sandbox/active-overrides.env`).
   - `use-aws <profile>` (or `use-aws --list`) — Switches `AWS_PROFILE` both in the current shell and persistently across subshells.
+  - `use-github <profile>` (or `use-github --list`) — Switches active GitHub fine-grained PAT profile (`GH_TOKEN` / `GH_ENTERPRISE_TOKEN` and `~/.config/gh/hosts.yml`) across personal and organization Resource Owners (works seamlessly with `"proxyInject": true`).
   - `box-context` (or `box-context --json`) — Prints the live, non-secret sandbox inventory.
 
 > **Cloud Credentials Note**: Any credentials you configure inside `/home/agent` (`~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.config/gh`, `~/.config/.jira`, `~/.config/upctl.yaml`, `~/.kube/config`) are accessible to autonomous agents running in this box. Use dedicated, least-privilege sandbox accounts/clusters or short-lived tokens rather than production admin credentials.
@@ -230,7 +231,7 @@ Manifest path resolution priority:
 
 | Service Key | CLI / Tool | Auth Mechanism & Linux Target |
 | :--- | :--- | :--- |
-| `github` | `gh` + `git` (HTTPS) | Machine account / fine-grained PAT → `~/.config/gh/hosts.yml`, `gh auth setup-git`, optional `GH_TOKEN` / `GH_ENTERPRISE_TOKEN` (and optional `loginOnline: true`); supports `"proxyInject": true` (`GITHUB_API_URL=http://127.0.0.1:3129/github`). |
+| `github` | `gh` + `git` (HTTPS) | Machine account / fine-grained PAT (single or multi-profile `profiles[]` across personal and organization Resource Owners, switchable via `use-github <profile>`) → `~/.config/gh/hosts.yml`, `gh auth setup-git`, optional `GH_TOKEN` / `GH_ENTERPRISE_TOKEN` (and optional `loginOnline: true`); supports `"proxyInject": true` (`GITHUB_API_URL=http://127.0.0.1:3129/github`). |
 | `git` | `git` (SSH + signing) | Dedicated Git SSH keys (plus optional `.pub` & OpenSSH `-cert.pub` certs) → `~/.ssh/wsl-agent-sandbox-git/` (`0600`) or root-owned `ssh-agent` (`"mode": "agent-proxy"` via filtered `SSH_AUTH_SOCK=/run/ssh-agent-proxy/agent.sock`), independent Git `Host` stanzas in `~/.ssh/config`, pinned `known_hosts`, plus optional Git identity (`user.name`/`user.email`), SSH commit/tag signing (`gpg.format = ssh`, `allowed_signers`), and HTTPS-to-SSH rewrites via `~/.config/wsl-agent-sandbox/gitconfig`. |
 | `aws` | `aws` | IAM access keys / STS tokens (single or multi-profile) → `~/.aws/credentials`, `~/.aws/config`, optional `AWS_PROFILE`. |
 | `gcloud` | `gcloud` + GCP SDKs | Service Account JSON key(s) (single-project or multi-project `projects[]` / `profiles[]` with separate service accounts) → `~/.config/wsl-agent-sandbox/keys/gcloud-*.json`, named `gcloud` configurations (`~/.config/gcloud/configurations/config_<name>`), `gcloud auth activate-service-account`, project/region/zone config, `GOOGLE_APPLICATION_CREDENTIALS`. |
