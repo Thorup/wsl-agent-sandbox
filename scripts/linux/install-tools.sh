@@ -262,21 +262,32 @@ if [[ "${INSTALL_JIRA}" == "1" ]] && ! command -v jira >/dev/null 2>&1; then
 fi
 
 # 14. Additional AI Coding Agents (Codex CLI, OpenCode, Aider)
-if [[ "${INSTALL_CODEX}" == "1" ]] && [[ "${INSTALL_NODE}" == "1" ]] && ! command -v codex >/dev/null 2>&1; then
-  log "Installing @openai/codex..."
-  npm install -g @openai/codex
+if [[ "${INSTALL_CODEX}" == "1" ]]; then
+  if [[ "${INSTALL_NODE}" != "1" ]] || ! command -v npm >/dev/null 2>&1; then
+    log "WARNING: installCodexCli is enabled but Node.js/npm is unavailable (installNodeLts=${INSTALL_NODE}); skipping Codex CLI install."
+  elif ! command -v codex >/dev/null 2>&1; then
+    log "Installing @openai/codex..."
+    npm install -g @openai/codex
+  fi
 fi
 
-if [[ "${INSTALL_OPENCODE}" == "1" ]] && [[ "${INSTALL_NODE}" == "1" ]] && ! command -v opencode >/dev/null 2>&1; then
-  log "Installing opencode-ai..."
-  npm install -g opencode-ai
+if [[ "${INSTALL_OPENCODE}" == "1" ]]; then
+  if [[ "${INSTALL_NODE}" != "1" ]] || ! command -v npm >/dev/null 2>&1; then
+    log "WARNING: installOpenCode is enabled but Node.js/npm is unavailable (installNodeLts=${INSTALL_NODE}); skipping OpenCode install."
+  elif ! command -v opencode >/dev/null 2>&1; then
+    log "Installing opencode-ai..."
+    npm install -g opencode-ai
+  fi
 fi
 
-if [[ "${INSTALL_AIDER}" == "1" ]] && command -v uv >/dev/null 2>&1; then
-  if [[ ! -x "/home/${AGENT_NAME}/.local/bin/aider" ]]; then
-    log "Installing aider-chat via uv for '${AGENT_NAME}'..."
+if [[ "${INSTALL_AIDER}" == "1" ]]; then
+  if [[ "${INSTALL_UV}" != "1" ]] || ! command -v uv >/dev/null 2>&1; then
+    log "WARNING: installAider is enabled but uv is unavailable (installUv=${INSTALL_UV}); skipping Aider install."
+  elif [[ ! -x "/home/${AGENT_NAME}/.local/bin/aider" ]]; then
+    log "Installing aider-chat via uv (Python 3.12) for '${AGENT_NAME}'..."
+    # aider-chat requires Python <3.13; use uv-managed Python 3.12 on Ubuntu 26.04.
     # shellcheck disable=SC2016 # $HOME expands inside the target user's shell
-    su -s /bin/bash - "${AGENT_NAME}" -c 'uv tool install --python python3 aider-chat'
+    su -s /bin/bash - "${AGENT_NAME}" -c 'uv tool install --python 3.12 aider-chat'
   fi
 fi
 
@@ -313,10 +324,18 @@ EOF
 fi
 
 # 17. Headless Playwright Chromium + system dependencies
-if [[ "${INSTALL_PLAYWRIGHT}" == "1" ]] && [[ "${INSTALL_NODE}" == "1" ]]; then
-  if [[ ! -d "/home/${AGENT_NAME}/.cache/ms-playwright" ]]; then
-    log "Installing Playwright Chromium + system dependencies..."
-    npx --yes playwright install-deps chromium
-    su -s /bin/bash - "${AGENT_NAME}" -c 'npx --yes playwright install chromium'
+if [[ "${INSTALL_PLAYWRIGHT}" == "1" ]]; then
+  if [[ "${INSTALL_NODE}" != "1" ]] || ! command -v npm >/dev/null 2>&1; then
+    log "WARNING: installPlaywrightChromium is enabled but Node.js/npm is unavailable (installNodeLts=${INSTALL_NODE}); skipping Playwright Chromium install."
+  else
+    if ! command -v playwright >/dev/null 2>&1; then
+      log "Installing global playwright CLI..."
+      npm install -g playwright
+    fi
+    if [[ ! -d "/home/${AGENT_NAME}/.cache/ms-playwright" ]]; then
+      log "Installing Playwright Chromium + system dependencies..."
+      playwright install-deps chromium
+      su -s /bin/bash - "${AGENT_NAME}" -c 'playwright install chromium'
+    fi
   fi
 fi
