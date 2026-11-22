@@ -63,7 +63,9 @@ param(
     [string]$RepoPath = '',
 
     [Alias('Profile')]
-    [string]$ProfileName = ''
+    [string]$ProfileName = '',
+
+    [string]$Ttl = ''
 )
 
 Set-StrictMode -Version Latest
@@ -125,7 +127,7 @@ Commands:
                      on Windows without touching working tree or .git/hooks.
   seed-secrets [path] Seed or rotate CLI tokens, service accounts, and Git/SSH credentials from a
                      central Windows manifest (default: %USERPROFILE%\.wsl-agent-sandbox\secrets.json)
-                     independently of init/apply. Supports -SecretsPath, -Service <names>, -Prune, -DryRun.
+                     independently of init/apply. Supports -SecretsPath, -Service <names>, -Ttl <dur>, -Prune, -DryRun.
   clear-secrets      Remove managed seeded CLI credentials inside WSL (optionally scoped via -Service).
   register-terminal  Add or update a dedicated Windows Terminal profile for this sandbox
                      (pass -Unregister to remove it).
@@ -376,7 +378,8 @@ function Invoke-SeedSecrets {
         [string]$SecretsPath = '',
         [string[]]$Service = @(),
         [switch]$Prune,
-        [switch]$DryRun
+        [switch]$DryRun,
+        [string]$Ttl = ''
     )
     $distro = $Config.distroName
     if (-not (Test-WslDistroExists -DistroName $distro)) {
@@ -386,7 +389,7 @@ function Invoke-SeedSecrets {
     $explicitPath = if (-not [string]::IsNullOrWhiteSpace($SecretsPath)) { $SecretsPath } else { $Argument }
     $manifestPath = Resolve-SecretsManifestPath -ExplicitPath $explicitPath -Config $Config -RepoRoot $StateRoot
 
-    $built = Build-SeedSecretsPayload -ManifestPath $manifestPath -AgentName $Config.agentUser.name -Services $Service -Prune:$Prune
+    $built = Build-SeedSecretsPayload -ManifestPath $manifestPath -AgentName $Config.agentUser.name -Services $Service -Prune:$Prune -Ttl $Ttl
 
     $summaryLines = @($built.Summary)
     $disabledLines = @($built.SkippedDisabled)
@@ -414,15 +417,10 @@ function Invoke-SeedSecrets {
         return
     }
 
-<<<<<<< HEAD
-    # Always sync the seeder script directly so seed-secrets works independently of init/apply
-    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'scripts\linux\box-seed-secrets.sh') -RemotePath '/usr/local/sbin/box-seed-secrets.sh' -Mode '0755' -NormalizeLF
-=======
     # Always sync the seeder script & credential proxy assets so seed-secrets works independently of init/apply
-    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot 'scripts\linux\box-seed-secrets.sh') -RemotePath '/usr/local/sbin/box-seed-secrets.sh' -Mode '0755' -NormalizeLF
-    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot 'scripts\linux\credential-proxy.py') -RemotePath '/usr/local/sbin/box-credential-proxy.py' -Mode '0755' -NormalizeLF
-    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot 'systemd\credential-proxy.service') -RemotePath '/etc/systemd/system/credential-proxy.service' -Mode '0644' -NormalizeLF
->>>>>>> a3f00d8 (feat(security): add root-owned L7 credential injection proxy)
+    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'scripts\linux\box-seed-secrets.sh') -RemotePath '/usr/local/sbin/box-seed-secrets.sh' -Mode '0755' -NormalizeLF
+    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'scripts\linux\credential-proxy.py') -RemotePath '/usr/local/sbin/box-credential-proxy.py' -Mode '0755' -NormalizeLF
+    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'systemd\credential-proxy.service') -RemotePath '/etc/systemd/system/credential-proxy.service' -Mode '0644' -NormalizeLF
 
     $payloadJson = $built.Payload | ConvertTo-Json -Depth 10 -Compress
     Write-Host "[seed-secrets] Pushing resolved credentials to '$distro' via root control plane (stdin only)..."
@@ -1249,7 +1247,7 @@ switch ($Command) {
         Invoke-PullBranch -Config $cfg -RepoName $Argument -WindowsRepoPath $RepoPath -Branch $Branch
     }
     'seed-secrets' {
-        Invoke-SeedSecrets -Config $cfg -SecretsPath $SecretsPath -Service $Service -Prune:$Prune -DryRun:$DryRun
+        Invoke-SeedSecrets -Config $cfg -SecretsPath $SecretsPath -Service $Service -Prune:$Prune -DryRun:$DryRun -Ttl $Ttl
     }
     'clear-secrets' {
         Invoke-ClearSecrets -Config $cfg -Service $Service

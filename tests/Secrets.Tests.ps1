@@ -657,6 +657,40 @@ try {
     Assert-Throws "Rejects jira.proxyInject with authType=mtls" {
         Build-SeedSecretsPayload -ManifestPath $badJiraMtlsManifest -AgentName 'agent'
     } 'mtls'
+
+    $ttlBuilt = Build-SeedSecretsPayload -ManifestPath $proxyManifest -AgentName 'agent' -Ttl '2h'
+    Assert-True "TTL 2h resolves to 7200 seconds in payload" ($ttlBuilt.Payload.ttlSeconds -eq 7200 -and $ttlBuilt.Payload.serviceTtls.claude -eq 7200)
+    Assert-Throws "Rejects invalid -Ttl format" {
+        ConvertTo-TtlSeconds -Ttl '2hours' | Out-Null
+    } 'Invalid -Ttl'
+    Assert-Throws "Rejects zero -Ttl duration" {
+        ConvertTo-TtlSeconds -Ttl '0s' | Out-Null
+    } 'positive integer'
+    Assert-Throws "Rejects overflowing -Ttl duration" {
+        ConvertTo-TtlSeconds -Ttl '99999999999999999999d' | Out-Null
+    } 'between 1s and 365d'
+    Assert-Throws "Rejects -Ttl exceeding 365d max bound" {
+        ConvertTo-TtlSeconds -Ttl '366d' | Out-Null
+    } 'exceeds maximum'
+
+    $perSvcTtlManifest = Join-Path $tmpDir 'per-svc-ttl.json'
+    [System.IO.File]::WriteAllText($perSvcTtlManifest, (@{
+        github = @{ token = 'ghp_persvc123456'; ttl = '15m'; loginOnline = $false }
+        gemini = @{ apiKey = 'AIza_persvc123456' }
+    } | ConvertTo-Json -Depth 4), (New-Object System.Text.UTF8Encoding($false)))
+    $svcTtlBuilt = Build-SeedSecretsPayload -ManifestPath $perSvcTtlManifest -AgentName 'agent'
+    Assert-True "Per-service ttl resolves into serviceTtls without affecting sibling services" (
+        $svcTtlBuilt.Payload.ttlSeconds -eq 0 -and
+        $svcTtlBuilt.Payload.serviceTtls.github -eq 900 -and
+        -not $svcTtlBuilt.Payload.serviceTtls.Contains('gemini') -and
+        (($svcTtlBuilt.Summary | Where-Object { $_ -match '^github ' }) -match '\[ttl=900s\]')
+    )
+    $svcTtlOverride = Build-SeedSecretsPayload -ManifestPath $perSvcTtlManifest -AgentName 'agent' -Ttl '30s'
+    Assert-True "CLI -Ttl overrides per-service ttl" (
+        $svcTtlOverride.Payload.ttlSeconds -eq 30 -and
+        $svcTtlOverride.Payload.serviceTtls.github -eq 30 -and
+        $svcTtlOverride.Payload.serviceTtls.gemini -eq 30
+    )
 } finally {
     [Environment]::SetEnvironmentVariable('WSL_AGENT_SANDBOX_SECRETS_PATH', $prevEnvManifest)
     [Environment]::SetEnvironmentVariable('TEST_SANDBOX_GH_TOKEN', $prevTestToken)
