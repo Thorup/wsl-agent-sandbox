@@ -1126,7 +1126,13 @@ function Build-SeedSecretsPayload {
                     throw "git: specify at least one of 'privateKey*', 'keys', 'hosts', 'knownHosts', 'signing', 'userName', or 'userEmail'."
                 }
 
+                $gitMode = [string](Get-ObjectProperty -Object $entry -Name 'mode' -Default 'files')
+                if ($gitMode -eq 'file') { $gitMode = 'files' }
+                if ($gitMode -notin @('files', 'agent-proxy')) {
+                    throw "git.mode '$gitMode' must be 'files' or 'agent-proxy'."
+                }
                 $resolvedServices['git'] = [ordered]@{
+                    mode                  = $gitMode
                     userName              = $userName
                     userEmail             = $userEmail
                     keys                  = @($keysOut.ToArray())
@@ -1801,7 +1807,13 @@ function Build-SeedSecretsPayload {
                     throw "ssh: specify at least one of 'keys', 'hosts', 'knownHosts', or 'knownHostsFile'."
                 }
 
+                $sshMode = [string](Get-ObjectProperty -Object $entry -Name 'mode' -Default 'files')
+                if ($sshMode -eq 'file') { $sshMode = 'files' }
+                if ($sshMode -notin @('files', 'agent-proxy')) {
+                    throw "ssh.mode '$sshMode' must be 'files' or 'agent-proxy'."
+                }
                 $resolvedServices['ssh'] = [ordered]@{
+                    mode                  = $sshMode
                     keys                  = @($keysOut.ToArray())
                     hosts                 = @($hostsOut.ToArray())
                     knownHosts            = @($knownHostsList.ToArray())

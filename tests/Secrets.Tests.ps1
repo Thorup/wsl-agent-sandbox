@@ -765,6 +765,22 @@ try {
     # Invoke-VaultCliProcess separates stdout from stderr warnings without NativeCommandError
     $cliStdout = Invoke-VaultCliProcess -FileName 'powershell.exe' -Arguments @('-NoProfile', '-Command', '[Console]::Error.WriteLine("WARNING: CLI update available"); [Console]::Out.WriteLine("clean-secret-from-stdout")') -Context 'test.cli' -Uri 'op://v/i/f'
     Assert-True "Invoke-VaultCliProcess ignores stderr warnings and returns clean stdout" ($cliStdout -eq 'clean-secret-from-stdout')
+
+    $agentProxyManifest = Join-Path $tmpDir 'ssh-agent-proxy.json'
+    [System.IO.File]::WriteAllText($agentProxyManifest, (@{
+        ssh = @{ mode = 'agent-proxy'; keys = @(@{ name = 'deploy'; privateKeyFile = 'keys\ssh_deploy'; publicKeyFile = 'keys\ssh_deploy.pub' }) }
+        git = @{ mode = 'agent-proxy'; host = 'github.com'; privateKeyFile = 'keys\git_github'; publicKeyFile = 'keys\git_github.pub' }
+    } | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
+    $apBuilt = Build-SeedSecretsPayload -ManifestPath $agentProxyManifest -AgentName 'agent'
+    Assert-True "Supports mode=agent-proxy on ssh and git services" ($apBuilt.Payload.services.ssh.mode -eq 'agent-proxy' -and $apBuilt.Payload.services.git.mode -eq 'agent-proxy')
+
+    $badModeManifest = Join-Path $tmpDir 'bad-ssh-mode.json'
+    [System.IO.File]::WriteAllText($badModeManifest, (@{
+        ssh = @{ mode = 'invalid-mode'; keys = @(@{ name = 'deploy'; privateKeyFile = 'keys\ssh_deploy' }) }
+    } | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
+    Assert-Throws "Rejects invalid ssh.mode value" {
+        Build-SeedSecretsPayload -ManifestPath $badModeManifest -AgentName 'agent' | Out-Null
+    } "must be 'files' or 'agent-proxy'"
 } finally {
     [Environment]::SetEnvironmentVariable('WSL_AGENT_SANDBOX_SECRETS_PATH', $prevEnvManifest)
     [Environment]::SetEnvironmentVariable('TEST_SANDBOX_GH_TOKEN', $prevTestToken)

@@ -1,0 +1,15 @@
+[Unit]
+Description=wsl-agent-sandbox Root-Mediated Filtered SSH Agent Proxy
+After=box-hardening.service
+Wants=box-hardening.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/bin/python3 /usr/local/sbin/box-ssh-agent-proxy.py
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
