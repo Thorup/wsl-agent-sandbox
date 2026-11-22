@@ -953,9 +953,38 @@ def derive_public_key_line(priv_path):
         return res.stdout.strip().splitlines()[0].strip()
     return ""
 
+def derive_public_key_from_private_text(priv_raw):
+    if not shutil.which("ssh-keygen"):
+        return ""
+    import tempfile
+    os.makedirs("/run/box-root", mode=0o700, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix="pubderive-", dir="/run/box-root")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tf:
+            tf.write(priv_raw)
+        os.chmod(tmp_path, 0o600)
+        res = subprocess.run(["ssh-keygen", "-y", "-f", tmp_path], check=False, text=True, capture_output=True)
+        if res.returncode == 0 and res.stdout.strip():
+            return res.stdout.strip().splitlines()[0].strip()
+        return ""
+    finally:
+        remove_file_quiet(tmp_path)
+
+def extract_pubkey_blob_hex(pub_line):
+    parts = (pub_line or "").strip().split()
+    if len(parts) < 2:
+        return ""
+    try:
+        return base64.b64decode(parts[1]).hex().lower()
+    except Exception:
+        return ""
+
 def seed_git(cfg, prev_meta):
     ensure_agent_dir(SSH_DIR, mode=0o700)
     ensure_agent_dir(GIT_SSH_MANAGED_DIR, mode=0o700)
+
+    is_agent_proxy = (cfg.get("mode") == "agent-proxy")
+    agent_proxy_keys = []
 
     keys_raw = cfg.get("keys") or []
     if isinstance(keys_raw, dict):
@@ -980,24 +1009,39 @@ def seed_git(cfg, prev_meta):
         priv_raw = k["privateKey"].replace("\r\n", "\n").replace("\r", "\n").rstrip("\n") + "\n"
         register_ssh_private_key(priv_raw)
 
-        priv_path = os.path.join(GIT_SSH_MANAGED_DIR, k_name)
-        write_agent_file(priv_path, priv_raw, mode=0o600, dir_mode=0o700)
-        expected_basenames.add(k_name)
-        key_paths[k_name] = priv_path
-        key_names.append(k_name)
+        pub_raw = (k.get("publicKey") or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+        pub_norm = pub_raw or derive_public_key_from_private_text(priv_raw)
 
-        pub_raw = k.get("publicKey") or ""
-        if pub_raw.strip():
-            pub_norm = pub_raw.replace("\r\n", "\n").replace("\r", "\n").strip()
+        if is_agent_proxy:
+            if not pub_norm:
+                raise ValueError(f"Failed to derive public key for Git SSH key '{k_name}' in agent-proxy mode.")
+            blob_hex = extract_pubkey_blob_hex(pub_norm)
+            if not blob_hex:
+                raise ValueError(f"Invalid public key material for Git SSH key '{k_name}'.")
             pub_basename = f"{k_name}.pub"
-            write_agent_file(
-                os.path.join(GIT_SSH_MANAGED_DIR, pub_basename),
-                pub_norm + "\n",
-                mode=0o644,
-                dir_mode=0o700,
-            )
+            pub_path = os.path.join(GIT_SSH_MANAGED_DIR, pub_basename)
+            write_agent_file(pub_path, pub_norm + "\n", mode=0o644, dir_mode=0o700)
             expected_basenames.add(pub_basename)
+            key_paths[k_name] = pub_path
             pub_keys[k_name] = pub_norm
+            key_names.append(k_name)
+            agent_proxy_keys.append({"name": k_name, "privateKey": priv_raw, "blobHex": blob_hex})
+        else:
+            priv_path = os.path.join(GIT_SSH_MANAGED_DIR, k_name)
+            write_agent_file(priv_path, priv_raw, mode=0o600, dir_mode=0o700)
+            expected_basenames.add(k_name)
+            key_paths[k_name] = priv_path
+            key_names.append(k_name)
+            if pub_raw:
+                pub_basename = f"{k_name}.pub"
+                write_agent_file(
+                    os.path.join(GIT_SSH_MANAGED_DIR, pub_basename),
+                    pub_norm + "\n",
+                    mode=0o644,
+                    dir_mode=0o700,
+                )
+                expected_basenames.add(pub_basename)
+                pub_keys[k_name] = pub_norm
 
         cert_raw = k.get("certificate") or ""
         if cert_raw.strip():
@@ -1165,6 +1209,7 @@ def seed_git(cfg, prev_meta):
         update_gitconfig_include(False)
 
     return {
+        "mode": "agent-proxy" if is_agent_proxy else "files",
         "keys": key_names,
         "hosts": host_names,
         "knownHostsCount": len(cleaned_kh),
@@ -1172,6 +1217,7 @@ def seed_git(cfg, prev_meta):
         "userEmail": user_email,
         "managedDir": GIT_SSH_MANAGED_DIR,
         "updatedAt": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "_agentProxyKeys": agent_proxy_keys,
     }
 
 def clear_git(prev_meta):
@@ -1192,6 +1238,9 @@ def clear_git(prev_meta):
 def seed_ssh(cfg, prev_meta):
     ensure_agent_dir(SSH_DIR, mode=0o700)
     ensure_agent_dir(SSH_MANAGED_DIR, mode=0o700)
+
+    is_agent_proxy = (cfg.get("mode") == "agent-proxy")
+    agent_proxy_keys = []
 
     keys_raw = cfg.get("keys") or []
     if isinstance(keys_raw, dict):
@@ -1215,22 +1264,37 @@ def seed_ssh(cfg, prev_meta):
         priv_raw = k["privateKey"].replace("\r\n", "\n").replace("\r", "\n").rstrip("\n") + "\n"
         register_ssh_private_key(priv_raw)
 
-        priv_path = os.path.join(SSH_MANAGED_DIR, k_name)
-        write_agent_file(priv_path, priv_raw, mode=0o600, dir_mode=0o700)
-        expected_basenames.add(k_name)
-        key_paths[k_name] = priv_path
-        key_names.append(k_name)
+        pub_raw = (k.get("publicKey") or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+        pub_norm = pub_raw or derive_public_key_from_private_text(priv_raw)
 
-        pub_raw = k.get("publicKey") or ""
-        if pub_raw.strip():
+        if is_agent_proxy:
+            if not pub_norm:
+                raise ValueError(f"Failed to derive public key for SSH key '{k_name}' in agent-proxy mode.")
+            blob_hex = extract_pubkey_blob_hex(pub_norm)
+            if not blob_hex:
+                raise ValueError(f"Invalid public key material for SSH key '{k_name}'.")
             pub_basename = f"{k_name}.pub"
-            write_agent_file(
-                os.path.join(SSH_MANAGED_DIR, pub_basename),
-                pub_raw.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n") + "\n",
-                mode=0o644,
-                dir_mode=0o700,
-            )
+            pub_path = os.path.join(SSH_MANAGED_DIR, pub_basename)
+            write_agent_file(pub_path, pub_norm + "\n", mode=0o644, dir_mode=0o700)
             expected_basenames.add(pub_basename)
+            key_paths[k_name] = pub_path
+            key_names.append(k_name)
+            agent_proxy_keys.append({"name": k_name, "privateKey": priv_raw, "blobHex": blob_hex})
+        else:
+            priv_path = os.path.join(SSH_MANAGED_DIR, k_name)
+            write_agent_file(priv_path, priv_raw, mode=0o600, dir_mode=0o700)
+            expected_basenames.add(k_name)
+            key_paths[k_name] = priv_path
+            key_names.append(k_name)
+            if pub_raw:
+                pub_basename = f"{k_name}.pub"
+                write_agent_file(
+                    os.path.join(SSH_MANAGED_DIR, pub_basename),
+                    pub_norm + "\n",
+                    mode=0o644,
+                    dir_mode=0o700,
+                )
+                expected_basenames.add(pub_basename)
 
         cert_raw = k.get("certificate") or ""
         if cert_raw.strip():
@@ -1347,11 +1411,13 @@ def seed_ssh(cfg, prev_meta):
     merge_ssh_config(hosts_block, defaults_block)
 
     return {
+        "mode": "agent-proxy" if is_agent_proxy else "files",
         "keys": key_names,
         "hosts": host_names,
         "knownHostsCount": len(cleaned_kh),
         "managedDir": SSH_MANAGED_DIR,
         "updatedAt": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "_agentProxyKeys": agent_proxy_keys,
     }
 
 def clear_ssh(prev_meta):
@@ -1486,6 +1552,95 @@ def cancel_ttl_timer(svc_name):
         if suffix == ".timer" or active_unit != f"{unit}.service":
             subprocess.run(["systemctl", "reset-failed", f"{unit}{suffix}"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+SSH_AGENT_DIR = "/run/box-root/ssh-agent"
+SSH_AGENT_UPSTREAM_SOCK = os.path.join(SSH_AGENT_DIR, "upstream.sock")
+SSH_AGENT_STATE_FILE = os.path.join(SSH_AGENT_DIR, "root-keys.json")
+SSH_AGENT_ALLOWLIST_FILE = "/etc/wsl-agent-sandbox/ssh-agent-allowlist.json"
+SSH_AGENT_ENV_FILE = os.path.join(ENV_D_DIR, "90-ssh-agent-proxy.env")
+
+def load_root_ssh_agent_services():
+    if not os.path.isfile(SSH_AGENT_STATE_FILE):
+        return {}
+    try:
+        with open(SSH_AGENT_STATE_FILE, "r", encoding="utf-8") as sf:
+            data = json.load(sf)
+        svcs = data.get("services", {}) if isinstance(data, dict) else {}
+        return svcs if isinstance(svcs, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+def sync_root_ssh_agent_state(agent_services_map):
+    has_systemd = os.path.isdir("/run/systemd/system")
+    if os.path.isdir(SSH_AGENT_DIR):
+        for entry in os.listdir(SSH_AGENT_DIR):
+            if entry.startswith("keys-"):
+                shutil.rmtree(os.path.join(SSH_AGENT_DIR, entry), ignore_errors=True)
+
+    all_keys = []
+    all_blobs = set()
+    cleaned_map = {}
+    for s_name, k_list in (agent_services_map or {}).items():
+        if not isinstance(k_list, list) or not k_list:
+            continue
+        valid_items = []
+        for item in k_list:
+            if isinstance(item, dict) and item.get("privateKey") and item.get("blobHex"):
+                register_ssh_private_key(item["privateKey"])
+                valid_items.append({"name": item.get("name", ""), "privateKey": item["privateKey"], "blobHex": item["blobHex"].lower()})
+                all_keys.append(item["privateKey"])
+                all_blobs.add(item["blobHex"].lower())
+        if valid_items:
+            cleaned_map[s_name] = valid_items
+
+    env = dict(os.environ, SSH_AUTH_SOCK=SSH_AGENT_UPSTREAM_SOCK)
+    if all_keys:
+        os.makedirs("/run/box-root", mode=0o700, exist_ok=True)
+        os.makedirs(SSH_AGENT_DIR, mode=0o700, exist_ok=True)
+        os.chmod(SSH_AGENT_DIR, 0o700)
+
+        tmp_state = f"{SSH_AGENT_STATE_FILE}.tmp.{os.getpid()}"
+        with open(tmp_state, "w", encoding="utf-8") as sf:
+            json.dump({"services": cleaned_map}, sf, indent=2)
+        os.chmod(tmp_state, 0o600)
+        os.replace(tmp_state, SSH_AGENT_STATE_FILE)
+
+        probe = subprocess.run(["ssh-add", "-l"], env=env, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if probe.returncode not in (0, 1):
+            remove_file_quiet(SSH_AGENT_UPSTREAM_SOCK)
+            subprocess.run(["ssh-agent", "-a", SSH_AGENT_UPSTREAM_SOCK], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            os.chmod(SSH_AGENT_UPSTREAM_SOCK, 0o600)
+
+        subprocess.run(["ssh-add", "-D"], env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for priv_key in all_keys:
+            add_proc = subprocess.run(["ssh-add", "-"], input=priv_key, text=True, env=env, check=False, capture_output=True)
+            if add_proc.returncode != 0:
+                raise RuntimeError(f"ssh-add failed loading key into root ssh-agent: {(add_proc.stderr or add_proc.stdout).strip()}")
+
+        os.makedirs(os.path.dirname(SSH_AGENT_ALLOWLIST_FILE), mode=0o755, exist_ok=True)
+        tmp_al = f"{SSH_AGENT_ALLOWLIST_FILE}.tmp.{os.getpid()}"
+        with open(tmp_al, "w", encoding="utf-8") as af:
+            json.dump({"allowedKeyBlobsHex": sorted(all_blobs)}, af, indent=2)
+        os.chmod(tmp_al, 0o600)
+        os.replace(tmp_al, SSH_AGENT_ALLOWLIST_FILE)
+
+        write_agent_file(SSH_AGENT_ENV_FILE, 'export SSH_AUTH_SOCK="/run/ssh-agent-proxy/agent.sock"\n', mode=0o600)
+        if has_systemd:
+            subprocess.run(["systemctl", "daemon-reload"], check=True)
+            subprocess.run(["systemctl", "enable", "ssh-agent-proxy.service"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["systemctl", "restart", "ssh-agent-proxy.service"], check=True)
+    else:
+        if os.path.exists(SSH_AGENT_UPSTREAM_SOCK):
+            subprocess.run(["ssh-add", "-D"], env=env, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["pkill", "-f", SSH_AGENT_UPSTREAM_SOCK], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            remove_file_quiet(SSH_AGENT_UPSTREAM_SOCK)
+        remove_file_quiet(SSH_AGENT_STATE_FILE)
+        remove_file_quiet(SSH_AGENT_ALLOWLIST_FILE)
+        remove_file_quiet(SSH_AGENT_ENV_FILE)
+        if has_systemd:
+            subprocess.run(["systemctl", "daemon-reload"], check=False)
+            subprocess.run(["systemctl", "stop", "ssh-agent-proxy.service"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["systemctl", "disable", "ssh-agent-proxy.service"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
 # ------------------------------------------------------------------
 # Modes: --status, --clear, --apply
 # ------------------------------------------------------------------
@@ -1560,6 +1715,8 @@ if args.clear:
     cleared_any = False
     proxy_routes_state = load_credential_proxy_routes()
     proxy_changed = False
+    ssh_agent_state = load_root_ssh_agent_services()
+    ssh_agent_changed = False
     for name in targets:
         if name not in CLEARERS:
             print(f"[seed-secrets] [FAIL] Unknown service: {name}", file=sys.stderr)
@@ -1570,6 +1727,10 @@ if args.clear:
         if name in proxy_routes_state:
             proxy_routes_state.pop(name, None)
             proxy_changed = True
+        if name in ("git", "ssh"):
+            if name in ssh_agent_state:
+                ssh_agent_state.pop(name, None)
+            ssh_agent_changed = True
         if name in svcs:
             svcs.pop(name, None)
             print(f"[seed-secrets] [CLEARED] {name}")
@@ -1582,6 +1743,11 @@ if args.clear:
         if not args.services.strip():
             proxy_routes_state = {}
         sync_credential_proxy(proxy_routes_state)
+
+    if ssh_agent_changed or (not args.services.strip() and (os.path.isfile(SSH_AGENT_ALLOWLIST_FILE) or os.path.exists(SSH_AGENT_UPSTREAM_SOCK))):
+        if not args.services.strip():
+            ssh_agent_state = {}
+        sync_root_ssh_agent_state(ssh_agent_state)
 
     rebuild_secrets_env()
     if svcs:
@@ -1615,6 +1781,7 @@ ensure_agent_dir(STATE_DIR, mode=0o700)
 state = load_state()
 state_services = state.get("services", {})
 merged_proxy_routes = load_credential_proxy_routes()
+merged_ssh_agent_services = load_root_ssh_agent_services()
 
 failures = 0
 seeded_count = 0
@@ -1626,6 +1793,12 @@ for svc_name, svc_cfg in services_payload.items():
         continue
     try:
         meta = SEEDERS[svc_name](svc_cfg, state_services.get(svc_name))
+        agent_proxy_keys = meta.pop("_agentProxyKeys", None)
+        if svc_name in ("ssh", "git"):
+            if isinstance(svc_cfg, dict) and svc_cfg.get("mode") == "agent-proxy" and agent_proxy_keys:
+                merged_ssh_agent_services[svc_name] = agent_proxy_keys
+            else:
+                merged_ssh_agent_services.pop(svc_name, None)
         svc_ttl = int(service_ttls.get(svc_name, ttl_seconds) or 0)
         cancel_ttl_timer(svc_name)
         if svc_ttl > 0:
@@ -1676,9 +1849,11 @@ if prune:
                 CLEARERS[svc_name](state_services.get(svc_name))
             state_services.pop(svc_name, None)
             merged_proxy_routes.pop(svc_name, None)
+            merged_ssh_agent_services.pop(svc_name, None)
             print(f"[seed-secrets] [PRUNED] Removed previously seeded {svc_name}")
 
 sync_credential_proxy(merged_proxy_routes)
+sync_root_ssh_agent_state(merged_ssh_agent_services)
 
 rebuild_secrets_env()
 state["services"] = state_services
