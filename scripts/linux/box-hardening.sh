@@ -231,6 +231,10 @@ compiled_docker_policy = {
     "denyEndpoints": docker_cfg.get("denyEndpoints", [
         "/plugins", "/swarm", "/services", "/nodes", "/secrets", "/configs", "/tasks"
     ]),
+    "allowPortBindings": bool(docker_cfg.get("allowPortBindings", True)),
+    "forceLoopbackPortBindings": bool(docker_cfg.get("forceLoopbackPortBindings", True)),
+    "allowedPublishedPorts": [int(p) for p in docker_cfg.get("allowedPublishedPorts", [])],
+    "forceInternalNetwork": bool(docker_cfg.get("forceInternalNetwork", False)),
     "bindMappings": bind_mappings,
 }
 if is_mountpoint(private_wsl_mnt):
@@ -281,6 +285,9 @@ if pkgs.get("installRust", False):
 
 verify_policy = {
     "dockerEnabled": bool(docker_cfg.get("enabled", True)),
+    "allowPortBindings": bool(docker_cfg.get("allowPortBindings", True)),
+    "forceLoopbackPortBindings": bool(docker_cfg.get("forceLoopbackPortBindings", True)),
+    "forceInternalNetwork": bool(docker_cfg.get("forceInternalNetwork", False)),
     "expectedTools": expected_tools,
     "checkDockerCompose": bool(pkgs.get("installDockerCli", True)),
     "checkAzureDevopsExt": bool(pkgs.get("installAzureDevopsCli", False)),

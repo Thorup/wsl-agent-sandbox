@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -74,8 +75,35 @@ func NewPolicyProxy(upstreamSocket string, initial *Policy, logger *log.Logger) 
 	}
 	pp.reverseProxy = rp
 	pp.upstreamClient = &http.Client{Transport: transport}
+	if initial != nil {
+		initial.networkChecker = pp.checkNetworkInternal
+	}
 	go pp.reconcileLoop()
 	return pp
+}
+
+func (pp *PolicyProxy) checkNetworkInternal(nameOrID string) (bool, error) {
+	reqCtx, cancel := context.WithTimeout(pp.ctx, 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, "http://docker/networks/"+url.PathEscape(nameOrID), nil)
+	if err != nil {
+		return false, err
+	}
+	resp, err := pp.upstreamClient.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("upstream /networks/%s returned status %d", nameOrID, resp.StatusCode)
+	}
+	var netInfo struct {
+		Internal bool `json:"Internal"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1024*1024)).Decode(&netInfo); err != nil {
+		return false, err
+	}
+	return netInfo.Internal, nil
 }
 
 func (pp *PolicyProxy) Close() {
@@ -185,8 +213,13 @@ func (pp *PolicyProxy) reconcileLoop() {
 }
 
 func (pp *PolicyProxy) UpdatePolicy(next *Policy) {
-	if next != nil && next.bindManager == nil {
-		next.bindManager = pp.bindManager
+	if next != nil {
+		if next.bindManager == nil {
+			next.bindManager = pp.bindManager
+		}
+		if next.networkChecker == nil {
+			next.networkChecker = pp.checkNetworkInternal
+		}
 	}
 	pp.policy.Store(next)
 }
@@ -320,6 +353,10 @@ func needsJSONBodyInspection(method, rawPath string) bool {
 	case norm == "/containers/create":
 		return true
 	case norm == "/volumes/create":
+		return true
+	case norm == "/networks/create":
+		return true
+	case hasPrefixSuffix(norm, "/networks/", "/connect"):
 		return true
 	case hasPrefixSuffix(norm, "/containers/", "/update"):
 		return true

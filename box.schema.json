@@ -172,6 +172,30 @@
           "items": {
             "type": "string"
           }
+        },
+        "allowPortBindings": {
+          "type": "boolean",
+          "default": true,
+          "description": "Allow containers to publish ports to the Windows host via HostConfig.PortBindings."
+        },
+        "forceLoopbackPortBindings": {
+          "type": "boolean",
+          "default": true,
+          "description": "When PortBindings are allowed, force HostIp to 127.0.0.1 and reject 0.0.0.0 or LAN bindings."
+        },
+        "allowedPublishedPorts": {
+          "type": "array",
+          "description": "Optional allowlist of host ports containers are permitted to publish (empty = any valid port).",
+          "items": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          }
+        },
+        "forceInternalNetwork": {
+          "type": "boolean",
+          "default": false,
+          "description": "Restrict containers from using Docker Desktop's default bridge network (prevents container egress to host.docker.internal/Windows host/LAN)."
         }
       }
     },
