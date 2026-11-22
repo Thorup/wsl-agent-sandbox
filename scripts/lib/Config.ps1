@@ -268,6 +268,32 @@ function Assert-BoxConfigValid {
             }
         }
     }
+
+    # Validate optional 'resources' systemd per-UID quotas
+    if ($Config.PSObject.Properties['resources'] -and $null -ne $Config.resources) {
+        $allowedResProps = @('memoryMax', 'cpuQuota', 'tasksMax')
+        foreach ($prop in $Config.resources.PSObject.Properties) {
+            if ($prop.Name -notin $allowedResProps) {
+                throw "Unknown property '$($prop.Name)' in resources. Allowed: $($allowedResProps -join ', ')."
+            }
+        }
+        if ($Config.resources.PSObject.Properties['memoryMax'] -and $null -ne $Config.resources.memoryMax) {
+            if ([string]$Config.resources.memoryMax -notmatch '^[1-9][0-9]*[KMGTP]?$') {
+                throw "Invalid resources.memoryMax '$($Config.resources.memoryMax)'. Expected positive size e.g. '8G' or '4096M'."
+            }
+        }
+        if ($Config.resources.PSObject.Properties['cpuQuota'] -and $null -ne $Config.resources.cpuQuota) {
+            if ([string]$Config.resources.cpuQuota -notmatch '^[1-9][0-9]*%$') {
+                throw "Invalid resources.cpuQuota '$($Config.resources.cpuQuota)'. Expected positive percentage e.g. '400%'."
+            }
+        }
+        if ($Config.resources.PSObject.Properties['tasksMax'] -and $null -ne $Config.resources.tasksMax) {
+            $tm = [int]$Config.resources.tasksMax
+            if ($tm -lt 32 -or $tm -gt 65536) {
+                throw "resources.tasksMax ($tm) must be between 32 and 65536."
+            }
+        }
+    }
 }
 
 function Get-WindowsHostIPs {

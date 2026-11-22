@@ -18,7 +18,7 @@
 #Requires -Version 5.1
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('init', 'up', 'apply', 'upgrade', 'doctor', 'seed-secrets', 'clear-secrets', 'register-terminal', 'shell', 'root-shell', 'status', 'verify', 'snapshot', 'restore', 'reset', 'destroy', 'help')]
+    [ValidateSet('init', 'up', 'apply', 'upgrade', 'doctor', 'compact', 'seed-secrets', 'clear-secrets', 'register-terminal', 'shell', 'root-shell', 'status', 'verify', 'snapshot', 'restore', 'reset', 'destroy', 'help')]
     [string]$Command = 'help',
 
     [Parameter(Position = 1)]
@@ -80,6 +80,7 @@ Commands:
                      (optional -Scope apt,agents,toolchains).
   doctor             Run Windows + WSL preflight diagnostics (WSL2, .wslconfig, Docker Desktop,
                      systemd health, VHDX disk size, image cache).
+  compact            Trim free blocks inside WSL (fstrim) and compact the distro's ext4.vhdx.
   seed-secrets [path] Seed or rotate CLI tokens, service accounts, and Git/SSH credentials from a
                      central Windows manifest (default: %USERPROFILE%\.wsl-agent-sandbox\secrets.json)
                      independently of init/apply. Supports -SecretsPath, -Service <names>, -Prune, -DryRun.
@@ -438,6 +439,16 @@ echo "Active nftables table inet wsl_agent_sandbox:"
 nft list table inet wsl_agent_sandbox 2>/dev/null || echo "  (not loaded)"
 '@
     Invoke-WslRootBash -DistroName $distro -Script $statusScript
+    $installDir = Expand-BoxPath -RawPath $Config.installDir -BaseDir $RepoRoot
+    $vhdx = Join-Path $installDir 'ext4.vhdx'
+    if (Test-Path -LiteralPath $vhdx -PathType Leaf) {
+        $sizeGB = [Math]::Round(((Get-Item -LiteralPath $vhdx).Length / 1GB), 2)
+        Write-Host ""
+        Write-Host "VHDX disk footprint: ${sizeGB} GB ($vhdx)"
+    }
+    if ($Config.PSObject.Properties['resources'] -and $null -ne $Config.resources) {
+        Write-Host "Configured agent UID slice quotas: $($Config.resources | ConvertTo-Json -Compress)"
+    }
     foreach ($w in (Get-GlobalWslConfigWarnings)) {
         Write-Warning $w
     }
@@ -709,6 +720,57 @@ function Invoke-Doctor {
     }
 }
 
+function Invoke-Compact {
+    param($Config)
+    $distro = $Config.distroName
+    if (-not (Test-WslDistroExists -DistroName $distro)) {
+        throw "Distro '$distro' does not exist."
+    }
+    $installDir = Expand-BoxPath -RawPath $Config.installDir -BaseDir $RepoRoot
+    $vhdx = Join-Path $installDir 'ext4.vhdx'
+    if (-not (Test-Path -LiteralPath $vhdx -PathType Leaf)) {
+        throw "VHDX file not found at '$vhdx'."
+    }
+    $principal = New-Object System.Security.Principal.WindowsPrincipal([System.Security.Principal.WindowsIdentity]::GetCurrent())
+    if (-not $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw "VHDX compaction requires an elevated Administrator PowerShell session (Optimize-VHD and diskpart require Administrator privileges)."
+    }
+
+    $beforeBytes = (Get-Item -LiteralPath $vhdx).Length
+    Write-Host "[compact] Running fstrim inside '$distro'..."
+    & wsl.exe -d $distro -u root -- fstrim -av
+    if ($LASTEXITCODE -ne 0) {
+        throw "fstrim inside '$distro' failed with exit code $LASTEXITCODE."
+    }
+    Write-Host "[compact] Terminating '$distro' before VHDX compaction..."
+    & wsl.exe --terminate $distro | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "wsl --terminate '$distro' failed with exit code $LASTEXITCODE."
+    }
+    Start-Sleep -Seconds 2
+
+    if (Get-Command Optimize-VHD -ErrorAction SilentlyContinue) {
+        Write-Host "[compact] Compacting '$vhdx' via Optimize-VHD..."
+        Optimize-VHD -Path $vhdx -Mode Full
+    } else {
+        Write-Host "[compact] Optimize-VHD unavailable; compacting '$vhdx' via diskpart..."
+        $dpScript = "select vdisk file=""$vhdx""`r`nattach vdisk readonly`r`ncompact vdisk`r`ndetach vdisk"
+        $tmpDp = Join-Path ([System.IO.Path]::GetTempPath()) ("wsl-compact-" + [Guid]::NewGuid().ToString('N').Substring(0, 8) + ".txt")
+        try {
+            [System.IO.File]::WriteAllText($tmpDp, $dpScript, [System.Text.Encoding]::Unicode)
+            $dpOut = (& diskpart.exe /s $tmpDp 2>&1 | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0) {
+                throw "diskpart compaction failed (exit code $LASTEXITCODE): $dpOut"
+            }
+        } finally {
+            Remove-Item -LiteralPath $tmpDp -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $afterBytes = (Get-Item -LiteralPath $vhdx).Length
+    $savedMB = [Math]::Round(($beforeBytes - $afterBytes) / 1MB, 1)
+    Write-Host ("[compact] Done: {0:N2} GB -> {1:N2} GB (reclaimed {2:N1} MB)." -f ($beforeBytes / 1GB), ($afterBytes / 1GB), $savedMB)
+}
+
 function Invoke-Destroy {
     param(
         $Config,
@@ -767,6 +829,9 @@ switch ($Command) {
     }
     'doctor' {
         Invoke-Doctor -Config $cfg
+    }
+    'compact' {
+        Invoke-Compact -Config $cfg
     }
     'seed-secrets' {
         Invoke-SeedSecrets -Config $cfg -SecretsPath $SecretsPath -Service $Service -Prune:$Prune -DryRun:$DryRun
