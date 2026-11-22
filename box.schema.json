@@ -140,6 +140,19 @@
           "type": "boolean",
           "default": true,
           "description": "When true, rate-limit log blocked outbound agent connections to dmesg/journald before dropping."
+        },
+        "egressMode": {
+          "type": "string",
+          "enum": ["open", "allowlist"],
+          "default": "open",
+          "description": "Public internet egress mode for the agent user: 'open' (default) or 'allowlist' (requires HTTP/HTTPS traffic through root-owned egress proxy)."
+        },
+        "allowedDomains": {
+          "type": "array",
+          "description": "Allowlisted domains (e.g., 'api.github.com', '*.anthropic.com') or presets ('llm-apis', 'github', 'npm', 'pypi', 'apt') when egressMode is 'allowlist'.",
+          "items": {
+            "type": "string"
+          }
         }
       }
     },

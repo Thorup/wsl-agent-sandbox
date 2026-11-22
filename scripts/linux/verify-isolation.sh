@@ -128,10 +128,60 @@ else
   warn "Could not determine default gateway IP to probe Windows host"
 fi
 
-if curl -fsS --max-time 8 https://example.com >/dev/null 2>&1; then
-  pass "Outbound HTTPS internet access works"
+VERIFY_POLICY_FILE="/etc/wsl-agent-sandbox/verify-policy.json"
+EGRESS_MODE="open"
+ALLOWED_DOMAIN_COUNT=0
+ALLOWLIST_PROBE_URL=""
+if [[ -r "${VERIFY_POLICY_FILE}" ]]; then
+  EGRESS_MODE="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("egressMode", "open"))' "${VERIFY_POLICY_FILE}" 2>/dev/null || echo "open")"
+  ALLOWED_DOMAIN_COUNT="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d.get("allowedDomains", [])))' "${VERIFY_POLICY_FILE}" 2>/dev/null || echo "0")"
+  ALLOWLIST_PROBE_URL="$(python3 -c 'import json,sys
+PRESETS = {"llm-apis": "https://api.openai.com", "github": "https://github.com", "npm": "https://registry.npmjs.org", "pypi": "https://pypi.org", "apt": "http://archive.ubuntu.com/ubuntu/dists/resolute/Release"}
+d = json.load(open(sys.argv[1]))
+for item in d.get("allowedDomains", []):
+    s = str(item).strip().lower()
+    if s in PRESETS:
+        print(PRESETS[s]); sys.exit(0)
+    if s and not s.startswith("*"):
+        print(f"https://{s}"); sys.exit(0)
+' "${VERIFY_POLICY_FILE}" 2>/dev/null || true)"
+fi
+
+if [[ "${EGRESS_MODE}" == "allowlist" ]]; then
+  if curl --noproxy '*' -fsS --max-time 4 https://example.com >/dev/null 2>&1; then
+    fail "Direct non-proxy internet access bypassed egress allowlist firewall!"
+  else
+    pass "Direct internet egress blocked in allowlist mode"
+  fi
+
+  if nc -z -u -w 2 1.1.1.1 53 >/dev/null 2>&1 && dig +short +time=2 +tries=1 @1.1.1.1 example.com >/dev/null 2>&1; then
+    fail "Direct external DNS query bypassed allowlist firewall!"
+  else
+    pass "Direct external DNS blocked in allowlist mode"
+  fi
+
+  BLOCK_CODE="$(curl --proxy http://127.0.0.1:3128 -s -o /dev/null -w '%{http_connect}' --max-time 6 https://blocked-verify.example.invalid 2>/dev/null || true)"
+  if [[ "${BLOCK_CODE}" == "403" ]]; then
+    pass "Egress allowlist proxy blocked non-allowlisted domain (HTTP 403)"
+  else
+    fail "Expected egress proxy HTTP 403 for blocked domain, got status ${BLOCK_CODE}"
+  fi
+
+  if [[ "${ALLOWED_DOMAIN_COUNT}" -gt 0 ]] && [[ -n "${ALLOWLIST_PROBE_URL}" ]]; then
+    if curl --proxy http://127.0.0.1:3128 -fsSI --max-time 8 "${ALLOWLIST_PROBE_URL}" >/dev/null 2>&1 || curl --proxy http://127.0.0.1:3128 -sS -o /dev/null -w '%{http_code}' --max-time 8 "${ALLOWLIST_PROBE_URL}" | grep -qE '^[234][0-9]{2}$'; then
+      pass "Allowlisted egress works via proxy (${ALLOWLIST_PROBE_URL})"
+    else
+      fail "Allowlisted egress failed via proxy (${ALLOWLIST_PROBE_URL})"
+    fi
+  else
+    pass "Strict allowlist active (0 allowedDomains configured)"
+  fi
 else
-  fail "Outbound HTTPS internet access failed"
+  if curl -fsS --max-time 8 https://example.com >/dev/null 2>&1; then
+    pass "Outbound HTTPS internet access works"
+  else
+    fail "Outbound HTTPS internet access failed"
+  fi
 fi
 
 # ------------------------------------------------------------------

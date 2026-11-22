@@ -123,6 +123,19 @@ Assert-Throws "Rejects non-boolean string network.logDrops = 'false'" {
     Assert-BoxConfigValid -Config $c
 } 'must be a boolean'
 
+# Validate egressMode and allowedDomains
+$allowlistCfg = Copy-Config $baseCfg
+$allowlistCfg.network | Add-Member -NotePropertyName 'egressMode' -NotePropertyValue 'allowlist'
+$allowlistCfg.network | Add-Member -NotePropertyName 'allowedDomains' -NotePropertyValue @('llm-apis', 'api.github.com')
+Assert-BoxConfigValid -Config $allowlistCfg
+Assert-True "Accepts valid network.egressMode=allowlist with allowedDomains" $true
+
+Assert-Throws "Rejects invalid network.egressMode" {
+    $c = Copy-Config $baseCfg
+    $c.network | Add-Member -NotePropertyName 'egressMode' -NotePropertyValue 'deny-all'
+    Assert-BoxConfigValid -Config $c
+} 'egressMode'
+
 # Reject unsafe docker.allowBindPrefixes
 Assert-Throws "Rejects /mnt/c in docker.allowBindPrefixes" {
     $c = Copy-Config $baseCfg

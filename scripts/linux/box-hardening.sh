@@ -291,6 +291,8 @@ verify_policy = {
     "allowPortBindings": bool(docker_cfg.get("allowPortBindings", True)),
     "forceLoopbackPortBindings": bool(docker_cfg.get("forceLoopbackPortBindings", True)),
     "forceInternalNetwork": bool(docker_cfg.get("forceInternalNetwork", False)),
+    "egressMode": policy.get("network", {}).get("egressMode", "open"),
+    "allowedDomains": policy.get("network", {}).get("allowedDomains", []),
     "expectedTools": expected_tools,
     "checkDockerCompose": bool(pkgs.get("installDockerCli", True)),
     "checkAzureDevopsExt": bool(pkgs.get("installAzureDevopsCli", False)),
@@ -347,6 +349,8 @@ if os.path.isfile(host_ips_file):
 
 net_cfg = policy.get("network", {})
 block_host_and_lan = bool(net_cfg.get("blockHostAndLan", True))
+egress_mode = net_cfg.get("egressMode", "open")
+allowed_domains = net_cfg.get("allowedDomains", [])
 blocked_v4 = []
 blocked_v6 = ["fc00::/7", "fe80::/10"]
 for cidr in net_cfg.get("blockedCidrs", []):
@@ -355,6 +359,21 @@ for cidr in net_cfg.get("blockedCidrs", []):
         blocked_v4.append(str(net))
     else:
         blocked_v6.append(str(net))
+
+egress_cfg_file = "/etc/wsl-agent-sandbox/egress-allowlist.json"
+egress_cfg_tmp = f"{egress_cfg_file}.tmp.{os.getpid()}"
+with open(egress_cfg_tmp, "w", encoding="utf-8") as f:
+    json.dump({
+        "egressMode": egress_mode,
+        "allowedDomains": allowed_domains,
+        "blockHostAndLan": block_host_and_lan,
+        "hostIps": sorted(host_v4 | host_v6),
+        "blockedCidrs": sorted(set(blocked_v4 + blocked_v6)),
+        "allowedPorts": [443],
+        "allowedHttpPorts": [80, 443],
+    }, f, indent=2)
+os.chmod(egress_cfg_tmp, 0o600)
+os.replace(egress_cfg_tmp, egress_cfg_file)
 
 allowed_tcp = sorted({int(p["port"]) for p in net_cfg.get("allowedHostPorts", []) if p.get("protocol") == "tcp"})
 allowed_udp = sorted({int(p["port"]) for p in net_cfg.get("allowedHostPorts", []) if p.get("protocol") == "udp"})
@@ -491,14 +510,17 @@ lines.extend([
     '        oifname "lo" accept',
 ])
 
-if dns_v4:
-    elems = ", ".join(sorted(dns_v4))
-    lines.append(f"        ip daddr {{ {elems} }} udp dport 53 accept")
-    lines.append(f"        ip daddr {{ {elems} }} tcp dport 53 accept")
-if dns_v6:
-    elems = ", ".join(sorted(dns_v6))
-    lines.append(f"        ip6 daddr {{ {elems} }} udp dport 53 accept")
-    lines.append(f"        ip6 daddr {{ {elems} }} tcp dport 53 accept")
+# Only permit direct agent UDP/TCP DNS queries in 'open' egress mode; in 'allowlist' mode
+# egress-proxy.py performs root-side DNS resolution, preventing direct DNS tunneling exfiltration.
+if egress_mode != "allowlist":
+    if dns_v4:
+        elems = ", ".join(sorted(dns_v4))
+        lines.append(f"        ip daddr {{ {elems} }} udp dport 53 accept")
+        lines.append(f"        ip daddr {{ {elems} }} tcp dport 53 accept")
+    if dns_v6:
+        elems = ", ".join(sorted(dns_v6))
+        lines.append(f"        ip6 daddr {{ {elems} }} udp dport 53 accept")
+        lines.append(f"        ip6 daddr {{ {elems} }} tcp dport 53 accept")
 
 if allowed_tcp:
     ports = ", ".join(str(p) for p in allowed_tcp)
@@ -531,6 +553,10 @@ if block_host_and_lan:
     if blocked_v6:
         cidrs = ", ".join(sorted(set(blocked_v6)))
         lines.append(f"        ip6 daddr {{ {cidrs} }} {drop_action}")
+
+if egress_mode == "allowlist":
+    # Loopback (127.0.0.1:3128 egress-proxy) is already permitted above via 'oifname "lo" accept'.
+    lines.append("        drop")
 
 lines.extend([
     "    }",

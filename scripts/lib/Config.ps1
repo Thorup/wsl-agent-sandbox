@@ -413,6 +413,18 @@ function Assert-BoxConfigValid {
             throw "network.logDrops must be a boolean."
         }
     }
+    if ($Config.network.PSObject.Properties['egressMode'] -and $Config.network.egressMode) {
+        if ($Config.network.egressMode -notin @('open', 'allowlist')) {
+            throw "Invalid network.egressMode '$($Config.network.egressMode)'. Must be 'open' or 'allowlist'."
+        }
+    }
+    if ($Config.network.PSObject.Properties['allowedDomains'] -and $null -ne $Config.network.allowedDomains) {
+        foreach ($dom in @($Config.network.allowedDomains)) {
+            if (-not $dom -or $dom -match '\s') {
+                throw "Invalid network.allowedDomains entry '$dom'."
+            }
+        }
+    }
 
     # Validate docker
     if (-not $Config.docker) {
