@@ -431,8 +431,16 @@ if slice_lines:
     with open(dropin_path, "w", encoding="utf-8") as f:
         f.write("[Slice]\n" + "\n".join(slice_lines) + "\n")
     os.chmod(dropin_path, 0o644)
+    if os.path.isdir("/run/systemd/system"):
+        r = run(["systemctl", "daemon-reload"], check=False)
+        if r.returncode != 0:
+            print(f"[box-hardening] WARNING: systemctl daemon-reload failed: {r.stderr.strip()}", file=sys.stderr)
     print(f"[box-hardening] Configured {dropin_path}: {', '.join(slice_lines)}")
 elif os.path.exists(dropin_path):
     os.remove(dropin_path)
+    if os.path.isdir("/run/systemd/system"):
+        r = run(["systemctl", "daemon-reload"], check=False)
+        if r.returncode != 0:
+            print(f"[box-hardening] WARNING: systemctl daemon-reload failed: {r.stderr.strip()}", file=sys.stderr)
     print(f"[box-hardening] Removed {dropin_path} (no resources quota configured).")
 PYEOF

@@ -325,6 +325,24 @@ Assert-Throws "Rejects invalid resources.memoryMax format" {
     Assert-BoxConfigValid -Config $c
 } 'Invalid resources\.memoryMax'
 
+Assert-Throws "Rejects zero resources.memoryMax ('0')" {
+    $c = Copy-Config $baseCfg
+    $c | Add-Member -NotePropertyName 'resources' -NotePropertyValue ([pscustomobject]@{ memoryMax = '0' })
+    Assert-BoxConfigValid -Config $c
+} 'Invalid resources\.memoryMax'
+
+Assert-Throws "Rejects zero resources.cpuQuota ('0%')" {
+    $c = Copy-Config $baseCfg
+    $c | Add-Member -NotePropertyName 'resources' -NotePropertyValue ([pscustomobject]@{ cpuQuota = '0%' })
+    Assert-BoxConfigValid -Config $c
+} 'Invalid resources\.cpuQuota'
+
+Assert-Throws "Rejects unknown property in resources section" {
+    $c = Copy-Config $baseCfg
+    $c | Add-Member -NotePropertyName 'resources' -NotePropertyValue ([pscustomobject]@{ memoryLimit = '4G' })
+    Assert-BoxConfigValid -Config $c
+} 'Unknown property'
+
 Assert-Throws "Rejects out-of-range resources.tasksMax" {
     $c = Copy-Config $baseCfg
     $c | Add-Member -NotePropertyName 'resources' -NotePropertyValue ([pscustomobject]@{ tasksMax = 5 })

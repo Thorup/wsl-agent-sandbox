@@ -731,11 +731,22 @@ function Invoke-Compact {
     if (-not (Test-Path -LiteralPath $vhdx -PathType Leaf)) {
         throw "VHDX file not found at '$vhdx'."
     }
+    $principal = New-Object System.Security.Principal.WindowsPrincipal([System.Security.Principal.WindowsIdentity]::GetCurrent())
+    if (-not $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw "VHDX compaction requires an elevated Administrator PowerShell session (Optimize-VHD and diskpart require Administrator privileges)."
+    }
+
     $beforeBytes = (Get-Item -LiteralPath $vhdx).Length
     Write-Host "[compact] Running fstrim inside '$distro'..."
     & wsl.exe -d $distro -u root -- fstrim -av
+    if ($LASTEXITCODE -ne 0) {
+        throw "fstrim inside '$distro' failed with exit code $LASTEXITCODE."
+    }
     Write-Host "[compact] Terminating '$distro' before VHDX compaction..."
     & wsl.exe --terminate $distro | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "wsl --terminate '$distro' failed with exit code $LASTEXITCODE."
+    }
     Start-Sleep -Seconds 2
 
     if (Get-Command Optimize-VHD -ErrorAction SilentlyContinue) {
@@ -746,8 +757,11 @@ function Invoke-Compact {
         $dpScript = "select vdisk file=""$vhdx""`r`nattach vdisk readonly`r`ncompact vdisk`r`ndetach vdisk"
         $tmpDp = Join-Path ([System.IO.Path]::GetTempPath()) ("wsl-compact-" + [Guid]::NewGuid().ToString('N').Substring(0, 8) + ".txt")
         try {
-            [System.IO.File]::WriteAllText($tmpDp, $dpScript, [System.Text.Encoding]::ASCII)
-            & diskpart.exe /s $tmpDp | Out-Null
+            [System.IO.File]::WriteAllText($tmpDp, $dpScript, [System.Text.Encoding]::Unicode)
+            $dpOut = (& diskpart.exe /s $tmpDp 2>&1 | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0) {
+                throw "diskpart compaction failed (exit code $LASTEXITCODE): $dpOut"
+            }
         } finally {
             Remove-Item -LiteralPath $tmpDp -Force -ErrorAction SilentlyContinue
         }
