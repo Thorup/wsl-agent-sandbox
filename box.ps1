@@ -605,12 +605,23 @@ function Invoke-Doctor {
     $hasFail = $false
 
     # 1. WSL2 availability
-    $null = & wsl.exe --status 2>&1
-    if ($LASTEXITCODE -eq 0) {
-        Write-Host "  [PASS] WSL2 CLI reachable (wsl.exe --status)"
-    } else {
-        Write-Host "  [FAIL] wsl.exe --status failed. Ensure WSL2 is installed and enabled."
+    $wslCmd = Get-Command wsl.exe -ErrorAction SilentlyContinue
+    if (-not $wslCmd) {
+        Write-Host "  [FAIL] wsl.exe not found on PATH. Ensure WSL2 is installed and enabled."
         $hasFail = $true
+    } else {
+        try {
+            $null = & $wslCmd.Source --status 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "  [PASS] WSL2 CLI reachable (wsl.exe --status)"
+            } else {
+                Write-Host "  [FAIL] wsl.exe --status failed (exit code $LASTEXITCODE). Ensure WSL2 is installed and enabled."
+                $hasFail = $true
+            }
+        } catch {
+            Write-Host "  [FAIL] wsl.exe --status error: $($_.Exception.Message)"
+            $hasFail = $true
+        }
     }
 
     # 2. Global .wslconfig checks
@@ -625,15 +636,22 @@ function Invoke-Doctor {
 
     # 3. Distro & systemd checks
     $distro = $Config.distroName
-    if (Test-WslDistroExists -DistroName $distro) {
+    $distroInstalled = $wslCmd -and (Test-WslDistroExists -DistroName $distro)
+    if ($distroInstalled) {
         Write-Host "  [PASS] Distro '$distro' is registered"
-        $sysState = (& wsl.exe -d $distro -u root -- sh -c "systemctl is-system-running 2>/dev/null || echo inactive" | Out-String).Trim()
+        $runningRaw = & $wslCmd.Source --list --quiet --running 2>$null
+        $runningList = @($runningRaw | ForEach-Object { ("$_" -replace "`0", '').Trim() } | Where-Object { $_ })
+        if ($runningList -notcontains $distro) {
+            Write-Host "  [INFO] Distro '$distro' was stopped; waiting for systemd startup..."
+            [void](Wait-WslSystemdReady -DistroName $distro -TimeoutSeconds 45)
+        }
+        $sysState = (& $wslCmd.Source -d $distro -u root -- sh -c "systemctl is-system-running 2>/dev/null || echo inactive" | Out-String).Trim()
         if ($sysState -eq 'running' -or $sysState -eq 'degraded') {
             Write-Host "  [PASS] systemd state: $sysState"
         } else {
             Write-Host "  [WARN] systemd state: $sysState (try '.\box.ps1 up')"
         }
-        $hardenState = (& wsl.exe -d $distro -u root -- sh -c "systemctl is-active box-hardening.service 2>/dev/null || echo inactive" | Out-String).Trim()
+        $hardenState = (& $wslCmd.Source -d $distro -u root -- sh -c "systemctl is-active box-hardening.service 2>/dev/null || echo inactive" | Out-String).Trim()
         if ($hardenState -eq 'active') {
             Write-Host "  [PASS] box-hardening.service is active"
         } else {
@@ -644,13 +662,28 @@ function Invoke-Doctor {
         Write-Host "  [WARN] Distro '$distro' is not installed yet (run '.\box.ps1 init')"
     }
 
-    # 4. Docker Desktop bridge check
+    # 4. Docker Desktop bridge & WSL proxy check
     if ($Config.docker.enabled) {
         $pipes = @(Get-ChildItem '\\.\pipe\' -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'docker_engine' })
         if ($pipes.Count -gt 0) {
             Write-Host "  [PASS] Docker Desktop named pipe (docker_engine) is active"
         } else {
             Write-Host "  [WARN] Docker Desktop is not running (docker.enabled=true). Start Docker Desktop on Windows."
+        }
+        if ($distroInstalled) {
+            $ddSock = (& $wslCmd.Source -d $distro -u root -- sh -c '[ -S /run/box-root/mnt-wsl/box-binds/dd-upstream.sock ] && echo OK || echo MISSING' 2>$null | Out-String).Trim()
+            if ($ddSock -eq 'OK') {
+                Write-Host "  [PASS] Docker upstream socket bridge (dd-upstream.sock) present"
+            } else {
+                Write-Host "  [WARN] Docker upstream socket bridge (dd-upstream.sock) missing (run '.\box.ps1 up' or '.\box.ps1 apply')"
+            }
+            $proxyState = (& $wslCmd.Source -d $distro -u root -- sh -c "systemctl is-active docker-policy-proxy.service 2>/dev/null || echo inactive" | Out-String).Trim()
+            if ($proxyState -eq 'active') {
+                Write-Host "  [PASS] docker-policy-proxy.service is active"
+            } else {
+                Write-Host "  [FAIL] docker-policy-proxy.service is $proxyState (run '.\box.ps1 apply')"
+                $hasFail = $true
+            }
         }
     } else {
         Write-Host "  [PASS] Docker integration disabled per policy (docker.enabled=false)"
