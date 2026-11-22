@@ -79,7 +79,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $scripts = Get-ChildItem -Path box.ps1, scripts, tests -Recurse -Filter *.ps1 | Sort-Object FullName
+          $scripts = Get-ChildItem -Path box.ps1, wsl-sandbox.ps1, scripts, tests -Recurse -Filter *.ps1 | Sort-Object FullName
           $parseErrorCount = 0
           foreach ($file in $scripts) {
             $tokens = $null
@@ -122,7 +122,7 @@ jobs:
             Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
           }
           Import-Module PSScriptAnalyzer -Force
-          $targets = @('box.ps1', 'scripts', 'tests')
+          $targets = @('box.ps1', 'wsl-sandbox.ps1', 'scripts', 'tests')
           $findings = @(foreach ($t in $targets) {
             Invoke-ScriptAnalyzer -Path $t -Recurse -Settings .PSScriptAnalyzerSettings.psd1
           })

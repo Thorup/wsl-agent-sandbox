@@ -32,6 +32,7 @@ cd wsl-agent-sandbox
 
 # 2. Provision Ubuntu 26.04 LTS, build & test the Docker policy proxy, harden, and verify:
 .\box.ps1 init
+# (Or if installed globally via Scoop / packaging/scoop/wsl-agent-sandbox.json: `wsl-sandbox init`)
 
 # 3. Open an interactive shell as the sandboxed agent user:
 .\box.ps1 shell
@@ -215,6 +216,8 @@ Manifest path resolution priority:
 - `.\box.ps1 upgrade` — Update installed `apt` packages, AI agents, and toolchains in place (optional `-Scope apt,agents,toolchains`).
 - `.\box.ps1 doctor` — Run Windows + WSL preflight diagnostics (WSL2, `.wslconfig`, Docker Desktop, systemd, VHDX size, image cache).
 - `.\box.ps1 compact` — Run `fstrim` inside WSL and compact `ext4.vhdx` to reclaim disk space.
+- `.\box.ps1 logs` / `.\box.ps1 audit` — View root-owned security events (`nftables` drops, `docker-policy-proxy` denials, `box-hardening` reloads) filtered by `-Source` and `-Since`.
+- `.\box.ps1 push-repo <path>` / `pull-diff <name>` / `pull-branch <name>` — Transfer git repos via bundle onto native Linux `ext4` (`~/work/<name>`) and pull reviewable branches back without `rw` `/shared` mounts.
 - `.\box.ps1 seed-secrets [path]` — Seed or rotate CLI service tokens and service account credentials from a central Windows manifest (independently of `init`/`apply`); supports `-SecretsPath`, `-Service <names>`, `-Prune`, and `-DryRun`.
 - `.\box.ps1 clear-secrets` — Revoke managed seeded CLI credentials inside WSL (optionally scoped via `-Service <names>`).
 - `.\box.ps1 verify` — Run full red-team isolation audit + Windows ↔ WSL `localhost` web test.

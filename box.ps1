@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Manage the hardened Ubuntu 26.04 LTS WSL2 Agent Sandbox (wsl-agent-sandbox).
 
@@ -18,7 +18,7 @@
 #Requires -Version 5.1
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('init', 'up', 'apply', 'upgrade', 'doctor', 'compact', 'seed-secrets', 'clear-secrets', 'register-terminal', 'shell', 'root-shell', 'status', 'verify', 'snapshot', 'restore', 'reset', 'destroy', 'help')]
+    [ValidateSet('init', 'up', 'apply', 'upgrade', 'doctor', 'compact', 'logs', 'audit', 'list', 'push-repo', 'pull-diff', 'pull-branch', 'seed-secrets', 'clear-secrets', 'register-terminal', 'shell', 'root-shell', 'status', 'verify', 'snapshot', 'restore', 'reset', 'destroy', 'help')]
     [string]$Command = 'help',
 
     [Parameter(Position = 1)]
@@ -46,21 +46,56 @@ param(
 
     [switch]$Unregister,
 
-    [string[]]$Scope = @('all')
+    [string[]]$Scope = @('all'),
+
+    [ValidateSet('all', 'docker', 'network', 'hardening')]
+    [string]$Source = 'all',
+
+    [string]$Since = '1 hour ago',
+
+    [ValidateRange(1, 100000)]
+    [int]$Lines = 100,
+
+    [string]$Dest = '',
+
+    [string]$Branch = 'HEAD',
+
+    [string]$RepoPath = '',
+
+    [Alias('Profile')]
+    [string]$ProfileName = ''
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$RepoRoot = $PSScriptRoot
+$AppRoot = $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
-    $ConfigPath = Join-Path $RepoRoot 'box.json'
+    $cwdConfig = Join-Path (Get-Location).Path 'box.json'
+    $userConfig = Join-Path $env:USERPROFILE '.wsl-agent-sandbox\box.json'
+    if (Test-Path -LiteralPath $cwdConfig -PathType Leaf) {
+        $ConfigPath = $cwdConfig
+        $StateRoot = (Get-Location).Path
+    } elseif (Test-Path -LiteralPath $userConfig -PathType Leaf) {
+        $ConfigPath = $userConfig
+        $StateRoot = Split-Path -Parent $userConfig
+    } else {
+        $ConfigPath = Join-Path $AppRoot 'box.json'
+        $StateRoot = if (Test-Path -LiteralPath (Join-Path $AppRoot '.git')) {
+            $AppRoot
+        } else {
+            Join-Path $env:USERPROFILE '.wsl-agent-sandbox'
+        }
+    }
+} else {
+    $fullConfigPath = [System.IO.Path]::GetFullPath($ConfigPath)
+    $StateRoot = Split-Path -Parent $fullConfigPath
 }
-. (Join-Path $RepoRoot 'scripts\lib\Config.ps1')
-. (Join-Path $RepoRoot 'scripts\lib\Image.ps1')
-. (Join-Path $RepoRoot 'scripts\lib\Wsl.ps1')
-. (Join-Path $RepoRoot 'scripts\lib\Secrets.ps1')
-. (Join-Path $RepoRoot 'scripts\lib\Terminal.ps1')
+. (Join-Path $AppRoot 'scripts\lib\Config.ps1')
+. (Join-Path $AppRoot 'scripts\lib\Image.ps1')
+. (Join-Path $AppRoot 'scripts\lib\Wsl.ps1')
+. (Join-Path $AppRoot 'scripts\lib\Secrets.ps1')
+. (Join-Path $AppRoot 'scripts\lib\Terminal.ps1')
 
 function Show-Usage {
     @"
@@ -81,6 +116,13 @@ Commands:
   doctor             Run Windows + WSL preflight diagnostics (WSL2, .wslconfig, Docker Desktop,
                      systemd health, VHDX disk size, image cache).
   compact            Trim free blocks inside WSL (fstrim) and compact the distro's ext4.vhdx.
+  logs / audit       View root-owned security events (nftables drops, docker-policy-proxy denials,
+                     box-hardening reloads) with optional -Source, -Since, -Lines.
+  list               List configured sandbox profiles, their distro names, UIDs, and WSL state.
+  push-repo <path>   Bundle a Windows git repo and clone/update it into ~/work/<name> on native ext4.
+  pull-diff <name>   Show git status, recent commits, and diffstat from ~/work/<name> inside WSL.
+  pull-branch <name> Fetch agent commits from ~/work/<name> into a safe local branch (sandbox/<name>)
+                     on Windows without touching working tree or .git/hooks.
   seed-secrets [path] Seed or rotate CLI tokens, service accounts, and Git/SSH credentials from a
                      central Windows manifest (default: %USERPROFILE%\.wsl-agent-sandbox\secrets.json)
                      independently of init/apply. Supports -SecretsPath, -Service <names>, -Prune, -DryRun.
@@ -115,26 +157,26 @@ function Sync-AssetsToWsl {
     Copy-TextToWsl -DistroName $distro -Content ($hostIps + "`n") -RemotePath '/etc/wsl-agent-sandbox/host_ips.txt' -Mode '0600'
 
     # Push Linux scripts & systemd units
-    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot 'scripts\linux\box-hardening.sh') -RemotePath '/usr/local/sbin/box-hardening.sh' -Mode '0755' -NormalizeLF
-    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot 'scripts\linux\install-tools.sh') -RemotePath '/usr/local/sbin/box-install-tools.sh' -Mode '0755' -NormalizeLF
-    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot 'scripts\linux\provision.sh') -RemotePath '/usr/local/sbin/box-provision.sh' -Mode '0755' -NormalizeLF
-    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot 'scripts\linux\apply-policy.sh') -RemotePath '/usr/local/sbin/box-apply-policy.sh' -Mode '0755' -NormalizeLF
-    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot 'scripts\linux\box-seed-secrets.sh') -RemotePath '/usr/local/sbin/box-seed-secrets.sh' -Mode '0755' -NormalizeLF
-    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot 'scripts\linux\verify-isolation.sh') -RemotePath '/usr/local/bin/box-verify-isolation.sh' -Mode '0755' -NormalizeLF
-    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot 'systemd\box-hardening.service') -RemotePath '/etc/systemd/system/box-hardening.service' -Mode '0644' -NormalizeLF
-    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot 'systemd\docker-policy-proxy.service') -RemotePath '/etc/systemd/system/docker-policy-proxy.service' -Mode '0644' -NormalizeLF
+    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'scripts\linux\box-hardening.sh') -RemotePath '/usr/local/sbin/box-hardening.sh' -Mode '0755' -NormalizeLF
+    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'scripts\linux\install-tools.sh') -RemotePath '/usr/local/sbin/box-install-tools.sh' -Mode '0755' -NormalizeLF
+    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'scripts\linux\provision.sh') -RemotePath '/usr/local/sbin/box-provision.sh' -Mode '0755' -NormalizeLF
+    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'scripts\linux\apply-policy.sh') -RemotePath '/usr/local/sbin/box-apply-policy.sh' -Mode '0755' -NormalizeLF
+    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'scripts\linux\box-seed-secrets.sh') -RemotePath '/usr/local/sbin/box-seed-secrets.sh' -Mode '0755' -NormalizeLF
+    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'scripts\linux\verify-isolation.sh') -RemotePath '/usr/local/bin/box-verify-isolation.sh' -Mode '0755' -NormalizeLF
+    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'systemd\box-hardening.service') -RemotePath '/etc/systemd/system/box-hardening.service' -Mode '0644' -NormalizeLF
+    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'systemd\docker-policy-proxy.service') -RemotePath '/etc/systemd/system/docker-policy-proxy.service' -Mode '0644' -NormalizeLF
 
     if ($IncludeProxySource) {
         $proxyFiles = @('go.mod', 'main.go', 'policy.go', 'proxy.go', 'policy_test.go')
         foreach ($pf in $proxyFiles) {
-            Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot "docker-policy-proxy\$pf") -RemotePath "/usr/local/src/docker-policy-proxy/$pf" -Mode '0644' -NormalizeLF
+            Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot "docker-policy-proxy\$pf") -RemotePath "/usr/local/src/docker-policy-proxy/$pf" -Mode '0644' -NormalizeLF
         }
     }
 }
 
 function Get-GoldenSnapshotPath {
     param([Parameter(Mandatory)]$Config)
-    $cacheDir = Expand-BoxPath -RawPath $Config.image.cacheDir -BaseDir $RepoRoot
+    $cacheDir = Expand-BoxPath -RawPath $Config.image.cacheDir -BaseDir $StateRoot
     return (Join-Path $cacheDir "$($Config.distroName)-golden.tar")
 }
 
@@ -147,14 +189,14 @@ function Invoke-Snapshot {
     if (-not (Test-WslDistroExists -DistroName $Config.distroName)) {
         throw "Distro '$($Config.distroName)' does not exist."
     }
-    $cacheDir = Expand-BoxPath -RawPath $Config.image.cacheDir -BaseDir $RepoRoot
+    $cacheDir = Expand-BoxPath -RawPath $Config.image.cacheDir -BaseDir $StateRoot
     if ($Golden) {
         $OutFile = Get-GoldenSnapshotPath -Config $Config
     } elseif ([string]::IsNullOrWhiteSpace($OutFile)) {
         $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
         $OutFile = Join-Path $cacheDir "$($Config.distroName)-$stamp.tar"
     } else {
-        $OutFile = Expand-BoxPath -RawPath $OutFile -BaseDir $RepoRoot
+        $OutFile = Expand-BoxPath -RawPath $OutFile -BaseDir $StateRoot
     }
 
     $outParent = Split-Path -Parent $OutFile
@@ -187,12 +229,12 @@ function Invoke-Restore {
     if ([string]::IsNullOrWhiteSpace($SnapshotPath)) {
         throw "Snapshot path is required. Usage: .\box.ps1 restore <path-to-snapshot.tar>"
     }
-    $SnapshotPath = Expand-BoxPath -RawPath $SnapshotPath -BaseDir $RepoRoot
+    $SnapshotPath = Expand-BoxPath -RawPath $SnapshotPath -BaseDir $StateRoot
     if (-not (Test-Path -LiteralPath $SnapshotPath -PathType Leaf)) {
         throw "Snapshot file not found: '$SnapshotPath'"
     }
     $distro = $Config.distroName
-    $installDir = Expand-BoxPath -RawPath $Config.installDir -BaseDir $RepoRoot
+    $installDir = Expand-BoxPath -RawPath $Config.installDir -BaseDir $StateRoot
 
     if (Test-WslDistroExists -DistroName $distro) {
         Invoke-Destroy -Config $Config -Force:$Force
@@ -229,14 +271,14 @@ function Invoke-Init {
         [switch]$SaveGolden
     )
     $distro = $Config.distroName
-    $installDir = Expand-BoxPath -RawPath $Config.installDir -BaseDir $RepoRoot
+    $installDir = Expand-BoxPath -RawPath $Config.installDir -BaseDir $StateRoot
 
     if (Test-WslDistroExists -DistroName $distro) {
         Write-Host "[init] Distro '$distro' already exists. Use '.\box.ps1 apply' to update policy or '.\box.ps1 reset' to rebuild."
         return
     }
 
-    $imagePath = Resolve-UbuntuWslImage -Config $Config -RepoRoot $RepoRoot
+    $imagePath = Resolve-UbuntuWslImage -Config $Config -RepoRoot $StateRoot
 
     if (-not (Test-Path -LiteralPath $installDir)) {
         New-Item -ItemType Directory -Path $installDir -Force | Out-Null
@@ -338,7 +380,7 @@ function Invoke-SeedSecrets {
     }
 
     $explicitPath = if (-not [string]::IsNullOrWhiteSpace($SecretsPath)) { $SecretsPath } else { $Argument }
-    $manifestPath = Resolve-SecretsManifestPath -ExplicitPath $explicitPath -Config $Config -RepoRoot $RepoRoot
+    $manifestPath = Resolve-SecretsManifestPath -ExplicitPath $explicitPath -Config $Config -RepoRoot $StateRoot
 
     $built = Build-SeedSecretsPayload -ManifestPath $manifestPath -AgentName $Config.agentUser.name -Services $Service -Prune:$Prune
 
@@ -369,7 +411,7 @@ function Invoke-SeedSecrets {
     }
 
     # Always sync the seeder script directly so seed-secrets works independently of init/apply
-    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot 'scripts\linux\box-seed-secrets.sh') -RemotePath '/usr/local/sbin/box-seed-secrets.sh' -Mode '0755' -NormalizeLF
+    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'scripts\linux\box-seed-secrets.sh') -RemotePath '/usr/local/sbin/box-seed-secrets.sh' -Mode '0755' -NormalizeLF
 
     $payloadJson = $built.Payload | ConvertTo-Json -Depth 10 -Compress
     Write-Host "[seed-secrets] Pushing resolved credentials to '$distro' via root control plane (stdin only)..."
@@ -387,7 +429,7 @@ function Invoke-ClearSecrets {
     }
 
     $filterServices = @(Resolve-RequestedServiceFilter -Services $Service)
-    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot 'scripts\linux\box-seed-secrets.sh') -RemotePath '/usr/local/sbin/box-seed-secrets.sh' -Mode '0755' -NormalizeLF
+    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'scripts\linux\box-seed-secrets.sh') -RemotePath '/usr/local/sbin/box-seed-secrets.sh' -Mode '0755' -NormalizeLF
 
     if ($filterServices.Count -gt 0) {
         $svcArg = $filterServices -join ','
@@ -414,7 +456,8 @@ function Invoke-Status {
     if ($localOverride) {
         Write-Host "Local override: $localOverride (active)"
     }
-    $statusScript = @'
+    $agentUid = [int]$Config.agentUser.uid
+    $statusScript = "AGENT_UID=$agentUid`n" + @'
 echo "OS:          $(. /etc/os-release && echo "$PRETTY_NAME")"
 echo "Systemd:     $(systemctl is-system-running 2>/dev/null || echo inactive)"
 echo "Hardening:   $(systemctl is-active box-hardening.service 2>/dev/null || echo inactive)"
@@ -435,11 +478,16 @@ else
   echo "  (not initialized)"
 fi
 echo ""
-echo "Active nftables table inet wsl_agent_sandbox:"
-nft list table inet wsl_agent_sandbox 2>/dev/null || echo "  (not loaded)"
+echo "Active nftables table inet wsl_agent_sandbox_${AGENT_UID}:"
+nft list table inet "wsl_agent_sandbox_${AGENT_UID}" 2>/dev/null || echo "  (not loaded)"
+if nft list table inet wsl_agent_sandbox_shared >/dev/null 2>&1; then
+  echo ""
+  echo "Shared mirrored-loopback table inet wsl_agent_sandbox_shared:"
+  nft list table inet wsl_agent_sandbox_shared 2>/dev/null || true
+fi
 '@
     Invoke-WslRootBash -DistroName $distro -Script $statusScript
-    $installDir = Expand-BoxPath -RawPath $Config.installDir -BaseDir $RepoRoot
+    $installDir = Expand-BoxPath -RawPath $Config.installDir -BaseDir $StateRoot
     $vhdx = Join-Path $installDir 'ext4.vhdx'
     if (Test-Path -LiteralPath $vhdx -PathType Leaf) {
         $sizeGB = [Math]::Round(((Get-Item -LiteralPath $vhdx).Length / 1GB), 2)
@@ -526,25 +574,53 @@ function Invoke-Verify {
         }
     }
 
-    # Verify Windows -> WSL localhost web browsing AND WSL-internal localhost!
-    $webPort = 18765
+    # Verify Windows -> WSL localhost web browsing AND WSL-internal localhost using an ephemeral free port!
+    $webPort = 0
     $token = "wsl-localhost-ok-$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
     $serverProc = $null
     try {
-        & wsl.exe -d $distro -u $agent -- bash -c "mkdir -p /tmp/box-web-verify && printf '%s' '$token' > /tmp/box-web-verify/token.txt"
-        $serverProc = Start-Process -FilePath 'wsl.exe' -ArgumentList "-d $distro -u $agent -- python3 -m http.server $webPort --bind 0.0.0.0 --directory /tmp/box-web-verify" -PassThru -WindowStyle Hidden
+        $prepWeb = @'
+set -euo pipefail
+mkdir -p /tmp/box-web-verify
+rm -f /tmp/box-web-verify/port.txt /tmp/box-web-verify/port.txt.tmp
+cat <<'PYEOF' > /tmp/box-web-verify/srv.py
+import functools
+import http.server
+import os
+handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory="/tmp/box-web-verify")
+httpd = http.server.HTTPServer(("0.0.0.0", 0), handler)
+with open("/tmp/box-web-verify/port.txt.tmp", "w", encoding="utf-8") as f:
+    f.write(str(httpd.server_port))
+os.replace("/tmp/box-web-verify/port.txt.tmp", "/tmp/box-web-verify/port.txt")
+httpd.serve_forever()
+PYEOF
+printf '%s' "$1" > /tmp/box-web-verify/token.txt
+'@.Replace("`r`n", "`n")
+        $null = Invoke-WslAgentBashStdin -DistroName $distro -AgentName $agent -BashArgs @($token) -ScriptText $prepWeb
+        $serverProc = Start-Process -FilePath 'wsl.exe' -ArgumentList "-d $distro -u $agent -- python3 /tmp/box-web-verify/srv.py" -PassThru -WindowStyle Hidden
+
+        for ($i = 0; $i -lt 25; $i++) {
+            Start-Sleep -Milliseconds 200
+            $portStr = (& wsl.exe -d $distro -u $agent -- cat /tmp/box-web-verify/port.txt 2>$null | Out-String).Trim()
+            if ($portStr -match '^\d+$') {
+                $webPort = [int]$portStr
+                break
+            }
+        }
 
         $winOk = $false
-        for ($i = 0; $i -lt 15; $i++) {
-            Start-Sleep -Milliseconds 300
-            try {
-                $resp = Invoke-WebRequest -Uri "http://127.0.0.1:$webPort/token.txt" -UseBasicParsing -TimeoutSec 2
-                if ($resp.StatusCode -eq 200 -and $resp.Content.Trim() -eq $token) {
-                    $winOk = $true
-                    break
+        if ($webPort -gt 0) {
+            for ($i = 0; $i -lt 15; $i++) {
+                try {
+                    $resp = Invoke-WebRequest -Uri "http://127.0.0.1:$webPort/token.txt" -UseBasicParsing -TimeoutSec 2
+                    if ($resp.StatusCode -eq 200 -and $resp.Content.Trim() -eq $token) {
+                        $winOk = $true
+                        break
+                    }
+                } catch {
+                    Write-Verbose "Waiting for WSL test HTTP server on port ${webPort}: $($_.Exception.Message)"
                 }
-            } catch {
-                Write-Verbose "Waiting for WSL test HTTP server on port ${webPort}: $($_.Exception.Message)"
+                Start-Sleep -Milliseconds 250
             }
         }
 
@@ -555,7 +631,9 @@ function Invoke-Verify {
             $overallFailed = $true
         }
 
-        $wslSelf = (& wsl.exe -d $distro -u $agent -- curl -fsS --max-time 3 "http://127.0.0.1:$webPort/token.txt" 2>$null | Out-String).Trim()
+        $wslSelf = if ($webPort -gt 0) {
+            (& wsl.exe -d $distro -u $agent -- curl -fsS --max-time 3 "http://127.0.0.1:$webPort/token.txt" 2>$null | Out-String).Trim()
+        } else { '' }
         if ($wslSelf -eq $token) {
             Write-Host "  [PASS] WSL-internal localhost (http://127.0.0.1:$webPort) still works for agent's own local services!"
         } else {
@@ -602,7 +680,7 @@ function Invoke-Upgrade {
         }
     }
     $scopeArg = if ($normalized.Count -gt 0) { $normalized -join ',' } else { 'all' }
-    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot 'scripts\linux\upgrade-tools.sh') -RemotePath '/usr/local/sbin/box-upgrade-tools.sh' -Mode '0755' -NormalizeLF
+    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'scripts\linux\upgrade-tools.sh') -RemotePath '/usr/local/sbin/box-upgrade-tools.sh' -Mode '0755' -NormalizeLF
     Write-Host "[upgrade] Running in-place upgrade in '$distro' (scope=$scopeArg)..."
     & wsl.exe -d $distro -u root -- /usr/local/sbin/box-upgrade-tools.sh $scopeArg
     if ($LASTEXITCODE -ne 0) {
@@ -701,13 +779,13 @@ function Invoke-Doctor {
     }
 
     # 5. VHDX disk size & image cache
-    $installDir = Expand-BoxPath -RawPath $Config.installDir -BaseDir $RepoRoot
+    $installDir = Expand-BoxPath -RawPath $Config.installDir -BaseDir $StateRoot
     $vhdx = Join-Path $installDir 'ext4.vhdx'
     if (Test-Path -LiteralPath $vhdx -PathType Leaf) {
         $sizeGB = [Math]::Round(((Get-Item -LiteralPath $vhdx).Length / 1GB), 2)
         Write-Host "  [PASS] VHDX footprint: ${sizeGB} GB ($vhdx)"
     }
-    $cacheDir = Expand-BoxPath -RawPath $Config.image.cacheDir -BaseDir $RepoRoot
+    $cacheDir = Expand-BoxPath -RawPath $Config.image.cacheDir -BaseDir $StateRoot
     $cachedImages = @(Get-ChildItem -Path $cacheDir -Filter 'ubuntu-*.wsl' -ErrorAction SilentlyContinue)
     if ($cachedImages.Count -gt 0) {
         Write-Host "  [PASS] Cached Ubuntu WSL image(s): $($cachedImages.Name -join ', ')"
@@ -726,7 +804,7 @@ function Invoke-Compact {
     if (-not (Test-WslDistroExists -DistroName $distro)) {
         throw "Distro '$distro' does not exist."
     }
-    $installDir = Expand-BoxPath -RawPath $Config.installDir -BaseDir $RepoRoot
+    $installDir = Expand-BoxPath -RawPath $Config.installDir -BaseDir $StateRoot
     $vhdx = Join-Path $installDir 'ext4.vhdx'
     if (-not (Test-Path -LiteralPath $vhdx -PathType Leaf)) {
         throw "VHDX file not found at '$vhdx'."
@@ -771,13 +849,310 @@ function Invoke-Compact {
     Write-Host ("[compact] Done: {0:N2} GB -> {1:N2} GB (reclaimed {2:N1} MB)." -f ($beforeBytes / 1GB), ($afterBytes / 1GB), $savedMB)
 }
 
+function Invoke-AuditLogs {
+    param(
+        $Config,
+        [string]$Source = 'all',
+        [string]$Since = '1 hour ago',
+        [ValidateRange(1, 100000)]
+        [int]$Lines = 100
+    )
+    if ($Lines -lt 1 -or $Lines -gt 100000) {
+        throw "-Lines must be between 1 and 100000."
+    }
+    $distro = $Config.distroName
+    if (-not (Test-WslDistroExists -DistroName $distro)) {
+        throw "Distro '$distro' does not exist."
+    }
+    $safeSince = $Since -replace "'", ""
+    # Validate --since timestamp up front so invalid expressions fail loudly instead of being masked.
+    $sinceCheck = "journalctl --since '$safeSince' -n 0 >/dev/null"
+    $cmd = switch ($Source) {
+        'docker'    { "$sinceCheck && journalctl -u docker-policy-proxy.service --since '$safeSince' -n $Lines --no-pager" }
+        'hardening' { "$sinceCheck && journalctl -u box-hardening.service --since '$safeSince' -n $Lines --no-pager" }
+        'network'   { "$sinceCheck && (journalctl -k --grep='wsl-agent-sandbox-drop' --since '$safeSince' -n $Lines --no-pager || true)" }
+        default     { "$sinceCheck && (journalctl -u docker-policy-proxy.service -u box-hardening.service --since '$safeSince' -n $Lines --no-pager || true) && echo '--- Kernel nftables drops ---' && (journalctl -k --grep='wsl-agent-sandbox-drop' --since '$safeSince' -n $Lines --no-pager || true)" }
+    }
+    Write-Host "=== Security Audit Logs: $distro (source=$Source, since='$safeSince') ==="
+    Invoke-WslRootBash -DistroName $distro -Script $cmd
+}
+
+function Assert-SafeBoxBranchName {
+    param([Parameter(Mandatory)][string]$Name)
+    $trimmed = $Name.Trim()
+    if ([string]::IsNullOrWhiteSpace($trimmed) -or
+        $trimmed.StartsWith('-') -or
+        $trimmed.StartsWith('/') -or
+        $trimmed.EndsWith('/') -or
+        $trimmed.EndsWith('.lock') -or
+        $trimmed.Contains('..') -or
+        $trimmed.Contains('@{') -or
+        $trimmed -notmatch '^[A-Za-z0-9._/@^-]+$') {
+        throw "Invalid git branch/ref name '$Name'."
+    }
+    return $trimmed
+}
+
+function Resolve-WslWorkRelPath {
+    param(
+        [Parameter(Mandatory)][string]$RawPath,
+        [string]$DefaultPrefix = ''
+    )
+    $norm = ($RawPath.Trim() -replace '\\', '/') -replace '^~/', ''
+    if ([string]::IsNullOrWhiteSpace($norm)) {
+        throw "Specify a non-empty relative repository path."
+    }
+    if ($DefaultPrefix -and -not $norm.Contains('/')) {
+        $norm = "$DefaultPrefix/$norm"
+    }
+    if ($norm.StartsWith('/') -or
+        $norm.Contains('..') -or
+        $norm.StartsWith('-') -or
+        $norm -notmatch '^[A-Za-z0-9._/-]+$') {
+        throw "Repository path '$RawPath' must be a safe relative path inside ~/."
+    }
+    return $norm.TrimEnd('/')
+}
+
+function Invoke-PushRepo {
+    param(
+        $Config,
+        [string]$WindowsRepoPath,
+        [string]$Dest = '',
+        [string]$Branch = 'HEAD',
+        [switch]$Force
+    )
+    $distro = $Config.distroName
+    $agent = $Config.agentUser.name
+    if (-not (Test-WslDistroExists -DistroName $distro)) { throw "Distro '$distro' does not exist." }
+    if ([string]::IsNullOrWhiteSpace($WindowsRepoPath) -or -not (Test-Path -LiteralPath $WindowsRepoPath -PathType Container)) {
+        throw "Windows repository directory not found: '$WindowsRepoPath'"
+    }
+    $resolved = (Resolve-Path -LiteralPath $WindowsRepoPath).Path
+    $isGit = (& git -C $resolved rev-parse --is-inside-work-tree 2>$null | Out-String).Trim()
+    if ($isGit -ne 'true') {
+        throw "'$resolved' is not a git repository."
+    }
+    $safeBranch = Assert-SafeBoxBranchName -Name $Branch
+    & git -C $resolved rev-parse --verify --quiet $safeBranch | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Git ref '$safeBranch' not found in '$resolved'."
+    }
+
+    $repoName = Split-Path -Leaf $resolved
+    $rawDest = if ([string]::IsNullOrWhiteSpace($Dest)) { "work/$repoName" } else { $Dest }
+    $targetRel = Resolve-WslWorkRelPath -RawPath $rawDest
+
+    $checkoutBranch = 'sandbox-base'
+    if ($safeBranch -eq 'HEAD') {
+        $headSym = (& git -C $resolved symbolic-ref --short -q HEAD 2>$null | Out-String).Trim()
+        if ($headSym -and $headSym -match '^[A-Za-z0-9._/-]+$') {
+            $checkoutBranch = $headSym
+        }
+    } elseif ($safeBranch -notmatch '^[0-9a-f]{7,40}$') {
+        $checkoutBranch = $safeBranch -replace '^refs/heads/', ''
+    }
+
+    $tmpBundle = Join-Path ([System.IO.Path]::GetTempPath()) ("wsl-push-" + [Guid]::NewGuid().ToString('N').Substring(0, 8) + ".bundle")
+    try {
+        Write-Host "[push-repo] Creating git bundle from '$resolved' ($safeBranch)..."
+        & git -C $resolved bundle create $tmpBundle $safeBranch
+        if ($LASTEXITCODE -ne 0) { throw "git bundle create failed." }
+        $bytes = [System.IO.File]::ReadAllBytes($tmpBundle)
+        $b64 = [Convert]::ToBase64String($bytes)
+
+        $scriptHead = @'
+set -euo pipefail
+target_rel="$1"
+checkout_branch="$2"
+force_flag="$3"
+tmp="$(mktemp /tmp/box-push-XXXXXX.bundle)"
+trap 'rm -f "$tmp"' EXIT
+base64 -d > "$tmp" <<'__WSL_BUNDLE__'
+'@
+        $scriptTail = @'
+__WSL_BUNDLE__
+target="$HOME/$target_rel"
+bundle_ref="$(git bundle list-heads "$tmp" | awk 'NR==1 { print $2 }')"
+if [ -z "$bundle_ref" ]; then
+  echo "[push-repo] ERROR: bundle contains no refs." >&2
+  exit 1
+fi
+if [ -d "$target/.git" ]; then
+  if [ "$force_flag" != "1" ] && [ -n "$(git -C "$target" status --porcelain)" ]; then
+    echo "[push-repo] ERROR: $target has uncommitted changes (commit/stash or pass -Force to overwrite)." >&2
+    exit 1
+  fi
+  if origin_url="$(git -C "$target" remote get-url origin 2>/dev/null || true)"; then
+    case "$origin_url" in
+      /tmp/box-push-*.bundle) git -C "$target" remote remove origin 2>/dev/null || true ;;
+    esac
+  fi
+  git -C "$target" fetch "$tmp" "$bundle_ref"
+  git -C "$target" checkout -B "$checkout_branch" FETCH_HEAD
+else
+  mkdir -p "$target"
+  git -C "$target" init -q
+  git -C "$target" fetch "$tmp" "$bundle_ref"
+  git -C "$target" checkout -B "$checkout_branch" FETCH_HEAD
+fi
+echo "[push-repo] Synced branch $checkout_branch to $target"
+'@
+        $fullScript = ($scriptHead + "`n" + $b64 + "`n" + $scriptTail + "`n").Replace("`r`n", "`n")
+        $forceArg = if ($Force) { '1' } else { '0' }
+
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = 'wsl.exe'
+        $psi.Arguments = "-d $distro -u $agent -- bash -s -- $targetRel $checkoutBranch $forceArg"
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardInput = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        $proc.StandardInput.Write($fullScript)
+        $proc.StandardInput.Close()
+        $stdout = $proc.StandardOutput.ReadToEnd()
+        $stderr = $proc.StandardError.ReadToEnd()
+        $proc.WaitForExit()
+        if ($stdout) { Write-Host $stdout.TrimEnd() }
+        if ($proc.ExitCode -ne 0) {
+            throw "Failed pushing bundle into WSL: $stderr"
+        }
+    } finally {
+        Remove-Item -LiteralPath $tmpBundle -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Invoke-WslAgentBashStdin {
+    param(
+        [Parameter(Mandatory)][string]$DistroName,
+        [Parameter(Mandatory)][string]$AgentName,
+        [Parameter(Mandatory)][string[]]$BashArgs,
+        [Parameter(Mandatory)][string]$ScriptText
+    )
+    $lfScript = ($ScriptText -replace "`r`n", "`n").TrimEnd("`n") + "`n"
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'wsl.exe'
+    $escapedArgs = ($BashArgs | ForEach-Object {
+        if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
+    }) -join ' '
+    $psi.Arguments = "-d $DistroName -u $AgentName -- bash -s -- $escapedArgs"
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $proc.StandardInput.Write($lfScript)
+    $proc.StandardInput.Close()
+    $stdout = $proc.StandardOutput.ReadToEnd()
+    $stderr = $proc.StandardError.ReadToEnd()
+    $proc.WaitForExit()
+    return [pscustomobject]@{
+        ExitCode = $proc.ExitCode
+        Stdout   = $stdout
+        Stderr   = $stderr
+    }
+}
+
+function Invoke-PullDiff {
+    param(
+        $Config,
+        [string]$RepoName
+    )
+    $distro = $Config.distroName
+    $agent = $Config.agentUser.name
+    if (-not (Test-WslDistroExists -DistroName $distro)) {
+        throw "Distro '$distro' does not exist."
+    }
+    $rel = Resolve-WslWorkRelPath -RawPath $RepoName -DefaultPrefix 'work'
+    $remoteScript = @'
+set -euo pipefail
+target="$HOME/$1"
+if ! git -C "$target" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "[pull-diff] ERROR: $target is not a git repository." >&2
+  exit 1
+fi
+echo "=== Status ==="
+git -C "$target" status --short
+echo "=== Recent Commits ==="
+git -C "$target" log --oneline -n 15
+echo "=== Diff Stat ==="
+git -C "$target" diff --stat
+'@
+    $res = Invoke-WslAgentBashStdin -DistroName $distro -AgentName $agent -BashArgs @($rel) -ScriptText $remoteScript
+    if ($res.Stdout) { Write-Host $res.Stdout.TrimEnd() }
+    if ($res.ExitCode -ne 0) {
+        throw "pull-diff failed for '~/$rel' in '$distro': $($res.Stderr)"
+    }
+}
+
+function Invoke-PullBranch {
+    param(
+        $Config,
+        [string]$RepoName,
+        [string]$WindowsRepoPath = '',
+        [string]$Branch = 'HEAD'
+    )
+    $distro = $Config.distroName
+    $agent = $Config.agentUser.name
+    if (-not (Test-WslDistroExists -DistroName $distro)) {
+        throw "Distro '$distro' does not exist."
+    }
+    $rel = Resolve-WslWorkRelPath -RawPath $RepoName -DefaultPrefix 'work'
+    $safeBranch = Assert-SafeBoxBranchName -Name $Branch
+
+    $winTargetRaw = if ([string]::IsNullOrWhiteSpace($WindowsRepoPath)) { (Get-Location).Path } else { $WindowsRepoPath }
+    if (-not (Test-Path -LiteralPath $winTargetRaw -PathType Container)) {
+        throw "Windows target repository directory not found: '$winTargetRaw'"
+    }
+    $winRepo = (Resolve-Path -LiteralPath $winTargetRaw).Path
+    $isGit = (& git -C $winRepo rev-parse --is-inside-work-tree 2>$null | Out-String).Trim()
+    if ($isGit -ne 'true') {
+        throw "Windows target '$winRepo' is not a git repository."
+    }
+
+    $safeName = (Split-Path -Leaf $rel) -replace '[^A-Za-z0-9._-]', '-'
+    $targetBranch = "sandbox/$safeName"
+    $tmpBundle = Join-Path ([System.IO.Path]::GetTempPath()) ("wsl-pull-" + [Guid]::NewGuid().ToString('N').Substring(0, 8) + ".bundle")
+    try {
+        $remoteScript = @'
+set -euo pipefail
+target="$HOME/$1"
+ref="$2"
+if ! git -C "$target" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "[pull-branch] ERROR: $target is not a git repository." >&2
+  exit 1
+fi
+tmp="$(mktemp /tmp/box-pull-XXXXXX.bundle)"
+trap 'rm -f "$tmp"' EXIT
+git -C "$target" bundle create "$tmp" "$ref" >/dev/null
+base64 -w0 "$tmp"
+'@
+        $res = Invoke-WslAgentBashStdin -DistroName $distro -AgentName $agent -BashArgs @($rel, $safeBranch) -ScriptText $remoteScript
+        $b64 = ($res.Stdout | Out-String).Trim()
+        if ($res.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($b64)) {
+            throw "Failed creating bundle from ~/$rel in '$distro': $($res.Stderr)"
+        }
+        [System.IO.File]::WriteAllBytes($tmpBundle, [Convert]::FromBase64String($b64))
+        $bundleRef = ((& git bundle list-heads $tmpBundle 2>$null | Out-String).Trim() -split '\s+' | Select-Object -Skip 1 -First 1)
+        if ([string]::IsNullOrWhiteSpace($bundleRef)) {
+            $bundleRef = $safeBranch
+        }
+        & git -C $winRepo fetch --force $tmpBundle "+${bundleRef}:refs/heads/${targetBranch}"
+        if ($LASTEXITCODE -ne 0) { throw "git fetch from bundle failed." }
+        Write-Host "[pull-branch] Imported agent commits into local branch '$targetBranch' in '$winRepo' (review with 'git diff main..$targetBranch')."
+    } finally {
+        Remove-Item -LiteralPath $tmpBundle -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Invoke-Destroy {
     param(
         $Config,
         [switch]$Force
     )
     $distro = $Config.distroName
-    $installDir = Expand-BoxPath -RawPath $Config.installDir -BaseDir $RepoRoot
+    $installDir = Expand-BoxPath -RawPath $Config.installDir -BaseDir $StateRoot
 
     if (-not $Force) {
         $answer = Read-Host "Unregister WSL distro '$distro' and delete '$installDir'? Type YES to confirm"
@@ -802,7 +1177,21 @@ if ($Command -eq 'help') {
     exit 0
 }
 
-$cfg = Read-BoxConfig -ConfigPath $ConfigPath
+if ($Command -eq 'list') {
+    $registered = @(Get-WslDistroList)
+    $profileNames = @('') + @(Get-ManagedBoxProfileNames -RepoRoot $StateRoot -WarnOnInvalid)
+    $listExplicitCfg = if ($ConfigPath -ne (Join-Path $StateRoot 'box.json')) { $ConfigPath } else { '' }
+    Write-Host "=== Managed Sandbox Profiles ==="
+    foreach ($pName in $profileNames) {
+        $c = Resolve-BoxProfileConfig -RepoRoot $StateRoot -ProfileName $pName -ExplicitConfigPath $listExplicitCfg
+        $state = if ($registered -contains $c.distroName) { 'Installed' } else { 'Not Installed' }
+        $label = if ($pName) { $pName } else { 'default' }
+        Write-Host ("  - {0,-15} distro={1,-28} uid={2} state={3}" -f $label, $c.distroName, $c.agentUser.uid, $state)
+    }
+    exit 0
+}
+
+$cfg = Resolve-BoxProfileConfig -RepoRoot $StateRoot -ProfileName $ProfileName -ExplicitConfigPath $(if ($ConfigPath -ne (Join-Path $StateRoot 'box.json')) { $ConfigPath } else { '' })
 
 switch ($Command) {
     'init' {
@@ -832,6 +1221,21 @@ switch ($Command) {
     }
     'compact' {
         Invoke-Compact -Config $cfg
+    }
+    'logs' {
+        Invoke-AuditLogs -Config $cfg -Source $Source -Since $Since -Lines $Lines
+    }
+    'audit' {
+        Invoke-AuditLogs -Config $cfg -Source $Source -Since $Since -Lines $Lines
+    }
+    'push-repo' {
+        Invoke-PushRepo -Config $cfg -WindowsRepoPath $Argument -Dest $Dest -Branch $Branch -Force:$Force
+    }
+    'pull-diff' {
+        Invoke-PullDiff -Config $cfg -RepoName $Argument
+    }
+    'pull-branch' {
+        Invoke-PullBranch -Config $cfg -RepoName $Argument -WindowsRepoPath $RepoPath -Branch $Branch
     }
     'seed-secrets' {
         Invoke-SeedSecrets -Config $cfg -SecretsPath $SecretsPath -Service $Service -Prune:$Prune -DryRun:$DryRun

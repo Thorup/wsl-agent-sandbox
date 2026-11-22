@@ -111,6 +111,18 @@ Assert-Throws "Rejects invalid blockedCidrs entry" {
     Assert-BoxConfigValid -Config $c
 } 'Invalid IP'
 
+# Validate network.logDrops boolean type
+$logDropsOk = Copy-Config $baseCfg
+$logDropsOk.network | Add-Member -NotePropertyName 'logDrops' -NotePropertyValue $false -Force
+Assert-BoxConfigValid -Config $logDropsOk
+Assert-True "Accepts boolean network.logDrops = false" $true
+
+Assert-Throws "Rejects non-boolean string network.logDrops = 'false'" {
+    $c = Copy-Config $baseCfg
+    $c.network | Add-Member -NotePropertyName 'logDrops' -NotePropertyValue 'false' -Force
+    Assert-BoxConfigValid -Config $c
+} 'must be a boolean'
+
 # Reject unsafe docker.allowBindPrefixes
 Assert-Throws "Rejects /mnt/c in docker.allowBindPrefixes" {
     $c = Copy-Config $baseCfg
@@ -348,6 +360,59 @@ Assert-Throws "Rejects out-of-range resources.tasksMax" {
     $c | Add-Member -NotePropertyName 'resources' -NotePropertyValue ([pscustomobject]@{ tasksMax = 5 })
     Assert-BoxConfigValid -Config $c
 } 'must be between 32 and 65536'
+
+# Named profile isolation tests
+$profWork = Resolve-BoxProfileConfig -RepoRoot $RepoRoot -Profile 'work'
+$profOss = Resolve-BoxProfileConfig -RepoRoot $RepoRoot -Profile 'untrusted'
+Assert-True "Profile 'work' derives unique distroName and isolated UID" ($profWork.distroName -eq 'wsl-agent-sandbox-work' -and $profWork.installDir -eq '%LOCALAPPDATA%\WSL\wsl-agent-sandbox-work' -and $profWork.agentUser.uid -ge 26100 -and $profWork.agentUser.uid -ne 26040)
+Assert-True "Distinct profiles allocate non-colliding UIDs" ($profWork.agentUser.uid -ne $profOss.agentUser.uid)
+
+$tmpProfRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("wsl-box-prof-test-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
+try {
+    New-Item -ItemType Directory -Path (Join-Path $tmpProfRoot 'profiles') -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $RepoRoot 'box.json') -Destination (Join-Path $tmpProfRoot 'box.json')
+    # Custom box.local.json changes default distroName, installDir, and base uid
+    [System.IO.File]::WriteAllText((Join-Path $tmpProfRoot 'box.local.json'), '{"distroName":"custom-box","installDir":"D:\\Boxes\\custom-box","agentUser":{"uid":26050,"gid":26050}}', (New-Object System.Text.UTF8Encoding($false)))
+    [System.IO.File]::WriteAllText((Join-Path $tmpProfRoot 'profiles\client-a.json'), '{"network":{"egressMode":"open"}}', (New-Object System.Text.UTF8Encoding($false)))
+    # Duplicate entry in box.client-a.json plus invalid uppercase file
+    [System.IO.File]::WriteAllText((Join-Path $tmpProfRoot 'box.client-a.json'), '{"network":{"egressMode":"open"}}', (New-Object System.Text.UTF8Encoding($false)))
+    [System.IO.File]::WriteAllText((Join-Path $tmpProfRoot 'profiles\UppercaseInvalid.json'), '{}', (New-Object System.Text.UTF8Encoding($false)))
+    # Override distroName without installDir -> must isolate installDir!
+    [System.IO.File]::WriteAllText((Join-Path $tmpProfRoot 'profiles\client-b.json'), '{"distroName":"isolated-client-b"}', (New-Object System.Text.UTF8Encoding($false)))
+
+    $managedNames = @(Get-ManagedBoxProfileNames -RepoRoot $tmpProfRoot)
+    Assert-True "Get-ManagedBoxProfileNames deduplicates and skips uppercase filenames" (($managedNames -join ',') -eq 'client-a,client-b')
+
+    $pA = Resolve-BoxProfileConfig -RepoRoot $tmpProfRoot -Profile 'client-a'
+    Assert-True "Profile derives distroName, installDir, and UID even over custom box.local.json" (
+        $pA.distroName -eq 'custom-box-client-a' -and
+        $pA.installDir -eq 'D:\Boxes\custom-box-client-a' -and
+        $pA.agentUser.uid -ne 26050 -and
+        $pA.agentUser.uid -ge 26100
+    )
+
+    # Force a deterministic hash collision with client-a by setting base uid to Get-DeterministicProfileUid 'client-a'
+    $detA = Get-DeterministicProfileUid -ProfileName 'client-a'
+    [System.IO.File]::WriteAllText((Join-Path $tmpProfRoot 'box.local.json'), "{""distroName"":""custom-box"",""installDir"":""D:\\Boxes\\custom-box"",""agentUser"":{""uid"":$detA,""gid"":$detA}}", (New-Object System.Text.UTF8Encoding($false)))
+    $pACollide = Resolve-BoxProfileConfig -RepoRoot $tmpProfRoot -Profile 'client-a'
+    Assert-True "Auto-probing resolves hash/base UID collision deterministically" ($pACollide.agentUser.uid -ne $detA -and $pACollide.agentUser.uid -ge 26100)
+    [System.IO.File]::WriteAllText((Join-Path $tmpProfRoot 'box.local.json'), '{"distroName":"custom-box","installDir":"D:\\Boxes\\custom-box","agentUser":{"uid":26050,"gid":26050}}', (New-Object System.Text.UTF8Encoding($false)))
+
+    $pB = Resolve-BoxProfileConfig -RepoRoot $tmpProfRoot -Profile 'client-b'
+    Assert-True "Profile overriding distroName without installDir derives isolated installDir" (
+        $pB.distroName -eq 'isolated-client-b' -and
+        $pB.installDir -eq 'D:\Boxes\isolated-client-b'
+    )
+
+    # Explicit UID collision must throw
+    [System.IO.File]::WriteAllText((Join-Path $tmpProfRoot 'profiles\dup1.json'), '{"agentUser":{"uid":27001,"gid":27001}}', (New-Object System.Text.UTF8Encoding($false)))
+    [System.IO.File]::WriteAllText((Join-Path $tmpProfRoot 'profiles\dup2.json'), '{"agentUser":{"uid":27001,"gid":27001}}', (New-Object System.Text.UTF8Encoding($false)))
+    Assert-Throws "Rejects explicit profile UID collision" {
+        Resolve-BoxProfileConfig -RepoRoot $tmpProfRoot -Profile 'dup2'
+    } 'collides'
+} finally {
+    Remove-Item -LiteralPath $tmpProfRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
 
 Write-Host ""
 Write-Host "=== Config.Tests.ps1 Summary: PASS=$script:Passed FAIL=$script:Failed ==="
