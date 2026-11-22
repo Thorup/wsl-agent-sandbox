@@ -324,6 +324,32 @@ lines = [
     "table inet wsl_agent_sandbox {",
 ]
 
+log_drops = bool(net_cfg.get("logDrops", True))
+if block_host_and_lan and log_drops:
+    probe_rule = (
+        "table inet __box_log_probe {\n"
+        "    chain c {\n"
+        '        limit rate 5/minute burst 10 packets log prefix "[wsl-agent-sandbox-drop] "\n'
+        "        drop\n"
+        "    }\n"
+        "}\n"
+    )
+    probe = subprocess.run(["nft", "-c", "-f", "-"], input=probe_rule, text=True, capture_output=True)
+    if probe.returncode != 0:
+        print(
+            f"[box-hardening] WARNING: kernel/nftables log target unavailable ({probe.stderr.strip()}); falling back to unconditional drop without log.",
+            file=sys.stderr,
+        )
+        log_drops = False
+
+if block_host_and_lan and log_drops:
+    lines.extend([
+        "    chain log_and_drop {",
+        '        limit rate 5/minute burst 10 packets log prefix "[wsl-agent-sandbox-drop] "',
+        "        drop",
+        "    }",
+    ])
+
 if has_loopback0 and block_host_and_lan:
     # Tag inbound connections from Windows -> WSL arriving on loopback0 so replies route back via loopback0
     lines.extend([
@@ -380,21 +406,20 @@ if block_host_and_lan:
     # Block WSL2 mirrored-mode outbound connections to Windows 127.0.0.1/::1 ports
     # (Windows -> WSL localhost replies still pass via 'ct state established,related accept',
     # and WSL-internal localhost still passes via 'oifname "lo" accept').
-    log_drops = bool(net_cfg.get("logDrops", True))
-    drop_prefix = 'limit rate 5/minute burst 10 packets log prefix "[wsl-agent-sandbox-drop] " ' if log_drops else ''
-    lines.append(f'        oifname "loopback0" {drop_prefix}drop')
+    drop_action = "jump log_and_drop" if log_drops else "drop"
+    lines.append(f'        oifname "loopback0" {drop_action}')
     if host_v4:
         hosts = ", ".join(sorted(host_v4))
-        lines.append(f"        ip daddr {{ {hosts} }} {drop_prefix}drop")
+        lines.append(f"        ip daddr {{ {hosts} }} {drop_action}")
     if host_v6:
         hosts = ", ".join(sorted(host_v6))
-        lines.append(f"        ip6 daddr {{ {hosts} }} {drop_prefix}drop")
+        lines.append(f"        ip6 daddr {{ {hosts} }} {drop_action}")
     if blocked_v4:
         cidrs = ", ".join(sorted(set(blocked_v4)))
-        lines.append(f"        ip daddr {{ {cidrs} }} {drop_prefix}drop")
+        lines.append(f"        ip daddr {{ {cidrs} }} {drop_action}")
     if blocked_v6:
         cidrs = ", ".join(sorted(set(blocked_v6)))
-        lines.append(f"        ip6 daddr {{ {cidrs} }} {drop_prefix}drop")
+        lines.append(f"        ip6 daddr {{ {cidrs} }} {drop_action}")
 
 lines.extend([
     "    }",

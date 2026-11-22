@@ -53,6 +53,7 @@ param(
 
     [string]$Since = '1 hour ago',
 
+    [ValidateRange(1, 100000)]
     [int]$Lines = 100
 )
 
@@ -785,18 +786,24 @@ function Invoke-AuditLogs {
         $Config,
         [string]$Source = 'all',
         [string]$Since = '1 hour ago',
+        [ValidateRange(1, 100000)]
         [int]$Lines = 100
     )
+    if ($Lines -lt 1 -or $Lines -gt 100000) {
+        throw "-Lines must be between 1 and 100000."
+    }
     $distro = $Config.distroName
     if (-not (Test-WslDistroExists -DistroName $distro)) {
         throw "Distro '$distro' does not exist."
     }
     $safeSince = $Since -replace "'", ""
+    # Validate --since timestamp up front so invalid expressions fail loudly instead of being masked.
+    $sinceCheck = "journalctl --since '$safeSince' -n 0 >/dev/null"
     $cmd = switch ($Source) {
-        'docker'    { "journalctl -u docker-policy-proxy.service --since '$safeSince' -n $Lines --no-pager || true" }
-        'hardening' { "journalctl -u box-hardening.service --since '$safeSince' -n $Lines --no-pager || true" }
-        'network'   { "journalctl -k --grep='wsl-agent-sandbox-drop' --since '$safeSince' -n $Lines --no-pager || true" }
-        default     { "journalctl -u docker-policy-proxy.service -u box-hardening.service --since '$safeSince' -n $Lines --no-pager || true; echo '--- Kernel nftables drops ---'; journalctl -k --grep='wsl-agent-sandbox-drop' --since '$safeSince' -n $Lines --no-pager || true" }
+        'docker'    { "$sinceCheck && journalctl -u docker-policy-proxy.service --since '$safeSince' -n $Lines --no-pager" }
+        'hardening' { "$sinceCheck && journalctl -u box-hardening.service --since '$safeSince' -n $Lines --no-pager" }
+        'network'   { "$sinceCheck && (journalctl -k --grep='wsl-agent-sandbox-drop' --since '$safeSince' -n $Lines --no-pager || true)" }
+        default     { "$sinceCheck && (journalctl -u docker-policy-proxy.service -u box-hardening.service --since '$safeSince' -n $Lines --no-pager || true) && echo '--- Kernel nftables drops ---' && (journalctl -k --grep='wsl-agent-sandbox-drop' --since '$safeSince' -n $Lines --no-pager || true)" }
     }
     Write-Host "=== Security Audit Logs: $distro (source=$Source, since='$safeSince') ==="
     Invoke-WslRootBash -DistroName $distro -Script $cmd

@@ -227,6 +227,11 @@ function Assert-BoxConfigValid {
             throw "Invalid prefix length in network.blockedCidrs: '$cidr'."
         }
     }
+    if ($Config.network.PSObject.Properties['logDrops'] -and $null -ne $Config.network.logDrops) {
+        if ($Config.network.logDrops -isnot [bool]) {
+            throw "network.logDrops must be a boolean."
+        }
+    }
 
     # Validate docker
     if (-not $Config.docker) {

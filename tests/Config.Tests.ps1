@@ -111,6 +111,18 @@ Assert-Throws "Rejects invalid blockedCidrs entry" {
     Assert-BoxConfigValid -Config $c
 } 'Invalid IP'
 
+# Validate network.logDrops boolean type
+$logDropsOk = Copy-Config $baseCfg
+$logDropsOk.network | Add-Member -NotePropertyName 'logDrops' -NotePropertyValue $false -Force
+Assert-BoxConfigValid -Config $logDropsOk
+Assert-True "Accepts boolean network.logDrops = false" $true
+
+Assert-Throws "Rejects non-boolean string network.logDrops = 'false'" {
+    $c = Copy-Config $baseCfg
+    $c.network | Add-Member -NotePropertyName 'logDrops' -NotePropertyValue 'false' -Force
+    Assert-BoxConfigValid -Config $c
+} 'must be a boolean'
+
 # Reject unsafe docker.allowBindPrefixes
 Assert-Throws "Rejects /mnt/c in docker.allowBindPrefixes" {
     $c = Copy-Config $baseCfg
