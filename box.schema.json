@@ -266,7 +266,24 @@
         "installAider": { "type": "boolean" },
         "installHelm": { "type": "boolean" },
         "installOpenTofu": { "type": "boolean" },
-        "installPlaywrightChromium": { "type": "boolean" }
+        "installPlaywrightChromium": { "type": "boolean" },
+        "configureVsCodeRemoteWsl": {
+          "type": "boolean",
+          "default": false,
+          "description": "Optional alias for ide.configureRemoteWsl: when true, init and apply configure 'remote.WSL.experimental.scriptLessStartup': true in VS Code / Antigravity user settings."
+        }
+      }
+    },
+    "ide": {
+      "type": "object",
+      "description": "Optional Windows IDE (VS Code / Antigravity) Remote-WSL integration settings.",
+      "additionalProperties": false,
+      "properties": {
+        "configureRemoteWsl": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true, '.\\box.ps1 init' and '.\\box.ps1 apply' automatically set 'remote.WSL.experimental.scriptLessStartup': true in VS Code and Antigravity user settings.json so Remote-WSL connects without /mnt/c or Windows interop."
+        }
       }
     },
     "secrets": {

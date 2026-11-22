@@ -539,6 +539,26 @@ function Assert-BoxConfigValid {
             }
         }
     }
+
+    # Validate optional 'ide' Remote-WSL settings
+    if ($Config.PSObject.Properties['ide'] -and $null -ne $Config.ide) {
+        $allowedIdeProps = @('configureRemoteWsl')
+        foreach ($prop in $Config.ide.PSObject.Properties) {
+            if ($prop.Name -notin $allowedIdeProps) {
+                throw "Unknown property '$($prop.Name)' in ide. Allowed: $($allowedIdeProps -join ', ')."
+            }
+        }
+        if ($Config.ide.PSObject.Properties['configureRemoteWsl'] -and $null -ne $Config.ide.configureRemoteWsl) {
+            if ($Config.ide.configureRemoteWsl -isnot [bool]) {
+                throw "ide.configureRemoteWsl must be a boolean."
+            }
+        }
+    }
+    if ($Config.packages.PSObject.Properties['configureVsCodeRemoteWsl'] -and $null -ne $Config.packages.configureVsCodeRemoteWsl) {
+        if ($Config.packages.configureVsCodeRemoteWsl -isnot [bool]) {
+            throw "packages.configureVsCodeRemoteWsl must be a boolean."
+        }
+    }
 }
 
 function Get-WindowsHostIPs {

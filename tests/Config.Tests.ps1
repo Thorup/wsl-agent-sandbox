@@ -457,6 +457,39 @@ Assert-Throws "Rejects invalid URL/slash in docker.allowedRegistries" {
     Assert-BoxConfigValid -Config $c
 } 'Invalid docker.allowedRegistries'
 
+# Sync-IdeWslScriptlessStartup tests (JSONC support, preservation, idempotency)
+$tmpIdeDir = Join-Path ([System.IO.Path]::GetTempPath()) ("wsl-box-ide-test-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Path $tmpIdeDir -Force | Out-Null
+try {
+    $ideSettings = Join-Path $tmpIdeDir 'settings.json'
+    [System.IO.File]::WriteAllText($ideSettings, "// user settings`n{`n  `"editor.fontSize`": 14,`n}`n", (New-Object System.Text.UTF8Encoding($false)))
+    $updated1 = @(Sync-IdeWslScriptlessStartup -SettingsPaths @($ideSettings))
+    $parsedIde = (Get-Content -LiteralPath $ideSettings -Raw -Encoding UTF8) | ConvertFrom-Json
+    Assert-True "Sync-IdeWslScriptlessStartup sets remote.WSL.experimental.scriptLessStartup=true and preserves existing settings" (
+        $updated1.Count -eq 1 -and
+        $parsedIde.'remote.WSL.experimental.scriptLessStartup' -eq $true -and
+        $parsedIde.'editor.fontSize' -eq 14
+    )
+    $updated2 = @(Sync-IdeWslScriptlessStartup -SettingsPaths @($ideSettings))
+    Assert-True "Sync-IdeWslScriptlessStartup is idempotent when already enabled" ($updated2.Count -eq 0)
+
+    Assert-True "Default box.json leaves ide.configureRemoteWsl disabled (opt-in)" (-not (Test-ShouldConfigureIdeRemoteWsl -Config $baseCfg))
+    $ideOptInCfg = Copy-Config $baseCfg
+    $ideOptInCfg | Add-Member -NotePropertyName 'ide' -NotePropertyValue ([pscustomobject]@{ configureRemoteWsl = $true }) -Force
+    Assert-BoxConfigValid -Config $ideOptInCfg
+    Assert-True "Test-ShouldConfigureIdeRemoteWsl returns true when ide.configureRemoteWsl is enabled" (Test-ShouldConfigureIdeRemoteWsl -Config $ideOptInCfg)
+
+    Assert-Throws "Rejects non-boolean ide.configureRemoteWsl" {
+        $badIdeCfg = Copy-Config $baseCfg
+        $badIdeCfg | Add-Member -NotePropertyName 'ide' -NotePropertyValue ([pscustomobject]@{ configureRemoteWsl = 'yes' }) -Force
+        Assert-BoxConfigValid -Config $badIdeCfg
+    } 'must be a boolean'
+} finally {
+    if (Test-Path -LiteralPath $tmpIdeDir) {
+        Remove-Item -LiteralPath $tmpIdeDir -Recurse -Force
+    }
+}
+
 Write-Host ""
 Write-Host "=== Config.Tests.ps1 Summary: PASS=$script:Passed FAIL=$script:Failed ==="
 if ($script:Failed -gt 0) {
