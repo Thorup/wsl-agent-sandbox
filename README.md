@@ -261,7 +261,13 @@ Manifest path resolution priority:
 
 ## Connecting Antigravity / VS Code Remote-WSL
 
-1. `.\box.ps1 init` and `.\box.ps1 apply` automatically enable `"remote.WSL.experimental.scriptLessStartup": true` in your Windows VS Code (`%APPDATA%\Code\User\settings.json`) and Antigravity (`%APPDATA%\Antigravity\User\settings.json`) user settings so Remote-WSL streams the server tarball over `stdin` without requiring `/mnt/c` (`[automount] enabled=false`) or Windows `.exe` interop (`[interop] enabled=false`).
+1. To have `.\box.ps1 init` and `.\box.ps1 apply` automatically configure VS Code (`%APPDATA%\Code\User\settings.json`) and Antigravity (`%APPDATA%\Antigravity\User\settings.json`) for this sandbox, opt in via `box.local.json` (or `box.json`):
+   ```json
+   "ide": {
+     "configureRemoteWsl": true
+   }
+   ```
+   When enabled, `init` and `apply` set `"remote.WSL.experimental.scriptLessStartup": true` so Remote-WSL streams the server tarball over `stdin` without requiring `/mnt/c` (`[automount] enabled=false`) or Windows `.exe` interop (`[interop] enabled=false`). (Defaults to `false` so global IDE settings are left untouched unless you intend to use VS Code / Antigravity with the sandbox.)
 2. Launch Antigravity or VS Code **from Windows** (e.g., `code --remote wsl+wsl-agent-sandbox /home/agent` or `antigravity --remote wsl+wsl-agent-sandbox /home/agent`, or use the bottom-left **`><`** Remote window menu → **Connect to WSL using Distro...** → **`wsl-agent-sandbox`**).
 
 ---

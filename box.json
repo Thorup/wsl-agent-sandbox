@@ -94,5 +94,8 @@
     "installHelm": false,
     "installOpenTofu": false,
     "installPlaywrightChromium": false
+  },
+  "ide": {
+    "configureRemoteWsl": false
   }
 }

@@ -320,7 +320,9 @@ function Invoke-Init {
     }
 
     Write-Host "[init] Applying policy and starting Docker policy proxy..."
-    [void](Sync-IdeWslScriptlessStartup)
+    if (Test-ShouldConfigureIdeRemoteWsl -Config $Config) {
+        [void](Sync-IdeWslScriptlessStartup)
+    }
     if ($Config.docker.enabled) {
         [void](Sync-DockerDesktopSocketBridge)
     }
@@ -353,7 +355,9 @@ function Invoke-Apply {
         throw "Distro '$distro' does not exist. Run '.\box.ps1 init' first."
     }
     Write-Host "[apply] Pushing updated policy & scripts to '$distro'..."
-    [void](Sync-IdeWslScriptlessStartup)
+    if (Test-ShouldConfigureIdeRemoteWsl -Config $Config) {
+        [void](Sync-IdeWslScriptlessStartup)
+    }
     if ($Config.docker.enabled) {
         [void](Sync-DockerDesktopSocketBridge)
     }
@@ -811,19 +815,21 @@ function Invoke-Doctor {
         Write-Host "  [WARN] No cached Ubuntu .wsl image in '$cacheDir' (will download on init)"
     }
 
-    # 6. VS Code / Antigravity Remote-WSL scriptLessStartup check
-    $idePaths = @(Get-IdeUserSettingsPaths)
-    foreach ($idePath in $idePaths) {
-        try {
-            $rawIde = Get-Content -LiteralPath $idePath -Raw -Encoding UTF8
-            $ideJson = if ([string]::IsNullOrWhiteSpace($rawIde)) { $null } else { ConvertFrom-Jsonc -Text $rawIde }
-            if ($null -ne $ideJson -and $ideJson.PSObject.Properties['remote.WSL.experimental.scriptLessStartup'] -and ($ideJson.'remote.WSL.experimental.scriptLessStartup' -eq $true)) {
-                Write-Host "  [PASS] IDE Remote-WSL scriptLessStartup enabled ($idePath)"
-            } else {
-                Write-Host "  [WARN] IDE Remote-WSL scriptLessStartup not enabled in '$idePath' (run '.\box.ps1 apply' to configure automatically)"
+    # 6. VS Code / Antigravity Remote-WSL scriptLessStartup check (only when opted in via ide.configureRemoteWsl)
+    if (Test-ShouldConfigureIdeRemoteWsl -Config $Config) {
+        $idePaths = @(Get-IdeUserSettingsPaths)
+        foreach ($idePath in $idePaths) {
+            try {
+                $rawIde = Get-Content -LiteralPath $idePath -Raw -Encoding UTF8
+                $ideJson = if ([string]::IsNullOrWhiteSpace($rawIde)) { $null } else { ConvertFrom-Jsonc -Text $rawIde }
+                if ($null -ne $ideJson -and $ideJson.PSObject.Properties['remote.WSL.experimental.scriptLessStartup'] -and ($ideJson.'remote.WSL.experimental.scriptLessStartup' -eq $true)) {
+                    Write-Host "  [PASS] IDE Remote-WSL scriptLessStartup enabled ($idePath)"
+                } else {
+                    Write-Host "  [WARN] IDE Remote-WSL scriptLessStartup not enabled in '$idePath' (run '.\box.ps1 apply' to configure automatically)"
+                }
+            } catch {
+                Write-Host "  [WARN] Could not parse IDE settings '$idePath': $($_.Exception.Message)"
             }
-        } catch {
-            Write-Host "  [WARN] Could not parse IDE settings '$idePath': $($_.Exception.Message)"
         }
     }
 

@@ -256,6 +256,22 @@ function Get-IdeUserSettingsPaths {
     return @($candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
 }
 
+function Test-ShouldConfigureIdeRemoteWsl {
+    param($Config)
+    if ($null -eq $Config) {
+        return $false
+    }
+    if ($Config.PSObject.Properties['ide'] -and $null -ne $Config.ide -and
+        $Config.ide.PSObject.Properties['configureRemoteWsl'] -and ($Config.ide.configureRemoteWsl -eq $true)) {
+        return $true
+    }
+    if ($Config.PSObject.Properties['packages'] -and $null -ne $Config.packages -and
+        $Config.packages.PSObject.Properties['configureVsCodeRemoteWsl'] -and ($Config.packages.configureVsCodeRemoteWsl -eq $true)) {
+        return $true
+    }
+    return $false
+}
+
 function Sync-IdeWslScriptlessStartup {
     param(
         [string[]]$SettingsPaths = @()

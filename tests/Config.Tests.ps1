@@ -472,6 +472,18 @@ try {
     )
     $updated2 = @(Sync-IdeWslScriptlessStartup -SettingsPaths @($ideSettings))
     Assert-True "Sync-IdeWslScriptlessStartup is idempotent when already enabled" ($updated2.Count -eq 0)
+
+    Assert-True "Default box.json leaves ide.configureRemoteWsl disabled (opt-in)" (-not (Test-ShouldConfigureIdeRemoteWsl -Config $baseCfg))
+    $ideOptInCfg = Copy-Config $baseCfg
+    $ideOptInCfg | Add-Member -NotePropertyName 'ide' -NotePropertyValue ([pscustomobject]@{ configureRemoteWsl = $true }) -Force
+    Assert-BoxConfigValid -Config $ideOptInCfg
+    Assert-True "Test-ShouldConfigureIdeRemoteWsl returns true when ide.configureRemoteWsl is enabled" (Test-ShouldConfigureIdeRemoteWsl -Config $ideOptInCfg)
+
+    Assert-Throws "Rejects non-boolean ide.configureRemoteWsl" {
+        $badIdeCfg = Copy-Config $baseCfg
+        $badIdeCfg | Add-Member -NotePropertyName 'ide' -NotePropertyValue ([pscustomobject]@{ configureRemoteWsl = 'yes' }) -Force
+        Assert-BoxConfigValid -Config $badIdeCfg
+    } 'must be a boolean'
 } finally {
     if (Test-Path -LiteralPath $tmpIdeDir) {
         Remove-Item -LiteralPath $tmpIdeDir -Recurse -Force
