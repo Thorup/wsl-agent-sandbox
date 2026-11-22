@@ -300,6 +300,8 @@ def seed_github(cfg, prev_meta):
     if export_env:
         env_key = "GH_TOKEN" if hostname == "github.com" else "GH_ENTERPRISE_TOKEN"
         env_vars[env_key] = token
+    if cfg.get("proxyBaseUrl"):
+        env_vars["GITHUB_API_URL"] = cfg["proxyBaseUrl"]
     written_keys = write_service_env("github", env_vars)
 
     managed_hosts = sorted(set((prev_meta or {}).get("hosts", []) + [hostname]))
@@ -757,6 +759,8 @@ def seed_gemini(cfg, prev_meta):
         env_vars["GOOGLE_CLOUD_LOCATION"] = cfg["googleCloudLocation"]
     if cfg.get("useVertexAi"):
         env_vars["GOOGLE_GENAI_USE_VERTEXAI"] = "true"
+    if cfg.get("proxyBaseUrl"):
+        env_vars["GOOGLE_GEMINI_BASE_URL"] = cfg["proxyBaseUrl"]
     written_keys = write_service_env("gemini", env_vars)
     return {
         "envVars": written_keys,
@@ -778,6 +782,8 @@ def seed_claude(cfg, prev_meta):
         env_vars["ANTHROPIC_API_KEY"] = api_key
     if oauth:
         env_vars["CLAUDE_CODE_OAUTH_TOKEN"] = oauth
+    if cfg.get("proxyBaseUrl"):
+        env_vars["ANTHROPIC_BASE_URL"] = cfg["proxyBaseUrl"]
     written_keys = write_service_env("claude", env_vars)
     return {
         "envVars": written_keys,
@@ -1437,6 +1443,38 @@ CLEARERS = {
     "files": clear_files,
 }
 
+PROXY_CFG_FILE = "/etc/wsl-agent-sandbox/credential-proxy.json"
+
+def load_credential_proxy_routes():
+    if not os.path.isfile(PROXY_CFG_FILE):
+        return {}
+    try:
+        with open(PROXY_CFG_FILE, "r", encoding="utf-8") as pf:
+            data = json.load(pf)
+        routes = data.get("routes", {}) if isinstance(data, dict) else {}
+        return routes if isinstance(routes, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+def sync_credential_proxy(routes):
+    has_systemd = os.path.isdir("/run/systemd/system")
+    if routes:
+        tmp_path = f"{PROXY_CFG_FILE}.tmp.{os.getpid()}"
+        with open(tmp_path, "w", encoding="utf-8") as pf:
+            json.dump({"routes": routes}, pf, indent=2)
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, PROXY_CFG_FILE)
+        if has_systemd:
+            subprocess.run(["systemctl", "daemon-reload"], check=True)
+            subprocess.run(["systemctl", "enable", "credential-proxy.service"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["systemctl", "restart", "credential-proxy.service"], check=True)
+    else:
+        remove_file_quiet(PROXY_CFG_FILE)
+        if has_systemd:
+            subprocess.run(["systemctl", "daemon-reload"], check=False)
+            subprocess.run(["systemctl", "stop", "credential-proxy.service"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["systemctl", "disable", "credential-proxy.service"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
 # ------------------------------------------------------------------
 # Modes: --status, --clear, --apply
 # ------------------------------------------------------------------
@@ -1488,12 +1526,17 @@ if args.clear:
             targets = list(CLEARERS.keys())
 
     cleared_any = False
+    proxy_routes_state = load_credential_proxy_routes()
+    proxy_changed = False
     for name in targets:
         if name not in CLEARERS:
             print(f"[seed-secrets] [FAIL] Unknown service: {name}", file=sys.stderr)
             sys.exit(1)
         prev_meta = svcs.get(name)
         CLEARERS[name](prev_meta)
+        if name in proxy_routes_state:
+            proxy_routes_state.pop(name, None)
+            proxy_changed = True
         if name in svcs:
             svcs.pop(name, None)
             print(f"[seed-secrets] [CLEARED] {name}")
@@ -1501,6 +1544,11 @@ if args.clear:
         elif args.services.strip():
             print(f"[seed-secrets] [CLEARED] {name} (was not recorded in state)")
             cleared_any = True
+
+    if proxy_changed or (not args.services.strip() and os.path.isfile(PROXY_CFG_FILE)):
+        if not args.services.strip():
+            proxy_routes_state = {}
+        sync_credential_proxy(proxy_routes_state)
 
     rebuild_secrets_env()
     if svcs:
@@ -1521,6 +1569,7 @@ if not raw_stdin.strip():
 
 payload = json.loads(raw_stdin)
 services_payload = payload.get("services", {})
+new_proxy_routes = payload.get("proxyRoutes", {}) or {}
 filter_services = payload.get("filterServices", [])
 if isinstance(filter_services, str):
     filter_services = [filter_services]
@@ -1530,6 +1579,7 @@ ensure_profile_hook()
 ensure_agent_dir(STATE_DIR, mode=0o700)
 state = load_state()
 state_services = state.get("services", {})
+merged_proxy_routes = load_credential_proxy_routes()
 
 failures = 0
 seeded_count = 0
@@ -1542,6 +1592,10 @@ for svc_name, svc_cfg in services_payload.items():
     try:
         meta = SEEDERS[svc_name](svc_cfg, state_services.get(svc_name))
         state_services[svc_name] = meta
+        if svc_name in new_proxy_routes:
+            merged_proxy_routes[svc_name] = new_proxy_routes[svc_name]
+        else:
+            merged_proxy_routes.pop(svc_name, None)
         seeded_count += 1
         print(f"[seed-secrets] [OK] Seeded {svc_name}")
     except Exception as exc:
@@ -1555,7 +1609,10 @@ if prune:
             if svc_name in CLEARERS:
                 CLEARERS[svc_name](state_services.get(svc_name))
             state_services.pop(svc_name, None)
+            merged_proxy_routes.pop(svc_name, None)
             print(f"[seed-secrets] [PRUNED] Removed previously seeded {svc_name}")
+
+sync_credential_proxy(merged_proxy_routes)
 
 rebuild_secrets_env()
 state["services"] = state_services

@@ -33,10 +33,19 @@ else
   pass "sudo is unavailable/denied for agent user"
 fi
 
-if [[ -r /etc/wsl-agent-sandbox/policy.json ]] || [[ -r /etc/wsl-agent-sandbox/docker-policy.json ]] || [[ -w /etc/wsl.conf ]]; then
-  fail "Agent can read root-only policy.json/docker-policy.json or write /etc/wsl.conf!"
+if [[ -r /etc/wsl-agent-sandbox/policy.json ]] || [[ -r /etc/wsl-agent-sandbox/docker-policy.json ]] || [[ -r /etc/wsl-agent-sandbox/credential-proxy.json ]] || [[ -w /etc/wsl.conf ]]; then
+  fail "Agent can read root-only config/credential-proxy state or write /etc/wsl.conf!"
 else
-  pass "Root-owned config files (/etc/wsl.conf, policy.json, docker-policy.json) protected"
+  pass "Root-owned config files (/etc/wsl.conf, policy.json, docker-policy.json, credential-proxy.json) protected"
+fi
+
+if command -v curl >/dev/null 2>&1 && nc -z -w 1 127.0.0.1 3129 >/dev/null 2>&1; then
+  UNAUTH_PROXY_CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:3129/claude/v1/messages || echo "000")"
+  if [[ "${UNAUTH_PROXY_CODE}" == "401" ]] || [[ "${UNAUTH_PROXY_CODE}" == "403" ]]; then
+    pass "L7 credential-proxy rejects unauthenticated caller (HTTP ${UNAUTH_PROXY_CODE})"
+  else
+    fail "L7 credential-proxy accepted or mis-handled unauthenticated caller (HTTP ${UNAUTH_PROXY_CODE})"
+  fi
 fi
 
 if ls /run/box-root >/dev/null 2>&1; then

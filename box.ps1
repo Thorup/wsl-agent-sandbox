@@ -167,6 +167,8 @@ function Sync-AssetsToWsl {
     Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'systemd\docker-policy-proxy.service') -RemotePath '/etc/systemd/system/docker-policy-proxy.service' -Mode '0644' -NormalizeLF
     Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'scripts\linux\egress-proxy.py') -RemotePath '/usr/local/sbin/box-egress-proxy.py' -Mode '0755' -NormalizeLF
     Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'systemd\egress-proxy.service') -RemotePath '/etc/systemd/system/egress-proxy.service' -Mode '0644' -NormalizeLF
+    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'scripts\linux\credential-proxy.py') -RemotePath '/usr/local/sbin/box-credential-proxy.py' -Mode '0755' -NormalizeLF
+    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'systemd\credential-proxy.service') -RemotePath '/etc/systemd/system/credential-proxy.service' -Mode '0644' -NormalizeLF
 
     if ($IncludeProxySource) {
         $proxyFiles = @('go.mod', 'main.go', 'policy.go', 'proxy.go', 'bind_pin.go', 'policy_test.go')
@@ -412,8 +414,15 @@ function Invoke-SeedSecrets {
         return
     }
 
+<<<<<<< HEAD
     # Always sync the seeder script directly so seed-secrets works independently of init/apply
     Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'scripts\linux\box-seed-secrets.sh') -RemotePath '/usr/local/sbin/box-seed-secrets.sh' -Mode '0755' -NormalizeLF
+=======
+    # Always sync the seeder script & credential proxy assets so seed-secrets works independently of init/apply
+    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot 'scripts\linux\box-seed-secrets.sh') -RemotePath '/usr/local/sbin/box-seed-secrets.sh' -Mode '0755' -NormalizeLF
+    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot 'scripts\linux\credential-proxy.py') -RemotePath '/usr/local/sbin/box-credential-proxy.py' -Mode '0755' -NormalizeLF
+    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot 'systemd\credential-proxy.service') -RemotePath '/etc/systemd/system/credential-proxy.service' -Mode '0644' -NormalizeLF
+>>>>>>> a3f00d8 (feat(security): add root-owned L7 credential injection proxy)
 
     $payloadJson = $built.Payload | ConvertTo-Json -Depth 10 -Compress
     Write-Host "[seed-secrets] Pushing resolved credentials to '$distro' via root control plane (stdin only)..."

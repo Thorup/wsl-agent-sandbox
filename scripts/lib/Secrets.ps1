@@ -378,6 +378,19 @@ function Add-ValidatedAllowedSignerLines {
     }
 }
 
+function Get-ProxyPlaceholderToken {
+    param([Parameter(Mandatory)][string]$ServicePrefix)
+    $bytes = New-Object byte[] 24
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $rng.GetBytes($bytes)
+    } finally {
+        if ($rng -is [IDisposable]) { $rng.Dispose() }
+    }
+    $hex = -join ($bytes | ForEach-Object { $_.ToString('x2') })
+    return "sandbox-proxy-$ServicePrefix-$hex"
+}
+
 function Build-SeedSecretsPayload {
     param(
         [Parameter(Mandatory)][string]$ManifestPath,
@@ -413,6 +426,7 @@ function Build-SeedSecretsPayload {
 
     $filterServices = @(Resolve-RequestedServiceFilter -Services $Services)
     $resolvedServices = [ordered]@{}
+    $proxyRoutes = [ordered]@{}
     $summary = New-Object System.Collections.Generic.List[string]
     $skippedDisabled = New-Object System.Collections.Generic.List[string]
 
@@ -452,15 +466,29 @@ function Build-SeedSecretsPayload {
                 $setupGit = [bool](Get-ObjectProperty -Object $entry -Name 'setupGit' -Default $true)
                 $exportEnv = [bool](Get-ObjectProperty -Object $entry -Name 'exportEnv' -Default $true)
                 $loginOnline = [bool](Get-ObjectProperty -Object $entry -Name 'loginOnline' -Default $false)
+                $proxyInject = [bool](Get-ObjectProperty -Object $entry -Name 'proxyInject' -Default $false)
+                $agentToken = $token
+                $proxyBaseUrl = ''
+                if ($proxyInject) {
+                    $upstreamUrl = if ($hostname -eq 'github.com') { 'https://api.github.com' } else { "https://$hostname/api/v3" }
+                    $agentToken = Get-ProxyPlaceholderToken -ServicePrefix 'github'
+                    $proxyBaseUrl = 'http://127.0.0.1:3129/github'
+                    $proxyRoutes['github'] = [ordered]@{
+                        upstreamBaseUrl = $upstreamUrl
+                        expectedToken   = $agentToken
+                        injectHeaders   = [ordered]@{ Authorization = "Bearer $token" }
+                    }
+                }
 
                 $resolvedServices['github'] = [ordered]@{
-                    hostname    = $hostname
-                    token       = $token
-                    user        = $user
-                    gitProtocol = $gitProtocol
-                    setupGit    = $setupGit
-                    exportEnv   = $exportEnv
-                    loginOnline = $loginOnline
+                    hostname     = $hostname
+                    token        = $agentToken
+                    user         = $user
+                    gitProtocol  = $gitProtocol
+                    setupGit     = $setupGit
+                    exportEnv    = $exportEnv
+                    loginOnline  = $loginOnline
+                    proxyBaseUrl = $proxyBaseUrl
                 }
                 $summary.Add("github (host=$hostname, setupGit=$setupGit, exportEnv=$exportEnv)")
             }
@@ -1132,11 +1160,32 @@ function Build-SeedSecretsPayload {
                 if ($authType -notin @('basic', 'bearer', 'mtls')) {
                     throw "jira.authType must be 'basic', 'bearer', or 'mtls'."
                 }
+                $proxyInject = [bool](Get-ObjectProperty -Object $entry -Name 'proxyInject' -Default $false)
+                $agentJiraToken = $apiToken
+                $agentJiraServer = $server
+                if ($proxyInject) {
+                    if ($authType -eq 'mtls') {
+                        throw "jira: proxyInject cannot be used with authType 'mtls'."
+                    }
+                    $agentJiraToken = Get-ProxyPlaceholderToken -ServicePrefix 'jira'
+                    $authHeader = if ($authType -eq 'basic') {
+                        $pairBytes = [System.Text.Encoding]::UTF8.GetBytes("${login}:${apiToken}")
+                        'Basic ' + [Convert]::ToBase64String($pairBytes)
+                    } else {
+                        "Bearer $apiToken"
+                    }
+                    $proxyRoutes['jira'] = [ordered]@{
+                        upstreamBaseUrl = $server.TrimEnd('/')
+                        expectedToken   = $agentJiraToken
+                        injectHeaders   = [ordered]@{ Authorization = $authHeader }
+                    }
+                    $agentJiraServer = 'http://127.0.0.1:3129/jira'
+                }
 
                 $jiraOut = [ordered]@{
-                    server       = $server
+                    server       = $agentJiraServer
                     login        = $login
-                    apiToken     = $apiToken
+                    apiToken     = $agentJiraToken
                     installation = $installation
                     authType     = $authType
                     projectKey   = [string](Get-ObjectProperty -Object $entry -Name 'projectKey' -Default '')
@@ -1233,11 +1282,24 @@ function Build-SeedSecretsPayload {
                 if ([string]::IsNullOrWhiteSpace($apiKey) -and [string]::IsNullOrWhiteSpace($gcpProject) -and -not $useVertex) {
                     throw "gemini: specify apiKey* and/or Vertex AI settings (googleCloudProject / useVertexAi)."
                 }
+                $proxyInject = [bool](Get-ObjectProperty -Object $entry -Name 'proxyInject' -Default $false)
+                $agentApiKey = $apiKey
+                $proxyBaseUrl = ''
+                if ($proxyInject -and $apiKey) {
+                    $agentApiKey = Get-ProxyPlaceholderToken -ServicePrefix 'gemini'
+                    $proxyBaseUrl = 'http://127.0.0.1:3129/gemini'
+                    $proxyRoutes['gemini'] = [ordered]@{
+                        upstreamBaseUrl = 'https://generativelanguage.googleapis.com'
+                        expectedToken   = $agentApiKey
+                        injectHeaders   = [ordered]@{ 'x-goog-api-key' = $apiKey }
+                    }
+                }
                 $resolvedServices['gemini'] = [ordered]@{
-                    apiKey              = $apiKey
+                    apiKey              = $agentApiKey
                     googleCloudProject  = $gcpProject
                     googleCloudLocation = $gcpLoc
                     useVertexAi         = $useVertex
+                    proxyBaseUrl        = $proxyBaseUrl
                 }
                 $summary.Add("gemini (apiKey=$(-not [string]::IsNullOrWhiteSpace($apiKey)), vertex=$useVertex)")
             }
@@ -1248,9 +1310,34 @@ function Build-SeedSecretsPayload {
                 if ([string]::IsNullOrWhiteSpace($apiKey) -and [string]::IsNullOrWhiteSpace($oauthToken)) {
                     throw "claude: specify apiKey* and/or oauthToken*."
                 }
+                $proxyInject = [bool](Get-ObjectProperty -Object $entry -Name 'proxyInject' -Default $false)
+                $agentClaudeKey = $apiKey
+                $agentOauth = $oauthToken
+                $proxyBaseUrl = ''
+                if ($proxyInject) {
+                    $injectHeaders = [ordered]@{}
+                    $expectedTokens = New-Object System.Collections.Generic.List[string]
+                    if (-not [string]::IsNullOrWhiteSpace($apiKey)) {
+                        $agentClaudeKey = Get-ProxyPlaceholderToken -ServicePrefix 'claude'
+                        $injectHeaders['x-api-key'] = $apiKey
+                        $expectedTokens.Add($agentClaudeKey)
+                    }
+                    if (-not [string]::IsNullOrWhiteSpace($oauthToken)) {
+                        $agentOauth = Get-ProxyPlaceholderToken -ServicePrefix 'claude-oauth'
+                        $injectHeaders['Authorization'] = "Bearer $oauthToken"
+                        $expectedTokens.Add($agentOauth)
+                    }
+                    $proxyBaseUrl = 'http://127.0.0.1:3129/claude'
+                    $proxyRoutes['claude'] = [ordered]@{
+                        upstreamBaseUrl = 'https://api.anthropic.com'
+                        expectedTokens  = $expectedTokens.ToArray()
+                        injectHeaders   = $injectHeaders
+                    }
+                }
                 $resolvedServices['claude'] = [ordered]@{
-                    apiKey     = $apiKey
-                    oauthToken = $oauthToken
+                    apiKey       = $agentClaudeKey
+                    oauthToken   = $agentOauth
+                    proxyBaseUrl = $proxyBaseUrl
                 }
                 $summary.Add("claude (apiKey=$(-not [string]::IsNullOrWhiteSpace($apiKey)), oauthToken=$(-not [string]::IsNullOrWhiteSpace($oauthToken)))")
             }
@@ -1610,6 +1697,7 @@ function Build-SeedSecretsPayload {
 
     $payload = [ordered]@{
         services       = $resolvedServices
+        proxyRoutes    = $proxyRoutes
         filterServices = @($filterServices)
         prune          = [bool]$Prune
     }
