@@ -247,7 +247,13 @@
         "installJiraCli": { "type": "boolean" },
         "installUpctl": { "type": "boolean" },
         "installDotnetSdk": { "type": "boolean" },
-        "installRust": { "type": "boolean" }
+        "installRust": { "type": "boolean" },
+        "installCodexCli": { "type": "boolean" },
+        "installOpenCode": { "type": "boolean" },
+        "installAider": { "type": "boolean" },
+        "installHelm": { "type": "boolean" },
+        "installOpenTofu": { "type": "boolean" },
+        "installPlaywrightChromium": { "type": "boolean" }
       }
     },
     "secrets": {

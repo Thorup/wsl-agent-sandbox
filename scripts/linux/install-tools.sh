@@ -36,6 +36,12 @@ INSTALL_JIRA="$(flag installJiraCli False)"
 INSTALL_UPCTL="$(flag installUpctl False)"
 INSTALL_DOTNET="$(flag installDotnetSdk False)"
 INSTALL_RUST="$(flag installRust False)"
+INSTALL_CODEX="$(flag installCodexCli False)"
+INSTALL_OPENCODE="$(flag installOpenCode False)"
+INSTALL_AIDER="$(flag installAider False)"
+INSTALL_HELM="$(flag installHelm False)"
+INSTALL_OPENTOFU="$(flag installOpenTofu False)"
+INSTALL_PLAYWRIGHT="$(flag installPlaywrightChromium False)"
 AGENT_NAME="$(python3 -c "import json; d=json.load(open('${POLICY_FILE}')); print(d['agentUser']['name'])")"
 
 ARCH="$(dpkg --print-architecture)" # amd64 or arm64
@@ -253,4 +259,83 @@ if [[ "${INSTALL_JIRA}" == "1" ]] && ! command -v jira >/dev/null 2>&1; then
   rm -rf "${TMP_DIR}"
   trap - EXIT
   log "Installed $(/usr/local/bin/jira version 2>&1 | head -n 1)."
+fi
+
+# 14. Additional AI Coding Agents (Codex CLI, OpenCode, Aider)
+if [[ "${INSTALL_CODEX}" == "1" ]]; then
+  if [[ "${INSTALL_NODE}" != "1" ]] || ! command -v npm >/dev/null 2>&1; then
+    log "WARNING: installCodexCli is enabled but Node.js/npm is unavailable (installNodeLts=${INSTALL_NODE}); skipping Codex CLI install."
+  elif ! command -v codex >/dev/null 2>&1; then
+    log "Installing @openai/codex..."
+    npm install -g @openai/codex
+  fi
+fi
+
+if [[ "${INSTALL_OPENCODE}" == "1" ]]; then
+  if [[ "${INSTALL_NODE}" != "1" ]] || ! command -v npm >/dev/null 2>&1; then
+    log "WARNING: installOpenCode is enabled but Node.js/npm is unavailable (installNodeLts=${INSTALL_NODE}); skipping OpenCode install."
+  elif ! command -v opencode >/dev/null 2>&1; then
+    log "Installing opencode-ai..."
+    npm install -g opencode-ai
+  fi
+fi
+
+if [[ "${INSTALL_AIDER}" == "1" ]]; then
+  if [[ "${INSTALL_UV}" != "1" ]] || ! command -v uv >/dev/null 2>&1; then
+    log "WARNING: installAider is enabled but uv is unavailable (installUv=${INSTALL_UV}); skipping Aider install."
+  elif [[ ! -x "/home/${AGENT_NAME}/.local/bin/aider" ]]; then
+    log "Installing aider-chat via uv (Python 3.12) for '${AGENT_NAME}'..."
+    # aider-chat requires Python <3.13; use uv-managed Python 3.12 on Ubuntu 26.04.
+    # shellcheck disable=SC2016 # $HOME expands inside the target user's shell
+    su -s /bin/bash - "${AGENT_NAME}" -c 'uv tool install --python 3.12 aider-chat'
+  fi
+fi
+
+# 15. Helm (official release tarball with SHA256 verification)
+if [[ "${INSTALL_HELM}" == "1" ]] && ! command -v helm >/dev/null 2>&1; then
+  log "Installing Helm (${ARCH}) with SHA256 verification..."
+  TMP_DIR="$(mktemp -d)"
+  trap 'rm -rf "${TMP_DIR}"' EXIT
+  HELM_VER="$(curl -fsSL -H 'Accept: application/vnd.github+json' https://api.github.com/repos/helm/helm/releases/latest | python3 -c "import json,sys; print(json.load(sys.stdin)['tag_name'])")"
+  HELM_TAR="helm-${HELM_VER}-linux-${ARCH}.tar.gz"
+  curl -fsSL "https://get.helm.sh/${HELM_TAR}" -o "${TMP_DIR}/${HELM_TAR}"
+  curl -fsSL "https://get.helm.sh/${HELM_TAR}.sha256sum" -o "${TMP_DIR}/${HELM_TAR}.sha256sum"
+  (cd "${TMP_DIR}" && sha256sum --check "${HELM_TAR}.sha256sum")
+  tar -xzf "${TMP_DIR}/${HELM_TAR}" -C "${TMP_DIR}"
+  install -o root -g root -m 0755 "${TMP_DIR}/linux-${ARCH}/helm" /usr/local/bin/helm
+  rm -rf "${TMP_DIR}"
+  trap - EXIT
+  log "Installed $(/usr/local/bin/helm version --short 2>&1)."
+fi
+
+# 16. OpenTofu (official signed APT repository)
+if [[ "${INSTALL_OPENTOFU}" == "1" ]] && ! command -v tofu >/dev/null 2>&1; then
+  log "Installing OpenTofu via official signed APT repository..."
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL https://get.opentofu.org/opentofu.gpg -o /etc/apt/keyrings/opentofu.gpg
+  curl -fsSL https://packages.opentofu.org/opentofu/tofu/gpgkey | gpg --dearmor --yes -o /etc/apt/keyrings/opentofu-repo.gpg
+  chmod a+r /etc/apt/keyrings/opentofu.gpg /etc/apt/keyrings/opentofu-repo.gpg
+  cat >/etc/apt/sources.list.d/opentofu.list <<'EOF'
+deb [signed-by=/etc/apt/keyrings/opentofu.gpg,/etc/apt/keyrings/opentofu-repo.gpg] https://packages.opentofu.org/opentofu/tofu/any/ any main
+EOF
+  apt-get update -y
+  apt-get install -y --no-install-recommends tofu
+  log "Installed $(tofu version 2>&1 | head -n 1)."
+fi
+
+# 17. Headless Playwright Chromium + system dependencies
+if [[ "${INSTALL_PLAYWRIGHT}" == "1" ]]; then
+  if [[ "${INSTALL_NODE}" != "1" ]] || ! command -v npm >/dev/null 2>&1; then
+    log "WARNING: installPlaywrightChromium is enabled but Node.js/npm is unavailable (installNodeLts=${INSTALL_NODE}); skipping Playwright Chromium install."
+  else
+    if ! command -v playwright >/dev/null 2>&1; then
+      log "Installing global playwright CLI..."
+      npm install -g playwright
+    fi
+    if [[ ! -d "/home/${AGENT_NAME}/.cache/ms-playwright" ]]; then
+      log "Installing Playwright Chromium + system dependencies..."
+      playwright install-deps chromium
+      su -s /bin/bash - "${AGENT_NAME}" -c 'playwright install chromium'
+    fi
+  fi
 fi
