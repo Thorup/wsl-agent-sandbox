@@ -18,7 +18,7 @@
 #Requires -Version 5.1
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('init', 'up', 'apply', 'seed-secrets', 'clear-secrets', 'shell', 'root-shell', 'status', 'verify', 'snapshot', 'reset', 'destroy', 'help')]
+    [ValidateSet('init', 'up', 'apply', 'upgrade', 'doctor', 'compact', 'seed-secrets', 'clear-secrets', 'register-terminal', 'shell', 'root-shell', 'status', 'verify', 'snapshot', 'restore', 'reset', 'destroy', 'help')]
     [string]$Command = 'help',
 
     [Parameter(Position = 1)]
@@ -36,7 +36,17 @@ param(
 
     [switch]$Force,
 
-    [switch]$RebuildProxy
+    [switch]$RebuildProxy,
+
+    [switch]$Golden,
+
+    [switch]$SaveGolden,
+
+    [switch]$Full,
+
+    [switch]$Unregister,
+
+    [string[]]$Scope = @('all')
 )
 
 Set-StrictMode -Version Latest
@@ -50,6 +60,7 @@ if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
 . (Join-Path $RepoRoot 'scripts\lib\Image.ps1')
 . (Join-Path $RepoRoot 'scripts\lib\Wsl.ps1')
 . (Join-Path $RepoRoot 'scripts\lib\Secrets.ps1')
+. (Join-Path $RepoRoot 'scripts\lib\Terminal.ps1')
 
 function Show-Usage {
     @"
@@ -65,17 +76,26 @@ Commands:
   apply              Push updated box.json (shared folders, allowed host ports, Docker policy,
                      apt packages, CLI/language toolchains) and reload hardening + proxy live
                      without rebuilding (use -RebuildProxy to rebuild docker-policy-proxy).
+  upgrade            Update installed apt packages, AI agents, and toolchains in place
+                     (optional -Scope apt,agents,toolchains).
+  doctor             Run Windows + WSL preflight diagnostics (WSL2, .wslconfig, Docker Desktop,
+                     systemd health, VHDX disk size, image cache).
+  compact            Trim free blocks inside WSL (fstrim) and compact the distro's ext4.vhdx.
   seed-secrets [path] Seed or rotate CLI tokens, service accounts, and Git/SSH credentials from a
                      central Windows manifest (default: %USERPROFILE%\.wsl-agent-sandbox\secrets.json)
                      independently of init/apply. Supports -SecretsPath, -Service <names>, -Prune, -DryRun.
   clear-secrets      Remove managed seeded CLI credentials inside WSL (optionally scoped via -Service).
+  register-terminal  Add or update a dedicated Windows Terminal profile for this sandbox
+                     (pass -Unregister to remove it).
   shell              Open an interactive shell inside the box as the non-root agent user.
   root-shell         Open an administrative root shell (Windows host control plane only).
   status             Show distro state, systemd service health, active /shared mounts, seeded secrets, and warnings.
   verify             Run full red-team isolation audit + Windows<->WSL localhost web test +
                      blocked Windows host port test + Docker escape tests.
-  snapshot [path]    Export the distro to a .tar backup (defaults to .cache\<distro>-<timestamp>.tar).
-  reset              Destroy and re-provision a clean distro from cached Ubuntu 26.04 image.
+  snapshot [path]    Export the distro to a .tar backup (defaults to .cache\<distro>-<timestamp>.tar;
+                     pass -Golden to save .cache\<distro>-golden.tar for fast resets).
+  restore <path>     Unregister the current distro, import a .tar backup, re-apply box.json, and verify.
+  reset              Fast-restore from golden snapshot if present (pass -Full for clean Ubuntu rebuild).
   destroy            Unregister the WSL distro and remove its VHDX directory (use -Force to skip prompt).
 "@
 }
@@ -112,8 +132,102 @@ function Sync-AssetsToWsl {
     }
 }
 
+function Get-GoldenSnapshotPath {
+    param([Parameter(Mandatory)]$Config)
+    $cacheDir = Expand-BoxPath -RawPath $Config.image.cacheDir -BaseDir $RepoRoot
+    return (Join-Path $cacheDir "$($Config.distroName)-golden.tar")
+}
+
+function Invoke-Snapshot {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [string]$OutFile = '',
+        [switch]$Golden
+    )
+    if (-not (Test-WslDistroExists -DistroName $Config.distroName)) {
+        throw "Distro '$($Config.distroName)' does not exist."
+    }
+    $cacheDir = Expand-BoxPath -RawPath $Config.image.cacheDir -BaseDir $RepoRoot
+    if ($Golden) {
+        $OutFile = Get-GoldenSnapshotPath -Config $Config
+    } elseif ([string]::IsNullOrWhiteSpace($OutFile)) {
+        $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+        $OutFile = Join-Path $cacheDir "$($Config.distroName)-$stamp.tar"
+    } else {
+        $OutFile = Expand-BoxPath -RawPath $OutFile -BaseDir $RepoRoot
+    }
+
+    $outParent = Split-Path -Parent $OutFile
+    if (-not [string]::IsNullOrWhiteSpace($outParent) -and -not (Test-Path -LiteralPath $outParent)) {
+        New-Item -ItemType Directory -Path $outParent -Force | Out-Null
+    }
+
+    $tmpOut = "$OutFile.tmp.$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
+    Write-Host "[snapshot] Exporting '$($Config.distroName)' -> '$OutFile'..."
+    try {
+        & wsl.exe --export $Config.distroName $tmpOut
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $tmpOut -PathType Leaf)) {
+            throw "wsl --export failed (exit code $LASTEXITCODE)."
+        }
+        Move-Item -LiteralPath $tmpOut -Destination $OutFile -Force
+    } finally {
+        if (Test-Path -LiteralPath $tmpOut -PathType Leaf) {
+            Remove-Item -LiteralPath $tmpOut -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Write-Host "[snapshot] Saved: $OutFile"
+}
+
+function Invoke-Restore {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [string]$SnapshotPath = '',
+        [switch]$Force
+    )
+    if ([string]::IsNullOrWhiteSpace($SnapshotPath)) {
+        throw "Snapshot path is required. Usage: .\box.ps1 restore <path-to-snapshot.tar>"
+    }
+    $SnapshotPath = Expand-BoxPath -RawPath $SnapshotPath -BaseDir $RepoRoot
+    if (-not (Test-Path -LiteralPath $SnapshotPath -PathType Leaf)) {
+        throw "Snapshot file not found: '$SnapshotPath'"
+    }
+    $distro = $Config.distroName
+    $installDir = Expand-BoxPath -RawPath $Config.installDir -BaseDir $RepoRoot
+
+    if (Test-WslDistroExists -DistroName $distro) {
+        Invoke-Destroy -Config $Config -Force:$Force
+        if (Test-WslDistroExists -DistroName $distro) {
+            return
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath $installDir)) {
+        New-Item -ItemType Directory -Path $installDir -Force | Out-Null
+    }
+    Write-Host "[restore] Importing '$distro' into '$installDir' from '$SnapshotPath' (WSL 2)..."
+    & wsl.exe --import $distro $installDir $SnapshotPath --version 2
+    if ($LASTEXITCODE -ne 0) {
+        throw "wsl --import failed with exit code $LASTEXITCODE."
+    }
+
+    Write-Host "[restore] Syncing current policy and scripts, and waiting for systemd..."
+    Sync-AssetsToWsl -Config $Config
+    if (-not (Wait-WslSystemdReady -DistroName $distro -TimeoutSeconds 60 -SkipHardeningCheck)) {
+        throw "Restored distro '$distro' systemd did not finish booting."
+    }
+
+    Invoke-Apply -Config $Config
+    if (-not (Wait-WslSystemdReady -DistroName $distro -TimeoutSeconds 30)) {
+        throw "Restored distro '$distro' systemd hardening did not reach active state."
+    }
+    Invoke-Verify -Config $Config
+}
+
 function Invoke-Init {
-    param($Config)
+    param(
+        $Config,
+        [switch]$SaveGolden
+    )
     $distro = $Config.distroName
     $installDir = Expand-BoxPath -RawPath $Config.installDir -BaseDir $RepoRoot
 
@@ -169,6 +283,12 @@ function Invoke-Init {
 
     Write-Host "[init] '$distro' is provisioned and hardened! Running verification..."
     Invoke-Verify -Config $Config
+
+    $goldenPath = Get-GoldenSnapshotPath -Config $Config
+    if ($SaveGolden -or -not (Test-Path -LiteralPath $goldenPath -PathType Leaf)) {
+        Write-Host "[init] Saving golden base snapshot for fast resets -> '$goldenPath'..."
+        Invoke-Snapshot -Config $Config -Golden
+    }
 }
 
 function Invoke-Apply {
@@ -319,6 +439,16 @@ echo "Active nftables table inet wsl_agent_sandbox:"
 nft list table inet wsl_agent_sandbox 2>/dev/null || echo "  (not loaded)"
 '@
     Invoke-WslRootBash -DistroName $distro -Script $statusScript
+    $installDir = Expand-BoxPath -RawPath $Config.installDir -BaseDir $RepoRoot
+    $vhdx = Join-Path $installDir 'ext4.vhdx'
+    if (Test-Path -LiteralPath $vhdx -PathType Leaf) {
+        $sizeGB = [Math]::Round(((Get-Item -LiteralPath $vhdx).Length / 1GB), 2)
+        Write-Host ""
+        Write-Host "VHDX disk footprint: ${sizeGB} GB ($vhdx)"
+    }
+    if ($Config.PSObject.Properties['resources'] -and $null -ne $Config.resources) {
+        Write-Host "Configured agent UID slice quotas: $($Config.resources | ConvertTo-Json -Compress)"
+    }
     foreach ($w in (Get-GlobalWslConfigWarnings)) {
         Write-Warning $w
     }
@@ -450,6 +580,197 @@ function Invoke-Verify {
     Write-Host "[verify] ALL security containment and capability checks PASSED!"
 }
 
+function Invoke-Upgrade {
+    param(
+        $Config,
+        [string[]]$Scope = @('all')
+    )
+    $distro = $Config.distroName
+    if (-not (Test-WslDistroExists -DistroName $distro)) {
+        throw "Distro '$distro' does not exist. Run '.\box.ps1 init' first."
+    }
+    $validScopes = @('all', 'apt', 'agents', 'toolchains')
+    $normalized = New-Object System.Collections.Generic.List[string]
+    foreach ($s in @($Scope)) {
+        foreach ($part in ($s -split ',')) {
+            $clean = $part.Trim().ToLowerInvariant()
+            if (-not $clean) { continue }
+            if ($clean -notin $validScopes) {
+                throw "Invalid -Scope '$clean'. Valid values: $($validScopes -join ', ')"
+            }
+            $normalized.Add($clean)
+        }
+    }
+    $scopeArg = if ($normalized.Count -gt 0) { $normalized -join ',' } else { 'all' }
+    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $RepoRoot 'scripts\linux\upgrade-tools.sh') -RemotePath '/usr/local/sbin/box-upgrade-tools.sh' -Mode '0755' -NormalizeLF
+    Write-Host "[upgrade] Running in-place upgrade in '$distro' (scope=$scopeArg)..."
+    & wsl.exe -d $distro -u root -- /usr/local/sbin/box-upgrade-tools.sh $scopeArg
+    if ($LASTEXITCODE -ne 0) {
+        throw "upgrade-tools.sh failed with exit code $LASTEXITCODE."
+    }
+}
+
+function Invoke-Doctor {
+    param($Config)
+    Write-Host "=== wsl-agent-sandbox Doctor ==="
+    $hasFail = $false
+
+    # 1. WSL2 availability
+    $wslCmd = Get-Command wsl.exe -ErrorAction SilentlyContinue
+    if (-not $wslCmd) {
+        Write-Host "  [FAIL] wsl.exe not found on PATH. Ensure WSL2 is installed and enabled."
+        $hasFail = $true
+    } else {
+        try {
+            $null = & $wslCmd.Source --status 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "  [PASS] WSL2 CLI reachable (wsl.exe --status)"
+            } else {
+                Write-Host "  [FAIL] wsl.exe --status failed (exit code $LASTEXITCODE). Ensure WSL2 is installed and enabled."
+                $hasFail = $true
+            }
+        } catch {
+            Write-Host "  [FAIL] wsl.exe --status error: $($_.Exception.Message)"
+            $hasFail = $true
+        }
+    }
+
+    # 2. Global .wslconfig checks
+    $warnings = @(Get-GlobalWslConfigWarnings)
+    if ($warnings.Count -eq 0) {
+        Write-Host "  [PASS] Global .wslconfig has no blocking warnings"
+    } else {
+        foreach ($w in $warnings) {
+            Write-Host "  [WARN] $w"
+        }
+    }
+
+    # 3. Distro & systemd checks
+    $distro = $Config.distroName
+    $distroInstalled = $wslCmd -and (Test-WslDistroExists -DistroName $distro)
+    if ($distroInstalled) {
+        Write-Host "  [PASS] Distro '$distro' is registered"
+        $runningRaw = & $wslCmd.Source --list --quiet --running 2>$null
+        $runningList = @($runningRaw | ForEach-Object { ("$_" -replace "`0", '').Trim() } | Where-Object { $_ })
+        if ($runningList -notcontains $distro) {
+            Write-Host "  [INFO] Distro '$distro' was stopped; waiting for systemd startup..."
+            [void](Wait-WslSystemdReady -DistroName $distro -TimeoutSeconds 45)
+        }
+        $sysState = (& $wslCmd.Source -d $distro -u root -- sh -c "systemctl is-system-running 2>/dev/null || echo inactive" | Out-String).Trim()
+        if ($sysState -eq 'running' -or $sysState -eq 'degraded') {
+            Write-Host "  [PASS] systemd state: $sysState"
+        } else {
+            Write-Host "  [WARN] systemd state: $sysState (try '.\box.ps1 up')"
+        }
+        $hardenState = (& $wslCmd.Source -d $distro -u root -- sh -c "systemctl is-active box-hardening.service 2>/dev/null || echo inactive" | Out-String).Trim()
+        if ($hardenState -eq 'active') {
+            Write-Host "  [PASS] box-hardening.service is active"
+        } else {
+            Write-Host "  [FAIL] box-hardening.service is $hardenState (run '.\box.ps1 apply')"
+            $hasFail = $true
+        }
+    } else {
+        Write-Host "  [WARN] Distro '$distro' is not installed yet (run '.\box.ps1 init')"
+    }
+
+    # 4. Docker Desktop bridge & WSL proxy check
+    if ($Config.docker.enabled) {
+        $pipes = @(Get-ChildItem '\\.\pipe\' -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'docker_engine' })
+        if ($pipes.Count -gt 0) {
+            Write-Host "  [PASS] Docker Desktop named pipe (docker_engine) is active"
+        } else {
+            Write-Host "  [WARN] Docker Desktop is not running (docker.enabled=true). Start Docker Desktop on Windows."
+        }
+        if ($distroInstalled) {
+            $ddSock = (& $wslCmd.Source -d $distro -u root -- sh -c '[ -S /run/box-root/mnt-wsl/box-binds/dd-upstream.sock ] && echo OK || echo MISSING' 2>$null | Out-String).Trim()
+            if ($ddSock -eq 'OK') {
+                Write-Host "  [PASS] Docker upstream socket bridge (dd-upstream.sock) present"
+            } else {
+                Write-Host "  [WARN] Docker upstream socket bridge (dd-upstream.sock) missing (run '.\box.ps1 up' or '.\box.ps1 apply')"
+            }
+            $proxyState = (& $wslCmd.Source -d $distro -u root -- sh -c "systemctl is-active docker-policy-proxy.service 2>/dev/null || echo inactive" | Out-String).Trim()
+            if ($proxyState -eq 'active') {
+                Write-Host "  [PASS] docker-policy-proxy.service is active"
+            } else {
+                Write-Host "  [FAIL] docker-policy-proxy.service is $proxyState (run '.\box.ps1 apply')"
+                $hasFail = $true
+            }
+        }
+    } else {
+        Write-Host "  [PASS] Docker integration disabled per policy (docker.enabled=false)"
+    }
+
+    # 5. VHDX disk size & image cache
+    $installDir = Expand-BoxPath -RawPath $Config.installDir -BaseDir $RepoRoot
+    $vhdx = Join-Path $installDir 'ext4.vhdx'
+    if (Test-Path -LiteralPath $vhdx -PathType Leaf) {
+        $sizeGB = [Math]::Round(((Get-Item -LiteralPath $vhdx).Length / 1GB), 2)
+        Write-Host "  [PASS] VHDX footprint: ${sizeGB} GB ($vhdx)"
+    }
+    $cacheDir = Expand-BoxPath -RawPath $Config.image.cacheDir -BaseDir $RepoRoot
+    $cachedImages = @(Get-ChildItem -Path $cacheDir -Filter 'ubuntu-*.wsl' -ErrorAction SilentlyContinue)
+    if ($cachedImages.Count -gt 0) {
+        Write-Host "  [PASS] Cached Ubuntu WSL image(s): $($cachedImages.Name -join ', ')"
+    } else {
+        Write-Host "  [WARN] No cached Ubuntu .wsl image in '$cacheDir' (will download on init)"
+    }
+
+    if ($hasFail) {
+        throw "Doctor found one or more failing checks."
+    }
+}
+
+function Invoke-Compact {
+    param($Config)
+    $distro = $Config.distroName
+    if (-not (Test-WslDistroExists -DistroName $distro)) {
+        throw "Distro '$distro' does not exist."
+    }
+    $installDir = Expand-BoxPath -RawPath $Config.installDir -BaseDir $RepoRoot
+    $vhdx = Join-Path $installDir 'ext4.vhdx'
+    if (-not (Test-Path -LiteralPath $vhdx -PathType Leaf)) {
+        throw "VHDX file not found at '$vhdx'."
+    }
+    $principal = New-Object System.Security.Principal.WindowsPrincipal([System.Security.Principal.WindowsIdentity]::GetCurrent())
+    if (-not $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw "VHDX compaction requires an elevated Administrator PowerShell session (Optimize-VHD and diskpart require Administrator privileges)."
+    }
+
+    $beforeBytes = (Get-Item -LiteralPath $vhdx).Length
+    Write-Host "[compact] Running fstrim inside '$distro'..."
+    & wsl.exe -d $distro -u root -- fstrim -av
+    if ($LASTEXITCODE -ne 0) {
+        throw "fstrim inside '$distro' failed with exit code $LASTEXITCODE."
+    }
+    Write-Host "[compact] Terminating '$distro' before VHDX compaction..."
+    & wsl.exe --terminate $distro | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "wsl --terminate '$distro' failed with exit code $LASTEXITCODE."
+    }
+    Start-Sleep -Seconds 2
+
+    if (Get-Command Optimize-VHD -ErrorAction SilentlyContinue) {
+        Write-Host "[compact] Compacting '$vhdx' via Optimize-VHD..."
+        Optimize-VHD -Path $vhdx -Mode Full
+    } else {
+        Write-Host "[compact] Optimize-VHD unavailable; compacting '$vhdx' via diskpart..."
+        $dpScript = "select vdisk file=""$vhdx""`r`nattach vdisk readonly`r`ncompact vdisk`r`ndetach vdisk"
+        $tmpDp = Join-Path ([System.IO.Path]::GetTempPath()) ("wsl-compact-" + [Guid]::NewGuid().ToString('N').Substring(0, 8) + ".txt")
+        try {
+            [System.IO.File]::WriteAllText($tmpDp, $dpScript, [System.Text.Encoding]::Unicode)
+            $dpOut = (& diskpart.exe /s $tmpDp 2>&1 | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0) {
+                throw "diskpart compaction failed (exit code $LASTEXITCODE): $dpOut"
+            }
+        } finally {
+            Remove-Item -LiteralPath $tmpDp -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $afterBytes = (Get-Item -LiteralPath $vhdx).Length
+    $savedMB = [Math]::Round(($beforeBytes - $afterBytes) / 1MB, 1)
+    Write-Host ("[compact] Done: {0:N2} GB -> {1:N2} GB (reclaimed {2:N1} MB)." -f ($beforeBytes / 1GB), ($afterBytes / 1GB), $savedMB)
+}
+
 function Invoke-Destroy {
     param(
         $Config,
@@ -485,7 +806,7 @@ $cfg = Read-BoxConfig -ConfigPath $ConfigPath
 
 switch ($Command) {
     'init' {
-        Invoke-Init -Config $cfg
+        Invoke-Init -Config $cfg -SaveGolden:$SaveGolden
     }
     'up' {
         if (-not (Test-WslDistroExists -DistroName $cfg.distroName)) {
@@ -503,11 +824,23 @@ switch ($Command) {
     'apply' {
         Invoke-Apply -Config $cfg -RebuildProxy:$RebuildProxy
     }
+    'upgrade' {
+        Invoke-Upgrade -Config $cfg -Scope $Scope
+    }
+    'doctor' {
+        Invoke-Doctor -Config $cfg
+    }
+    'compact' {
+        Invoke-Compact -Config $cfg
+    }
     'seed-secrets' {
         Invoke-SeedSecrets -Config $cfg -SecretsPath $SecretsPath -Service $Service -Prune:$Prune -DryRun:$DryRun
     }
     'clear-secrets' {
         Invoke-ClearSecrets -Config $cfg -Service $Service
+    }
+    'register-terminal' {
+        [void](Register-WindowsTerminalProfile -Config $cfg -Unregister:$Unregister)
     }
     'shell' {
         if ($cfg.docker.enabled) {
@@ -525,24 +858,20 @@ switch ($Command) {
         Invoke-Verify -Config $cfg
     }
     'snapshot' {
-        if (-not (Test-WslDistroExists -DistroName $cfg.distroName)) {
-            throw "Distro '$($cfg.distroName)' does not exist."
-        }
-        $outFile = $Argument
-        if ([string]::IsNullOrWhiteSpace($outFile)) {
-            $cacheDir = Expand-BoxPath -RawPath $cfg.image.cacheDir -BaseDir $RepoRoot
-            if (-not (Test-Path -LiteralPath $cacheDir)) { New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null }
-            $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-            $outFile = Join-Path $cacheDir "$($cfg.distroName)-$stamp.tar"
-        }
-        Write-Host "[snapshot] Exporting '$($cfg.distroName)' -> '$outFile'..."
-        & wsl.exe --export $cfg.distroName $outFile
-        if ($LASTEXITCODE -ne 0) { throw "wsl --export failed." }
-        Write-Host "[snapshot] Saved: $outFile"
+        Invoke-Snapshot -Config $cfg -OutFile $Argument -Golden:$Golden
+    }
+    'restore' {
+        Invoke-Restore -Config $cfg -SnapshotPath $Argument -Force:$Force
     }
     'reset' {
-        Invoke-Destroy -Config $cfg -Force:$Force
-        Invoke-Init -Config $cfg
+        $goldenPath = Get-GoldenSnapshotPath -Config $cfg
+        if ((-not $Full) -and (Test-Path -LiteralPath $goldenPath -PathType Leaf)) {
+            Write-Host "[reset] Fast-restoring from golden snapshot '$goldenPath' (use -Full for clean Ubuntu rebuild)..."
+            Invoke-Restore -Config $cfg -SnapshotPath $goldenPath -Force:$Force
+        } else {
+            Invoke-Destroy -Config $cfg -Force:$Force
+            Invoke-Init -Config $cfg -SaveGolden:($Full -or $SaveGolden)
+        }
     }
     'destroy' {
         Invoke-Destroy -Config $cfg -Force:$Force
