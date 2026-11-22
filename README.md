@@ -100,16 +100,26 @@ Use this table to determine what can reach a port forwarded to your Windows clie
    - **NAT mode (default WSL2):** Windows `127.0.0.1` is not routed into WSL NAT, so bind the forward to your Windows host/WSL interface (e.g., `kubectl port-forward --address 0.0.0.0 ... 8080:<target>` or the `vEthernet (WSL)` IP), allow the port through Windows Firewall if prompted, and connect from WSL to the Windows host gateway IP (`ip route show default | awk '{print $3}'`).
 
 ### Add System `apt` Packages & Cloud/Agent/Language Toolchains
-Add package names to `packages.apt` or toggle built-in installers (`installKubectl`, `installAwsCli`, `installGcloudCli`, `installAzureCli`, `installAzureDevopsCli`, `installGithubCli`, `installJiraCli`, `installUpctl`, `installDotnetSdk`, `installRust`, `installGeminiCli`, `installClaudeCode`) in `box.json` and run `.\box.ps1 apply`. (User-space tools via `uv`, `pip`, `npm`, `pnpm`, `cargo`, `rustup`, and `dotnet tool install -g` can be installed freely by the agent inside `/home/agent` without `sudo`.)
+Add package names to `packages.apt` or toggle any of the 22 built-in installers in `box.json` (or `box.local.json`) and run `.\box.ps1 apply`:
+- **Core Runtimes & Package Managers:** `installDockerCli`, `installUv`, `installNodeLts`, `installPnpm`, `installDotnetSdk`, `installRust`
+- **AI Coding Agents:** `installGeminiCli`, `installClaudeCode`, `installCodexCli`, `installOpenCode`, `installAider`
+- **Cloud, Kubernetes, IaC & DevOps CLIs:** `installKubectl`, `installHelm`, `installOpenTofu`, `installAwsCli`, `installGcloudCli`, `installAzureCli`, `installAzureDevopsCli`, `installGithubCli`, `installJiraCli`, `installUpctl`, `installPlaywrightChromium`
+
+(User-space tools via `uv`, `pip`, `npm`, `pnpm`, `cargo`, `rustup`, and `dotnet tool install -g` can also be installed freely by the agent inside `/home/agent` without `sudo`.)
+
+### Named Multi-Box Profiles (`-Profile <name>` & `.\box.ps1 list`)
+Run multiple independent, isolated sandboxes side-by-side (each with its own WSL distribution, VHDX directory, and deterministic high UID in `26100..26998` so per-UID `nftables` rules never collide):
+- Create an optional `box.<profile>.json` (or `profiles/<profile>.json`) override file, or pass `-Profile <name>` directly to any command (`.\box.ps1 init -Profile untrusted`, `.\box.ps1 shell -Profile untrusted`, `.\box.ps1 apply -Profile untrusted`).
+- Run `.\box.ps1 list` to inspect all configured sandbox profiles, their resolved distro names, UIDs, and WSL installation states.
 
 ---
 
 ## Using Other AI Agents (Claude Code, Codex, etc.)
 
 Because every containment boundary (non-root UID `26040`, no `sudo`, no `/mnt/c`, no Windows interop, no WSLg/clipboard, per-UID `nftables` + `loopback0` blocking, and `docker-policy-proxy`) is enforced at the **Linux OS / kernel / systemd level**, this box works identically for **any** CLI or IDE agent:
-- **Gemini CLI** (`gemini` — pre-installed)
+- **Gemini CLI** (`gemini` — pre-installed by default; toggle `installGeminiCli` in `box.json`)
 - **Claude Code** (`claude` — pre-installed by default; toggle `installClaudeCode` in `box.json`)
-- **OpenAI Codex CLI**, **Aider**, **OpenCode**, or custom agents (installable via `npm`/`uv` in user-space or via `box.json`)
+- **OpenAI Codex CLI** (`codex` — toggle `installCodexCli: true` in `box.json`), **OpenCode** (`opencode` — toggle `installOpenCode: true`), **Aider** (`aider` — toggle `installAider: true`), or custom agents (installable via ` box.json` toggles or in user-space via `npm`/`uv`)
 
 > **Cloud Credentials Note**: Any credentials you configure inside `/home/agent` (`~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.config/gh`, `~/.config/.jira`, `~/.config/upctl.yaml`, `~/.kube/config`) are accessible to autonomous agents running in this box. Use dedicated, least-privilege sandbox accounts/clusters or short-lived tokens rather than production admin credentials.
 
@@ -128,10 +138,11 @@ New-Item -ItemType Directory -Path "$env:USERPROFILE\.wsl-agent-sandbox" -Force 
 Copy-Item .\examples\secrets.example.json "$env:USERPROFILE\.wsl-agent-sandbox\secrets.json"
 ```
 
-Every secret field supports **three sources**:
+Every secret field supports **four mutually exclusive sources**:
 - **Inline value** (e.g., `"token": "..."`)
 - **Relative or absolute Windows file** (e.g., `"tokenFile": "tokens/github.txt"`, `"serviceAccountKeyFile": "keys/gcp-sa.json"` — relative paths resolve against the directory containing `secrets.json`, and `%ENVVAR%` expansion is supported)
 - **Windows environment variable** (e.g., `"tokenEnv": "SANDBOX_GH_TOKEN"`)
+- **Password manager or cloud vault URI** (e.g., `"tokenVault": "op://Sandbox/GitHub/pat"` — supports `op://` 1Password CLI, `bw://` Bitwarden CLI, `dpapi://` Windows CurrentUser DPAPI encrypted file, `azkv://` Azure Key Vault, `awssm://` AWS Secrets Manager, and `gcpsm://` GCP Secret Manager, resolved on Windows at seed time)
 
 Manifest path resolution priority:
 1. CLI argument: `.\box.ps1 seed-secrets "D:\vault\secrets.json"` or `-SecretsPath "D:\vault\secrets.json"`
@@ -210,23 +221,26 @@ Manifest path resolution priority:
 
 ## Lifecycle Commands
 
-- `.\box.ps1 init` — Full download (with SHA256 verification), import, provision, harden, verify.
+All commands accept `-Profile <name>` (alias `-ProfileName`) to target a named sandbox profile and `-ConfigPath <path>` to use a custom config file.
+
+- `.\box.ps1 init [-SaveGolden]` — Full download (with SHA256 verification), import, provision, harden, verify, and save initial golden snapshot.
 - `.\box.ps1 up` — Ensure the distro is running and systemd hardening services are active (runs `init` if not installed).
-- `.\box.ps1 apply` — Hot-reload `box.json` changes (mounts, ports, Docker policy, `apt` packages, CLI/language toolchains); pass `-RebuildProxy` to rebuild `docker-policy-proxy`.
-- `.\box.ps1 upgrade` — Update installed `apt` packages, AI agents, and toolchains in place (optional `-Scope apt,agents,toolchains`).
+- `.\box.ps1 apply [-RebuildProxy]` — Hot-reload `box.json` / `box.local.json` changes (mounts, ports, Docker policy, `apt` packages, CLI/language toolchains); pass `-RebuildProxy` to rebuild `docker-policy-proxy`.
+- `.\box.ps1 upgrade [-Scope all|apt,agents,toolchains]` — Update installed `apt` packages, AI agents, and toolchains in place.
 - `.\box.ps1 doctor` — Run Windows + WSL preflight diagnostics (WSL2, `.wslconfig`, Docker Desktop, systemd, VHDX size, image cache).
-- `.\box.ps1 compact` — Run `fstrim` inside WSL and compact `ext4.vhdx` to reclaim disk space.
-- `.\box.ps1 logs` / `.\box.ps1 audit` — View root-owned security events (`nftables` drops, `docker-policy-proxy` denials, `box-hardening` reloads) filtered by `-Source` and `-Since`.
-- `.\box.ps1 push-repo <path>` / `pull-diff <name>` / `pull-branch <name>` — Transfer git repos via bundle onto native Linux `ext4` (`~/work/<name>`) and pull reviewable branches back without `rw` `/shared` mounts.
-- `.\box.ps1 seed-secrets [path]` — Seed or rotate CLI service tokens and service account credentials from a central Windows manifest (independently of `init`/`apply`); supports `-SecretsPath`, `-Service <names>`, `-Ttl <dur>` (ephemeral auto-expiration enforced by root systemd timers, also configurable per service via `ttl`), `-Prune`, and `-DryRun`.
-- `.\box.ps1 clear-secrets` — Revoke managed seeded CLI credentials inside WSL (optionally scoped via `-Service <names>`).
+- `.\box.ps1 compact` — Run `fstrim` inside WSL and compact `ext4.vhdx` to reclaim disk space (requires elevated Administrator PowerShell).
+- `.\box.ps1 logs` / `.\box.ps1 audit` — View root-owned security events (`nftables` drops, `docker-policy-proxy` denials, `box-hardening` reloads) filtered by `-Source <all|docker|network|hardening>`, `-Since <time>`, and `-Lines <1..100000>`.
+- `.\box.ps1 list` — List all configured sandbox profiles (`default` + `box.<profile>.json` / `profiles/<profile>.json`), their distro names, UIDs, and WSL installation states.
+- `.\box.ps1 push-repo <path> [-Dest <relpath>] [-Branch <ref>] [-Force]` / `pull-diff <name>` / `pull-branch <name> [-RepoPath <winPath>] [-Branch <ref>]` — Transfer git repos via bundle onto native Linux `ext4` (`~/work/<name>`) and pull reviewable `sandbox/<name>` branches back without `rw` `/shared` mounts.
+- `.\box.ps1 seed-secrets [path]` — Seed or rotate CLI service tokens and service account credentials from a central Windows manifest (independently of `init`/`apply`); supports `-SecretsPath <path>`, `-Service <names>`, `-Ttl <dur>` (ephemeral auto-expiration enforced by root systemd timers, also configurable per service via `ttl`), `-Prune`, and `-DryRun`.
+- `.\box.ps1 clear-secrets [-Service <names>]` — Revoke managed seeded CLI credentials inside WSL (all or scoped to specific service(s)).
 - `.\box.ps1 verify` — Run full red-team isolation audit + Windows ↔ WSL `localhost` web test.
-- `.\box.ps1 status` — Inspect systemd services, active `/shared` mounts, seeded CLI secrets, and `nftables` rules.
-- `.\box.ps1 register-terminal` — Add or update a dedicated Windows Terminal profile for this sandbox (pass `-Unregister` to remove it).
+- `.\box.ps1 status` — Inspect systemd services, active `/shared` mounts, seeded CLI secrets, VHDX disk footprint, resource quotas, and `nftables` rules.
+- `.\box.ps1 register-terminal [-Unregister]` — Add or update a dedicated Windows Terminal profile for this sandbox (pass `-Unregister` to remove it).
 - `.\box.ps1 shell` / `.\box.ps1 root-shell` — Open agent shell or Windows-side admin root shell.
-- `.\box.ps1 snapshot [path]` — Export a `.tar` backup of the distro (pass `-Golden` to save `.cache\<distro>-golden.tar`).
-- `.\box.ps1 restore <path>` — Import a `.tar` backup, re-apply `box.json` policy, and run `verify`.
-- `.\box.ps1 reset` / `.\box.ps1 destroy` — Fast-restore from golden snapshot (pass `-Full` for clean Ubuntu rebuild) or remove the distro completely.
+- `.\box.ps1 snapshot [path] [-Golden]` — Export a `.tar` backup of the distro (pass `-Golden` to save `.cache\<distro>-golden.tar`).
+- `.\box.ps1 restore <path> [-Force]` — Import a `.tar` backup, re-apply `box.json` policy, and run `verify`.
+- `.\box.ps1 reset [-Full] [-SaveGolden] [-Force]` / `.\box.ps1 destroy [-Force]` — Fast-restore from golden snapshot (pass `-Full` for clean Ubuntu rebuild) or remove the distro completely.
 
 ---
 
