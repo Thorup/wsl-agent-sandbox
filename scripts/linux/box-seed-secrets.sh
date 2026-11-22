@@ -220,7 +220,35 @@ def rebuild_secrets_env():
         if os.path.isfile(path):
             with open(path, "r", encoding="utf-8") as f:
                 parts.append(f.read().rstrip())
+    parts.append(
+        '# Load interactive/persistent profile overrides (use-gcloud / use-aws)\n'
+        'if [ -r "$HOME/.config/wsl-agent-sandbox/active-overrides.env" ]; then\n'
+        '  . "$HOME/.config/wsl-agent-sandbox/active-overrides.env"\n'
+        'fi'
+    )
     write_agent_file(SECRETS_ENV_FILE, "\n\n".join(parts) + "\n", mode=0o600, dir_mode=0o700)
+
+
+def clear_overrides_section(section_name):
+    overrides_file = os.path.join(STATE_DIR, "active-overrides.env")
+    if not os.path.isfile(overrides_file):
+        return
+    try:
+        with open(overrides_file, "r", encoding="utf-8") as f:
+            existing = f.read()
+        begin_tag = f"# >>> {section_name} >>>"
+        end_tag = f"# <<< {section_name} <<<"
+        pattern = re.compile(
+            r"^" + re.escape(begin_tag) + r"\n.*?^" + re.escape(end_tag) + r"\n?",
+            re.MULTILINE | re.DOTALL,
+        )
+        cleaned = pattern.sub("", existing).strip()
+        if cleaned:
+            write_agent_file(overrides_file, cleaned + "\n", mode=0o600, dir_mode=0o700)
+        else:
+            remove_file_quiet(overrides_file)
+    except Exception:
+        pass
 
 def parse_gh_hosts_yml(text):
     """Minimal line-preserving parser for top-level host blocks in ~/.config/gh/hosts.yml."""
@@ -395,9 +423,11 @@ def seed_aws(cfg, prev_meta):
     if default_profile:
         env_vars["AWS_PROFILE"] = default_profile
     written_keys = write_service_env("aws", env_vars)
+    clear_overrides_section("aws")
 
     return {
         "profiles": new_profiles,
+        "defaultProfile": default_profile or (new_profiles[0] if new_profiles else "default"),
         "envVars": written_keys,
         "updatedAt": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
@@ -433,6 +463,7 @@ def clear_aws(prev_meta):
             remove_file_quiet(conf_file)
 
     write_service_env("aws", {})
+    clear_overrides_section("aws")
 
 def seed_gcloud(cfg, prev_meta):
     raw_projects = cfg.get("projects")
@@ -461,6 +492,7 @@ def seed_gcloud(cfg, prev_meta):
     new_key_paths = []
     new_cfg_names = []
     new_emails = []
+    project_details = []
     active_entry = projects[0]
     active_key_path = ""
 
@@ -530,6 +562,15 @@ def seed_gcloud(cfg, prev_meta):
         new_cfg_names.append(cfg_name)
         if client_email and client_email not in new_emails:
             new_emails.append(client_email)
+        project_details.append({
+            "name": cfg_name,
+            "project": project,
+            "clientEmail": client_email,
+            "region": region,
+            "zone": zone,
+            "keyPath": key_path,
+            "setAdc": set_adc,
+        })
         if cfg_name == default_cfg_name or not active_key_path:
             active_entry = {
                 "name": cfg_name,
@@ -577,6 +618,7 @@ def seed_gcloud(cfg, prev_meta):
         if active_entry.get("zone"):
             env_vars["CLOUDSDK_COMPUTE_ZONE"] = active_entry["zone"]
     written_keys = write_service_env("gcloud", env_vars)
+    clear_overrides_section("gcloud")
 
     return {
         "clientEmail": active_entry.get("clientEmail", ""),
@@ -584,6 +626,7 @@ def seed_gcloud(cfg, prev_meta):
         "project": active_entry.get("project", ""),
         "profiles": new_cfg_names,
         "defaultProject": active_entry.get("name", "default"),
+        "projectDetails": project_details,
         "keyPath": active_key_path,
         "keyPaths": new_key_paths,
         "envVars": written_keys,
@@ -612,6 +655,7 @@ def clear_gcloud(prev_meta):
     if os.path.isfile(os.path.join(gcloud_dir, "active_config")):
         write_agent_file(os.path.join(gcloud_dir, "active_config"), "default\n", mode=0o600, dir_mode=0o700)
     write_service_env("gcloud", {})
+    clear_overrides_section("gcloud")
 
 def seed_azure(cfg, prev_meta):
     client_id = cfg["clientId"]
@@ -1858,6 +1902,9 @@ if args.clear:
     else:
         remove_file_quiet(STATE_FILE)
 
+    if os.path.isfile("/usr/local/sbin/box-sync-context.py"):
+        subprocess.run(["python3", "/usr/local/sbin/box-sync-context.py"], check=False)
+
     if not cleared_any:
         print("[seed-secrets] No managed seeded credentials were present.")
     sys.exit(0)
@@ -1964,6 +2011,9 @@ if state_services:
     save_state(state)
 else:
     remove_file_quiet(STATE_FILE)
+
+if os.path.isfile("/usr/local/sbin/box-sync-context.py"):
+    subprocess.run(["python3", "/usr/local/sbin/box-sync-context.py"], check=False)
 
 print(f"[seed-secrets] Complete: seeded={seeded_count}, failed={failures}, active_services={len(state_services)}")
 if failures > 0:

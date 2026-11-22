@@ -112,10 +112,27 @@ unset DISPLAY WAYLAND_DISPLAY PULSE_SERVER WSL_INTEROP
 export DOCKER_HOST="unix:///run/docker-policy/docker.sock"
 export DOTNET_ROOT="/usr/local/share/dotnet"
 export PATH="$HOME/.cargo/bin:$HOME/.dotnet/tools:$HOME/.local/bin:$HOME/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export BASH_ENV="/etc/profile.d/99-agent-box.sh"
 # Load seeded CLI service credentials (managed by box.ps1 seed-secrets)
 if [ -r "$HOME/.config/wsl-agent-sandbox/secrets.env" ]; then
   . "$HOME/.config/wsl-agent-sandbox/secrets.env"
 fi
+# Load active profile overrides (managed by use-gcloud / use-aws)
+if [ -r "$HOME/.config/wsl-agent-sandbox/active-overrides.env" ]; then
+  . "$HOME/.config/wsl-agent-sandbox/active-overrides.env"
+fi
+use-gcloud() {
+  /usr/local/bin/use-gcloud "$@" || return $?
+  if [ -r "$HOME/.config/wsl-agent-sandbox/active-overrides.env" ]; then
+    . "$HOME/.config/wsl-agent-sandbox/active-overrides.env"
+  fi
+}
+use-aws() {
+  /usr/local/bin/use-aws "$@" || return $?
+  if [ -r "$HOME/.config/wsl-agent-sandbox/active-overrides.env" ]; then
+    . "$HOME/.config/wsl-agent-sandbox/active-overrides.env"
+  fi
+}
 EOF
 chmod 0644 /etc/profile.d/99-agent-box.sh
 
@@ -137,7 +154,12 @@ cat >/etc/environment <<'EOF'
 PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 DOCKER_HOST="unix:///run/docker-policy/docker.sock"
 DOTNET_ROOT="/usr/local/share/dotnet"
+BASH_ENV="/etc/profile.d/99-agent-box.sh"
 EOF
+
+if [[ -x /usr/local/sbin/box-sync-context.py ]]; then
+  /usr/local/sbin/box-sync-context.py
+fi
 
 # Enable systemd services (active after WSL restart with systemd=true)
 chmod 0755 /usr/local/sbin/box-hardening.sh
