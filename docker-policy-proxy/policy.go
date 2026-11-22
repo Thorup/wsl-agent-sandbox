@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 )
 
 // BindMapping maps an allowed Linux path prefix inside the WSL distro to the
@@ -22,11 +23,14 @@ type BindMapping struct {
 
 // Policy defines the Docker API containment rules loaded from JSON.
 type Policy struct {
-	Enabled       bool          `json:"enabled"`
-	AllowBuildKit bool          `json:"allowBuildKit"`
-	AllowCapAdd   []string      `json:"allowCapAdd"`
-	DenyEndpoints []string      `json:"denyEndpoints"`
-	BindMappings  []BindMapping `json:"bindMappings"`
+	Enabled             bool                   `json:"enabled"`
+	AllowBuildKit       bool                   `json:"allowBuildKit"`
+	AllowCapAdd         []string               `json:"allowCapAdd"`
+	DenyEndpoints       []string               `json:"denyEndpoints"`
+	BindMappings        []BindMapping          `json:"bindMappings"`
+	EphemeralBindRoot   string                 `json:"ephemeralBindRoot,omitempty"`
+	EphemeralDaemonRoot string                 `json:"ephemeralDaemonRoot,omitempty"`
+	bindManager         *EphemeralMountManager `json:"-"`
 }
 
 var (
@@ -175,8 +179,15 @@ func (p *Policy) CheckEndpoint(method, rawPath string, query map[string][]string
 // ProcessJSONBody validates and optionally rewrites the JSON request body for
 // security-critical endpoints. Returns (newBody, modified, err).
 func (p *Policy) ProcessJSONBody(method, rawPath string, body []byte) ([]byte, bool, error) {
+	newBody, modified, _, err := p.ProcessJSONBodyWithMounts(method, rawPath, body)
+	return newBody, modified, err
+}
+
+// ProcessJSONBodyWithMounts validates and rewrites the JSON body, also returning
+// any ephemeral host bind-mount paths created for TOCTOU mitigation.
+func (p *Policy) ProcessJSONBodyWithMounts(method, rawPath string, body []byte) ([]byte, bool, []string, error) {
 	if method != http.MethodPost {
-		return body, false, nil
+		return body, false, nil, nil
 	}
 	norm := NormalizeAPIPath(rawPath)
 
@@ -184,13 +195,16 @@ func (p *Policy) ProcessJSONBody(method, rawPath string, body []byte) ([]byte, b
 	case norm == "/containers/create":
 		return p.processContainerCreate(body)
 	case strings.HasPrefix(norm, "/containers/") && strings.HasSuffix(norm, "/update"):
-		return p.processContainerUpdate(body)
+		b, m, err := p.processContainerUpdate(body)
+		return b, m, nil, err
 	case strings.HasPrefix(norm, "/containers/") && strings.HasSuffix(norm, "/exec"):
-		return p.processContainerExec(body)
+		b, m, err := p.processContainerExec(body)
+		return b, m, nil, err
 	case norm == "/volumes/create":
-		return p.processVolumeCreate(body)
+		b, m, err := p.processVolumeCreate(body)
+		return b, m, nil, err
 	default:
-		return body, false, nil
+		return body, false, nil, nil
 	}
 }
 
@@ -278,33 +292,39 @@ func asStringSlice(v any) ([]string, bool) {
 	return out, true
 }
 
-func (p *Policy) processContainerCreate(body []byte) ([]byte, bool, error) {
+func (p *Policy) processContainerCreate(body []byte) ([]byte, bool, []string, error) {
 	obj, err := decodeStrictObject(body)
 	if err != nil {
-		return nil, false, err
+		return nil, false, nil, err
 	}
 	hcKey, hcRaw, hasHC := getKeyCI(obj, "HostConfig")
 	if !hasHC || hcRaw == nil {
-		return body, false, nil
+		return body, false, nil, nil
 	}
 	hc, ok := hcRaw.(map[string]any)
 	if !ok {
-		return nil, false, deny("HostConfig must be a JSON object")
+		return nil, false, nil, deny("HostConfig must be a JSON object")
 	}
 
-	modified, err := p.validateAndRewriteHostConfig(hc)
+	modified, ephemeralTargets, err := p.validateAndRewriteHostConfig(hc)
 	if err != nil {
-		return nil, false, err
+		if p.bindManager != nil && len(ephemeralTargets) > 0 {
+			p.bindManager.CleanupTargets(ephemeralTargets)
+		}
+		return nil, false, nil, err
 	}
 	if !modified {
-		return body, false, nil
+		return body, false, ephemeralTargets, nil
 	}
 	obj[hcKey] = hc
 	out, err := json.Marshal(obj)
 	if err != nil {
-		return nil, false, fmt.Errorf("re-marshaling container create body: %w", err)
+		if p.bindManager != nil && len(ephemeralTargets) > 0 {
+			p.bindManager.CleanupTargets(ephemeralTargets)
+		}
+		return nil, false, nil, fmt.Errorf("re-marshaling container create body: %w", err)
 	}
-	return out, true, nil
+	return out, true, ephemeralTargets, nil
 }
 
 func (p *Policy) processContainerUpdate(body []byte) ([]byte, bool, error) {
@@ -374,17 +394,18 @@ func checkVolumeDriverOpts(opts map[string]any) error {
 	return nil
 }
 
-func (p *Policy) validateAndRewriteHostConfig(hc map[string]any) (bool, error) {
+func (p *Policy) validateAndRewriteHostConfig(hc map[string]any) (bool, []string, error) {
 	modified := false
+	var ephemeralTargets []string
 
 	// 1. Privileged
 	if _, val, ok := getKeyCI(hc, "Privileged"); ok {
 		b, valid := asBool(val)
 		if !valid {
-			return false, deny("HostConfig.Privileged must be a boolean")
+			return false, ephemeralTargets, deny("HostConfig.Privileged must be a boolean")
 		}
 		if b {
-			return false, deny("privileged containers are forbidden")
+			return false, ephemeralTargets, deny("privileged containers are forbidden")
 		}
 	}
 
@@ -393,11 +414,11 @@ func (p *Policy) validateAndRewriteHostConfig(hc map[string]any) (bool, error) {
 		if _, val, ok := getKeyCI(hc, nsField); ok && val != nil {
 			mode, valid := asString(val)
 			if !valid {
-				return false, deny("HostConfig.%s must be a string", nsField)
+				return false, ephemeralTargets, deny("HostConfig.%s must be a string", nsField)
 			}
 			lm := strings.ToLower(strings.TrimSpace(mode))
 			if lm == "host" || strings.HasPrefix(lm, "host:") || strings.HasPrefix(lm, "ns:") {
-				return false, deny("HostConfig.%s=%q is forbidden", nsField, mode)
+				return false, ephemeralTargets, deny("HostConfig.%s=%q is forbidden", nsField, mode)
 			}
 		}
 	}
@@ -406,16 +427,16 @@ func (p *Policy) validateAndRewriteHostConfig(hc map[string]any) (bool, error) {
 	if _, val, ok := getKeyCI(hc, "CapAdd"); ok && val != nil {
 		caps, valid := asStringSlice(val)
 		if !valid {
-			return false, deny("HostConfig.CapAdd must be a string array")
+			return false, ephemeralTargets, deny("HostConfig.CapAdd must be a string array")
 		}
 		for _, c := range caps {
 			normCap := strings.ToUpper(strings.TrimSpace(c))
 			normCap = strings.TrimPrefix(normCap, "CAP_")
 			if hardDeniedCaps[normCap] {
-				return false, deny("capability %q is hard-denied by policy", c)
+				return false, ephemeralTargets, deny("capability %q is hard-denied by policy", c)
 			}
 			if !p.isCapAllowed(normCap) {
-				return false, deny("capability %q is not in allowCapAdd", c)
+				return false, ephemeralTargets, deny("capability %q is not in allowCapAdd", c)
 			}
 		}
 	}
@@ -423,14 +444,14 @@ func (p *Policy) validateAndRewriteHostConfig(hc map[string]any) (bool, error) {
 	// 4. Devices, DeviceCgroupRules, DeviceRequests, Sysctls, OomKillDisable
 	for _, field := range []string{"Devices", "DeviceCgroupRules", "DeviceRequests", "Sysctls"} {
 		if _, val, ok := getKeyCI(hc, field); ok && !isEmptyValue(val) {
-			return false, deny("HostConfig.%s is forbidden", field)
+			return false, ephemeralTargets, deny("HostConfig.%s is forbidden", field)
 		}
 	}
 
 	// 5. MaskedPaths / ReadonlyPaths overrides
 	for _, field := range []string{"MaskedPaths", "ReadonlyPaths"} {
 		if _, val, ok := getKeyCI(hc, field); ok && val != nil {
-			return false, deny("overriding HostConfig.%s is forbidden", field)
+			return false, ephemeralTargets, deny("overriding HostConfig.%s is forbidden", field)
 		}
 	}
 
@@ -438,11 +459,11 @@ func (p *Policy) validateAndRewriteHostConfig(hc map[string]any) (bool, error) {
 	if _, val, ok := getKeyCI(hc, "SecurityOpt"); ok && val != nil {
 		opts, valid := asStringSlice(val)
 		if !valid {
-			return false, deny("HostConfig.SecurityOpt must be a string array")
+			return false, ephemeralTargets, deny("HostConfig.SecurityOpt must be a string array")
 		}
 		for _, opt := range opts {
 			if isDangerousSecurityOpt(opt) {
-				return false, deny("SecurityOpt %q is forbidden", opt)
+				return false, ephemeralTargets, deny("SecurityOpt %q is forbidden", opt)
 			}
 		}
 	}
@@ -451,12 +472,12 @@ func (p *Policy) validateAndRewriteHostConfig(hc map[string]any) (bool, error) {
 	if _, val, ok := getKeyCI(hc, "ExtraHosts"); ok && val != nil {
 		hosts, valid := asStringSlice(val)
 		if !valid {
-			return false, deny("HostConfig.ExtraHosts must be a string array")
+			return false, ephemeralTargets, deny("HostConfig.ExtraHosts must be a string array")
 		}
 		for _, h := range hosts {
 			lh := strings.ToLower(strings.TrimSpace(h))
 			if strings.Contains(lh, "host-gateway") || strings.Contains(lh, "host.docker.internal") {
-				return false, deny("ExtraHosts entry %q is forbidden", h)
+				return false, ephemeralTargets, deny("ExtraHosts entry %q is forbidden", h)
 			}
 		}
 	}
@@ -465,13 +486,16 @@ func (p *Policy) validateAndRewriteHostConfig(hc map[string]any) (bool, error) {
 	if bKey, val, ok := getKeyCI(hc, "Binds"); ok && val != nil {
 		binds, valid := asStringSlice(val)
 		if !valid {
-			return false, deny("HostConfig.Binds must be a string array")
+			return false, ephemeralTargets, deny("HostConfig.Binds must be a string array")
 		}
 		newBinds := make([]any, 0, len(binds))
 		for _, b := range binds {
-			rewritten, changed, err := p.validateAndRewriteBindSpec(b)
+			rewritten, changed, ephTarget, err := p.validateAndRewriteBindSpec(b)
+			if ephTarget != "" {
+				ephemeralTargets = append(ephemeralTargets, ephTarget)
+			}
 			if err != nil {
-				return false, err
+				return false, ephemeralTargets, err
 			}
 			if changed {
 				modified = true
@@ -487,16 +511,19 @@ func (p *Policy) validateAndRewriteHostConfig(hc map[string]any) (bool, error) {
 	if mKey, val, ok := getKeyCI(hc, "Mounts"); ok && val != nil {
 		arr, valid := val.([]any)
 		if !valid {
-			return false, deny("HostConfig.Mounts must be an array")
+			return false, ephemeralTargets, deny("HostConfig.Mounts must be an array")
 		}
 		for i, item := range arr {
 			mObj, ok := item.(map[string]any)
 			if !ok {
-				return false, deny("HostConfig.Mounts[%d] must be an object", i)
+				return false, ephemeralTargets, deny("HostConfig.Mounts[%d] must be an object", i)
 			}
-			changed, err := p.validateAndRewriteMountObj(mObj)
+			changed, ephTarget, err := p.validateAndRewriteMountObj(mObj)
+			if ephTarget != "" {
+				ephemeralTargets = append(ephemeralTargets, ephTarget)
+			}
 			if err != nil {
-				return false, err
+				return false, ephemeralTargets, err
 			}
 			if changed {
 				modified = true
@@ -507,7 +534,7 @@ func (p *Policy) validateAndRewriteHostConfig(hc map[string]any) (bool, error) {
 		}
 	}
 
-	return modified, nil
+	return modified, ephemeralTargets, nil
 }
 
 func (p *Policy) isCapAllowed(normCap string) bool {
@@ -559,18 +586,18 @@ func isEmptyValue(v any) bool {
 }
 
 // validateAndRewriteBindSpec parses a Docker Binds entry (source:dest[:opts]).
-func (p *Policy) validateAndRewriteBindSpec(spec string) (string, bool, error) {
+func (p *Policy) validateAndRewriteBindSpec(spec string) (string, bool, string, error) {
 	if strings.TrimSpace(spec) == "" {
-		return "", false, deny("empty bind specification")
+		return "", false, "", deny("empty bind specification")
 	}
 	// Reject Windows drive paths immediately (e.g. C:\foo:/bar or c:/foo:/bar).
 	if windowsDriveRe.MatchString(spec) || strings.HasPrefix(spec, `\\`) {
-		return "", false, deny("Windows host bind path %q is forbidden", spec)
+		return "", false, "", deny("Windows host bind path %q is forbidden", spec)
 	}
 
 	parts := strings.Split(spec, ":")
 	if len(parts) < 2 || len(parts) > 3 {
-		return "", false, deny("invalid bind specification %q", spec)
+		return "", false, "", deny("invalid bind specification %q", spec)
 	}
 	src := parts[0]
 	dst := parts[1]
@@ -581,18 +608,18 @@ func (p *Policy) validateAndRewriteBindSpec(spec string) (string, bool, error) {
 
 	// Named Docker volume (no path separators, no dots-only).
 	if !strings.ContainsAny(src, `/\`) && namedVolumeRe.MatchString(src) {
-		return spec, false, nil
+		return spec, false, "", nil
 	}
 
-	rewrittenSrc, forceRO, err := p.validateAndTranslateHostPath(src)
+	rewrittenSrc, forceRO, ephTarget, err := p.validateAndPinHostPath(src)
 	if err != nil {
-		return "", false, err
+		return "", false, ephTarget, err
 	}
 
 	// Validate mount propagation options if present.
 	newOpts, err := sanitizeBindOptions(opts, forceRO)
 	if err != nil {
-		return "", false, err
+		return "", false, ephTarget, err
 	}
 
 	var rebuilt string
@@ -601,7 +628,7 @@ func (p *Policy) validateAndRewriteBindSpec(spec string) (string, bool, error) {
 	} else {
 		rebuilt = rewrittenSrc + ":" + dst
 	}
-	return rebuilt, rebuilt != spec, nil
+	return rebuilt, rebuilt != spec, ephTarget, nil
 }
 
 func sanitizeBindOptions(opts string, forceRO bool) (string, error) {
@@ -633,11 +660,11 @@ func sanitizeBindOptions(opts string, forceRO bool) (string, error) {
 	return strings.Join(tokens, ","), nil
 }
 
-func (p *Policy) validateAndRewriteMountObj(m map[string]any) (bool, error) {
+func (p *Policy) validateAndRewriteMountObj(m map[string]any) (bool, string, error) {
 	_, typeRaw, _ := getKeyCI(m, "Type")
 	mType, valid := asString(typeRaw)
 	if !valid {
-		return false, deny("Mount.Type must be a string")
+		return false, "", deny("Mount.Type must be a string")
 	}
 	lt := strings.ToLower(strings.TrimSpace(mType))
 	if lt == "" {
@@ -646,65 +673,65 @@ func (p *Policy) validateAndRewriteMountObj(m map[string]any) (bool, error) {
 
 	switch lt {
 	case "tmpfs":
-		return false, nil
+		return false, "", nil
 	case "volume":
 		if _, vOptsRaw, ok := getKeyCI(m, "VolumeOptions"); ok && vOptsRaw != nil {
 			vOpts, ok := vOptsRaw.(map[string]any)
 			if !ok {
-				return false, deny("Mount.VolumeOptions must be an object")
+				return false, "", deny("Mount.VolumeOptions must be an object")
 			}
 			if _, drvCfgRaw, ok := getKeyCI(vOpts, "DriverConfig"); ok && drvCfgRaw != nil {
 				drvCfg, ok := drvCfgRaw.(map[string]any)
 				if !ok {
-					return false, deny("Mount.VolumeOptions.DriverConfig must be an object")
+					return false, "", deny("Mount.VolumeOptions.DriverConfig must be an object")
 				}
 				if _, nameRaw, ok := getKeyCI(drvCfg, "Name"); ok && nameRaw != nil {
 					name, ok := asString(nameRaw)
 					if !ok || (name != "" && !strings.EqualFold(name, "local")) {
-						return false, deny("volume mount driver %q is forbidden", name)
+						return false, "", deny("volume mount driver %q is forbidden", name)
 					}
 				}
 				if _, optsRaw, ok := getKeyCI(drvCfg, "Options"); ok && optsRaw != nil {
 					opts, ok := optsRaw.(map[string]any)
 					if !ok {
-						return false, deny("Mount.VolumeOptions.DriverConfig.Options must be an object")
+						return false, "", deny("Mount.VolumeOptions.DriverConfig.Options must be an object")
 					}
 					if err := checkVolumeDriverOpts(opts); err != nil {
-						return false, err
+						return false, "", err
 					}
 				}
 			}
 		}
-		return false, nil
+		return false, "", nil
 	case "bind":
 		srcKey, srcRaw, hasSrc := getKeyCI(m, "Source")
 		if !hasSrc || srcRaw == nil {
-			return false, deny("bind mount missing Source")
+			return false, "", deny("bind mount missing Source")
 		}
 		src, ok := asString(srcRaw)
 		if !ok || strings.TrimSpace(src) == "" {
-			return false, deny("bind mount Source must be a non-empty string")
+			return false, "", deny("bind mount Source must be a non-empty string")
 		}
 		if _, bOptsRaw, ok := getKeyCI(m, "BindOptions"); ok && bOptsRaw != nil {
 			bOpts, ok := bOptsRaw.(map[string]any)
 			if !ok {
-				return false, deny("Mount.BindOptions must be an object")
+				return false, "", deny("Mount.BindOptions must be an object")
 			}
 			if _, propRaw, ok := getKeyCI(bOpts, "Propagation"); ok && propRaw != nil {
 				prop, ok := asString(propRaw)
 				if !ok {
-					return false, deny("Mount.BindOptions.Propagation must be a string")
+					return false, "", deny("Mount.BindOptions.Propagation must be a string")
 				}
 				lp := strings.ToLower(strings.TrimSpace(prop))
 				if lp != "" && lp != "private" && lp != "rprivate" {
-					return false, deny("bind mount propagation %q is forbidden", prop)
+					return false, "", deny("bind mount propagation %q is forbidden", prop)
 				}
 			}
 		}
 
-		rewritten, forceRO, err := p.validateAndTranslateHostPath(src)
+		rewritten, forceRO, ephTarget, err := p.validateAndPinHostPath(src)
 		if err != nil {
-			return false, err
+			return false, ephTarget, err
 		}
 		changed := false
 		if rewritten != src {
@@ -724,29 +751,31 @@ func (p *Policy) validateAndRewriteMountObj(m map[string]any) (bool, error) {
 				}
 			}
 		}
-		return changed, nil
+		return changed, ephTarget, nil
 	default:
-		return false, deny("mount type %q is forbidden", mType)
+		return false, "", deny("mount type %q is forbidden", mType)
 	}
 }
 
-// validateAndTranslateHostPath enforces strict containment on bind mount paths:
-//  1. Must be an absolute POSIX path with no Windows drive/UNC prefix and no ".." segments.
-//  2. Must fall under an explicitly configured BindMapping.GuestPrefix.
-//  3. Walks every path component from GuestPrefix downward using os.Lstat,
-//     rejecting ANY symlink (prevents both local symlink escapes and cross-VM
-//     dangling symlinks targeting /run/desktop/mnt/host/c), sockets, devices, and FIFOs.
-//  4. Translates GuestPrefix -> DaemonPrefix so docker-desktop accesses the root-mirrored path.
+// validateAndTranslateHostPath enforces strict containment on bind mount paths.
 func (p *Policy) validateAndTranslateHostPath(rawSrc string) (string, bool, error) {
+	rewritten, forceRO, _, err := p.validateAndPinHostPath(rawSrc)
+	return rewritten, forceRO, err
+}
+
+// validateAndPinHostPath walks every path component with O_NOFOLLOW and, when
+// EphemeralBindRoot/EphemeralDaemonRoot are configured, bind-mounts the pinned
+// kernel fd into a root-only ephemeral directory to eliminate TOCTOU races.
+func (p *Policy) validateAndPinHostPath(rawSrc string) (string, bool, string, error) {
 	if windowsDriveRe.MatchString(rawSrc) || strings.Contains(rawSrc, `\`) {
-		return "", false, deny("Windows host path %q is forbidden", rawSrc)
+		return "", false, "", deny("Windows host path %q is forbidden", rawSrc)
 	}
 	if !strings.HasPrefix(rawSrc, "/") {
-		return "", false, deny("bind mount source %q must be an absolute Linux path", rawSrc)
+		return "", false, "", deny("bind mount source %q must be an absolute Linux path", rawSrc)
 	}
 	for _, seg := range strings.Split(rawSrc, "/") {
 		if seg == ".." {
-			return "", false, deny("path traversal in bind mount source %q is forbidden", rawSrc)
+			return "", false, "", deny("path traversal in bind mount source %q is forbidden", rawSrc)
 		}
 	}
 
@@ -764,22 +793,37 @@ func (p *Policy) validateAndTranslateHostPath(rawSrc string) (string, bool, erro
 		}
 	}
 	if matched == nil {
-		return "", false, deny("bind mount source %q is outside allowed prefixes", cleaned)
+		return "", false, "", deny("bind mount source %q is outside allowed prefixes", cleaned)
 	}
 
 	gp := path.Clean(matched.GuestPrefix)
 	rel := strings.TrimPrefix(cleaned, gp)
 	rel = strings.TrimPrefix(rel, "/")
 
+	if p.EphemeralBindRoot != "" && p.EphemeralDaemonRoot != "" && p.bindManager != nil {
+		fd, isDir, err := openPinnedNoFollow(gp, rel, !matched.ReadOnly)
+		if err != nil {
+			return "", false, "", err
+		}
+		name := p.bindManager.NextMountName()
+		ephTarget := filepath.Join(p.EphemeralBindRoot, name)
+		bindErr := p.bindManager.mounter.BindFD(fd, ephTarget, isDir, matched.ReadOnly)
+		_ = syscall.Close(fd)
+		if bindErr != nil {
+			return "", false, "", fmt.Errorf("pinning ephemeral bind mount: %w", bindErr)
+		}
+		return path.Join(path.Clean(p.EphemeralDaemonRoot), name), matched.ReadOnly, ephTarget, nil
+	}
+
 	if err := verifyNoSymlinkOrSpecial(gp, rel); err != nil {
-		return "", false, err
+		return "", false, "", err
 	}
 
 	dp := path.Clean(matched.DaemonPrefix)
 	if rel == "" {
-		return dp, matched.ReadOnly, nil
+		return dp, matched.ReadOnly, "", nil
 	}
-	return path.Join(dp, rel), matched.ReadOnly, nil
+	return path.Join(dp, rel), matched.ReadOnly, "", nil
 }
 
 // verifyNoSymlinkOrSpecial walks from root through each component of rel using

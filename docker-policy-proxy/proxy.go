@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -11,7 +12,9 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strings"
 	"sync/atomic"
+	"time"
 )
 
 const maxInspectBodyBytes = 10 * 1024 * 1024 // 10 MiB max JSON body for container/volume/exec create
@@ -21,17 +24,34 @@ const maxInspectBodyBytes = 10 * 1024 * 1024 // 10 MiB max JSON body for contain
 type PolicyProxy struct {
 	upstreamSocket string
 	policy         atomic.Pointer[Policy]
+	bindManager    *EphemeralMountManager
 	reverseProxy   *httputil.ReverseProxy
+	upstreamClient *http.Client
 	logger         *log.Logger
+	ctx            context.Context
+	cancel         context.CancelFunc
+	wakeCh         chan struct{}
 }
 
 func NewPolicyProxy(upstreamSocket string, initial *Policy, logger *log.Logger) *PolicyProxy {
 	if logger == nil {
 		logger = log.Default()
 	}
+	bm := NewEphemeralMountManager(nil)
+	if initial != nil {
+		initial.bindManager = bm
+		if initial.EphemeralBindRoot != "" {
+			bm.CleanupStale(initial.EphemeralBindRoot)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
 	pp := &PolicyProxy{
 		upstreamSocket: upstreamSocket,
+		bindManager:    bm,
 		logger:         logger,
+		ctx:            ctx,
+		cancel:         cancel,
+		wakeCh:         make(chan struct{}, 1),
 	}
 	pp.policy.Store(initial)
 
@@ -53,11 +73,143 @@ func NewPolicyProxy(upstreamSocket string, initial *Policy, logger *log.Logger) 
 		writeDockerJSONError(w, http.StatusBadGateway, "upstream Docker Desktop socket unreachable: "+err.Error())
 	}
 	pp.reverseProxy = rp
+	pp.upstreamClient = &http.Client{Transport: transport}
+	go pp.reconcileLoop()
 	return pp
 }
 
+func (pp *PolicyProxy) Close() {
+	if pp.cancel != nil {
+		pp.cancel()
+	}
+}
+
+func (pp *PolicyProxy) wakeReconciler() {
+	select {
+	case pp.wakeCh <- struct{}{}:
+	default:
+	}
+}
+
+func (pp *PolicyProxy) reconcileActiveContainers() {
+	if !pp.bindManager.HasTracked() {
+		return
+	}
+	reqCtx, cancel := context.WithTimeout(pp.ctx, 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, "http://docker/containers/json?all=1", nil)
+	if err != nil {
+		return
+	}
+	resp, err := pp.upstreamClient.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return
+	}
+	var list []struct {
+		ID string `json:"Id"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4*1024*1024)).Decode(&list); err != nil {
+		return
+	}
+	active := make(map[string]bool, len(list))
+	for _, c := range list {
+		if c.ID != "" {
+			active[c.ID] = true
+		}
+	}
+	pp.bindManager.CleanupAbsent(active)
+}
+
+func (pp *PolicyProxy) watchDestroyEvents() {
+	eventsURL := "http://docker/events?filters=" + url.QueryEscape(`{"type":["container"],"event":["destroy"]}`)
+	req, err := http.NewRequestWithContext(pp.ctx, http.MethodGet, eventsURL, nil)
+	if err != nil {
+		return
+	}
+	resp, err := pp.upstreamClient.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return
+	}
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		if !pp.bindManager.HasTracked() {
+			return
+		}
+		var ev struct {
+			Type   string `json:"Type"`
+			Action string `json:"Action"`
+			Actor  struct {
+				ID string `json:"ID"`
+			} `json:"Actor"`
+		}
+		if json.Unmarshal(scanner.Bytes(), &ev) == nil {
+			if (ev.Type == "container" || ev.Type == "") && ev.Action == "destroy" && ev.Actor.ID != "" {
+				pp.bindManager.CleanupContainer(ev.Actor.ID)
+			}
+		}
+	}
+}
+
+func (pp *PolicyProxy) reconcileLoop() {
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+	for {
+		if !pp.bindManager.HasTracked() {
+			select {
+			case <-pp.ctx.Done():
+				return
+			case <-pp.wakeCh:
+			}
+			continue
+		}
+		pp.watchDestroyEvents()
+		pp.reconcileActiveContainers()
+		if !pp.bindManager.HasTracked() {
+			continue
+		}
+		select {
+		case <-pp.ctx.Done():
+			return
+		case <-pp.wakeCh:
+		case <-ticker.C:
+		}
+	}
+}
+
 func (pp *PolicyProxy) UpdatePolicy(next *Policy) {
+	if next != nil && next.bindManager == nil {
+		next.bindManager = pp.bindManager
+	}
 	pp.policy.Store(next)
+}
+
+type statusCaptureWriter struct {
+	http.ResponseWriter
+	status int
+	body   bytes.Buffer
+}
+
+func (w *statusCaptureWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *statusCaptureWriter) Write(p []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	if w.body.Len() < 64*1024 {
+		w.body.Write(p)
+	}
+	return w.ResponseWriter.Write(p)
 }
 
 func (pp *PolicyProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -73,6 +225,7 @@ func (pp *PolicyProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var ephemeralTargets []string
 	if needsJSONBodyInspection(r.Method, r.URL.Path) {
 		limited := io.LimitReader(r.Body, maxInspectBodyBytes+1)
 		bodyBytes, err := io.ReadAll(limited)
@@ -86,7 +239,7 @@ func (pp *PolicyProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		newBody, modified, err := pol.ProcessJSONBody(r.Method, r.URL.Path, bodyBytes)
+		newBody, modified, targets, err := pol.ProcessJSONBodyWithMounts(r.Method, r.URL.Path, bodyBytes)
 		if err != nil {
 			var pe *PolicyError
 			if errors.As(err, &pe) {
@@ -98,6 +251,7 @@ func (pp *PolicyProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeDockerJSONError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		ephemeralTargets = targets
 
 		if modified {
 			pp.logger.Printf("REWRITE method=%s path=%s bytes=%d->%d", r.Method, r.URL.Path, len(bodyBytes), len(newBody))
@@ -109,7 +263,52 @@ func (pp *PolicyProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		r.Header.Set("Content-Length", strconvItoa(len(newBody)))
 	}
 
+	if len(ephemeralTargets) > 0 {
+		capW := &statusCaptureWriter{ResponseWriter: w}
+		pp.reverseProxy.ServeHTTP(capW, r)
+		tracked := false
+		if capW.status >= 200 && capW.status < 300 {
+			var resp struct {
+				ID string `json:"Id"`
+			}
+			if json.Unmarshal(capW.body.Bytes(), &resp) == nil && resp.ID != "" {
+				pp.bindManager.Track(resp.ID, r.URL.Query().Get("name"), ephemeralTargets)
+				pp.wakeReconciler()
+				tracked = true
+			}
+		}
+		if !tracked {
+			pp.bindManager.CleanupTargets(ephemeralTargets)
+		}
+		return
+	}
+
+	norm := NormalizeAPIPath(r.URL.Path)
+	if r.Method == http.MethodPost && norm == "/containers/prune" {
+		capW := &statusCaptureWriter{ResponseWriter: w}
+		pp.reverseProxy.ServeHTTP(capW, r)
+		if capW.status >= 200 && capW.status < 300 {
+			var pruneResp struct {
+				ContainersDeleted []string `json:"ContainersDeleted"`
+			}
+			if json.Unmarshal(capW.body.Bytes(), &pruneResp) == nil {
+				for _, cid := range pruneResp.ContainersDeleted {
+					pp.bindManager.CleanupContainer(cid)
+				}
+			}
+			pp.reconcileActiveContainers()
+		}
+		return
+	}
+
 	pp.reverseProxy.ServeHTTP(w, r)
+
+	if r.Method == http.MethodDelete && strings.HasPrefix(norm, "/containers/") {
+		rest := strings.TrimPrefix(norm, "/containers/")
+		if cid, _, _ := strings.Cut(rest, "/"); cid != "" {
+			pp.bindManager.CleanupContainer(cid)
+		}
+	}
 }
 
 func needsJSONBodyInspection(method, rawPath string) bool {

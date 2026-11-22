@@ -167,7 +167,7 @@ function Sync-AssetsToWsl {
     Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'systemd\docker-policy-proxy.service') -RemotePath '/etc/systemd/system/docker-policy-proxy.service' -Mode '0644' -NormalizeLF
 
     if ($IncludeProxySource) {
-        $proxyFiles = @('go.mod', 'main.go', 'policy.go', 'proxy.go', 'policy_test.go')
+        $proxyFiles = @('go.mod', 'main.go', 'policy.go', 'proxy.go', 'bind_pin.go', 'policy_test.go')
         foreach ($pf in $proxyFiles) {
             Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot "docker-policy-proxy\$pf") -RemotePath "/usr/local/src/docker-policy-proxy/$pf" -Mode '0644' -NormalizeLF
         }

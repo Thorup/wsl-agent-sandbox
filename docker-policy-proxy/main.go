@@ -94,6 +94,7 @@ func main() {
 	}
 
 	proxy := NewPolicyProxy(*upstreamSocket, pol, logger)
+	defer proxy.Close()
 	srv := &http.Server{
 		Handler:           proxy,
 		ReadHeaderTimeout: 30 * time.Second,
