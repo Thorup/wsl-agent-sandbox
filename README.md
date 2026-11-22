@@ -261,9 +261,8 @@ Manifest path resolution priority:
 
 ## Connecting Antigravity / VS Code Remote-WSL
 
-1. Launch Antigravity / VS Code **from Windows**.
-2. Connect via **Remote - WSL** to distro `wsl-agent-sandbox`.
-3. Modern Remote-WSL uses script-less startup and works cleanly with `[interop] enabled=false` and `[automount] enabled=false`.
+1. `.\box.ps1 init` and `.\box.ps1 apply` automatically enable `"remote.WSL.experimental.scriptLessStartup": true` in your Windows VS Code (`%APPDATA%\Code\User\settings.json`) and Antigravity (`%APPDATA%\Antigravity\User\settings.json`) user settings so Remote-WSL streams the server tarball over `stdin` without requiring `/mnt/c` (`[automount] enabled=false`) or Windows `.exe` interop (`[interop] enabled=false`).
+2. Launch Antigravity or VS Code **from Windows** (e.g., `code --remote wsl+wsl-agent-sandbox /home/agent` or `antigravity --remote wsl+wsl-agent-sandbox /home/agent`, or use the bottom-left **`><`** Remote window menu → **Connect to WSL using Distro...** → **`wsl-agent-sandbox`**).
 
 ---
 

@@ -243,3 +243,56 @@ function Register-WindowsTerminalProfile {
 
     return $updated.ToArray()
 }
+
+function Get-IdeUserSettingsPaths {
+    if ([string]::IsNullOrWhiteSpace($env:APPDATA)) {
+        return @()
+    }
+    $candidates = @(
+        (Join-Path $env:APPDATA 'Code\User\settings.json'),
+        (Join-Path $env:APPDATA 'Code - Insiders\User\settings.json'),
+        (Join-Path $env:APPDATA 'Antigravity\User\settings.json')
+    )
+    return @($candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
+}
+
+function Sync-IdeWslScriptlessStartup {
+    param(
+        [string[]]$SettingsPaths = @()
+    )
+    if ($SettingsPaths.Count -eq 0) {
+        $SettingsPaths = @(Get-IdeUserSettingsPaths)
+    }
+    $updated = New-Object System.Collections.Generic.List[string]
+    $settingKey = 'remote.WSL.experimental.scriptLessStartup'
+
+    foreach ($settingsPath in $SettingsPaths) {
+        if (-not (Test-Path -LiteralPath $settingsPath -PathType Leaf)) {
+            continue
+        }
+        $raw = Get-Content -LiteralPath $settingsPath -Raw -Encoding UTF8
+        $json = if ([string]::IsNullOrWhiteSpace($raw)) {
+            [pscustomobject]@{}
+        } else {
+            ConvertFrom-Jsonc -Text $raw
+        }
+        if ($null -eq $json) {
+            $json = [pscustomobject]@{}
+        }
+        if ($json.PSObject.Properties[$settingKey] -and ($json.$settingKey -eq $true)) {
+            continue
+        }
+
+        $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+        $backupPath = "${settingsPath}.bak-${stamp}"
+        Copy-Item -LiteralPath $settingsPath -Destination $backupPath -Force
+
+        $json | Add-Member -NotePropertyName $settingKey -NotePropertyValue $true -Force
+        $outJson = $json | ConvertTo-Json -Depth 20
+        [System.IO.File]::WriteAllText($settingsPath, $outJson + "`n", (New-Object System.Text.UTF8Encoding($false)))
+        $updated.Add($settingsPath)
+        Write-Host "[ide-wsl] Enabled '$settingKey'=true in '$settingsPath' (backup: $backupPath)."
+    }
+
+    return $updated.ToArray()
+}
