@@ -313,6 +313,25 @@ elif docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
   if [[ "${FORCE_INTERNAL_NET}" == "true" ]]; then
     expect_docker_blocked "--network=bridge when forceInternalNetwork=true" \
       docker run --rm --network=bridge alpine:latest true
+
+    NET_AUDIT_OUT="$(docker run --rm alpine:latest sh -c '
+      if nc -z -w 2 1.1.1.1 443 >/dev/null 2>&1; then
+        echo "LEAK_INTERNET"
+        exit 0
+      fi
+      if nc -z -w 2 host.docker.internal 80 >/dev/null 2>&1; then
+        echo "LEAK_HOST"
+        exit 0
+      fi
+      echo "ISOLATED_OK"
+    ' 2>/dev/null || true)"
+    if [[ "${NET_AUDIT_OUT}" == "ISOLATED_OK" ]]; then
+      pass "Default container isolated from host.docker.internal and external internet (forceInternalNetwork=true)"
+    elif [[ "${NET_AUDIT_OUT}" == "LEAK_"* ]]; then
+      fail "Default container leaked outbound connectivity (${NET_AUDIT_OUT}) despite forceInternalNetwork=true"
+    else
+      warn "Could not execute active container network audit (alpine:latest unavailable or container failed to start)"
+    fi
   fi
 
   rm -rf "${WORK_DIR}"

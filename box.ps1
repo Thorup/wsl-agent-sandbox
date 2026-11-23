@@ -522,6 +522,9 @@ fi
     foreach ($w in (Get-GlobalWslConfigWarnings)) {
         Write-Warning $w
     }
+    foreach ($adv in @(Get-DockerSecurityAdvisories -Config $Config)) {
+        Write-Warning $adv
+    }
 }
 
 function Invoke-Verify {
@@ -795,6 +798,9 @@ function Invoke-Doctor {
                 Write-Host "  [FAIL] docker-policy-proxy.service is $proxyState (run '.\box.ps1 apply')"
                 $hasFail = $true
             }
+        }
+        foreach ($adv in @(Get-DockerSecurityAdvisories -Config $Config)) {
+            Write-Host "  [WARN] $adv"
         }
     } else {
         Write-Host "  [PASS] Docker integration disabled per policy (docker.enabled=false)"

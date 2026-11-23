@@ -582,3 +582,28 @@ function Get-WindowsHostIPs {
     }
     return $ips.ToArray()
 }
+
+function Get-DockerSecurityAdvisories {
+    param([Parameter(Mandatory)]$Config)
+    $advisories = New-Object System.Collections.Generic.List[string]
+    if (-not $Config -or -not $Config.docker -or -not [bool]$Config.docker.enabled) {
+        return @()
+    }
+    $forceInternal = ($Config.docker.PSObject.Properties['forceInternalNetwork'] -and [bool]$Config.docker.forceInternalNetwork)
+    $allowBuildKit = ($Config.docker.PSObject.Properties['allowBuildKit'] -and [bool]$Config.docker.allowBuildKit)
+    $allowedRegistries = @()
+    if ($Config.docker.PSObject.Properties['allowedRegistries'] -and $null -ne $Config.docker.allowedRegistries) {
+        $allowedRegistries = @($Config.docker.allowedRegistries)
+    }
+    $blockHostAndLan = ($Config.network -and $Config.network.PSObject.Properties['blockHostAndLan'] -and [bool]$Config.network.blockHostAndLan)
+    $egressAllowlist = ($Config.network -and $Config.network.PSObject.Properties['egressMode'] -and ($Config.network.egressMode -eq 'allowlist'))
+
+    if ((-not $forceInternal) -and ($blockHostAndLan -or $egressAllowlist)) {
+        $egressDesc = if ($egressAllowlist) { 'allowlist' } else { 'open' }
+        $advisories.Add("Docker is enabled with forceInternalNetwork=false while strict network isolation is active (blockHostAndLan=$($blockHostAndLan.ToString().ToLowerInvariant()), egressMode=$egressDesc). Containers can reach Windows host ports via host.docker.internal and bypass WSL egress rules unless docker.forceInternalNetwork is set to true.")
+        if ($allowBuildKit -and @($allowedRegistries).Count -eq 0) {
+            $advisories.Add("Docker BuildKit (allowBuildKit=true) is active without docker.forceInternalNetwork=true; 'docker buildx build' RUN steps execute on Docker Desktop's default network and can reach host.docker.internal/external internet.")
+        }
+    }
+    return $advisories.ToArray()
+}

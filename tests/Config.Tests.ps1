@@ -490,6 +490,23 @@ try {
     }
 }
 
+# Docker security advisories (host.docker.internal & BuildKit)
+$defaultAdvisories = @(Get-DockerSecurityAdvisories -Config $baseCfg)
+Assert-True "Default box.json emits host.docker.internal and BuildKit advisories when forceInternalNetwork is unset/false" (
+    $defaultAdvisories.Count -eq 2 -and
+    ($defaultAdvisories[0] -match 'host\.docker\.internal') -and
+    ($defaultAdvisories[1] -match 'BuildKit')
+)
+
+$hardenedDockerCfg = Copy-Config $baseCfg
+$hardenedDockerCfg.docker | Add-Member -NotePropertyName 'forceInternalNetwork' -NotePropertyValue $true -Force
+$hardenedAdvisories = @(Get-DockerSecurityAdvisories -Config $hardenedDockerCfg)
+Assert-True "No Docker host/BuildKit advisories when forceInternalNetwork is true" ($hardenedAdvisories.Count -eq 0)
+
+$disabledDockerCfg = Copy-Config $baseCfg
+$disabledDockerCfg.docker.enabled = $false
+Assert-True "No Docker advisories when docker.enabled is false" (@(Get-DockerSecurityAdvisories -Config $disabledDockerCfg).Count -eq 0)
+
 Write-Host ""
 Write-Host "=== Config.Tests.ps1 Summary: PASS=$script:Passed FAIL=$script:Failed ==="
 if ($script:Failed -gt 0) {
