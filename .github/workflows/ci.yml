@@ -16,11 +16,13 @@ concurrency:
 
 jobs:
   linux:
-    name: Linux (Go, ShellCheck, Schemas)
+    name: Linux (Go, Python, ShellCheck, Schemas)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -28,15 +30,37 @@ jobs:
           go-version-file: docker-policy-proxy/go.mod
           cache: false
 
-      - name: Run Go vet and race tests
+      - name: Run Go vet, race tests, and multi-arch builds
         working-directory: docker-policy-proxy
         run: |
           go vet ./...
           go test -v -race ./...
+          GOOS=linux GOARCH=amd64 go build ./...
+          GOOS=linux GOARCH=arm64 go build ./...
 
-      - name: Check bash syntax and run ShellCheck
+      - name: Check Python syntax and run Python unit tests
         run: |
           set -euo pipefail
+          python3 -m pip install --quiet jsonschema
+          python3 -m py_compile scripts/linux/*.py
+          python3 -m unittest discover -s tests -p "test_*.py" -v
+
+      - name: Check bash syntax, LF line endings, and run ShellCheck
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF'
+          import glob, sys
+          bad = []
+          for pattern in ("scripts/linux/*.sh", "scripts/linux/*.py", "systemd/*.service"):
+              for path in sorted(glob.glob(pattern)):
+                  with open(path, "rb") as f:
+                      if b"\r\n" in f.read():
+                          bad.append(path)
+          if bad:
+              print("ERROR: CRLF line endings found in Linux files:", ", ".join(bad), file=sys.stderr)
+              sys.exit(1)
+          print("[PASS] All Linux scripts and systemd units use LF line endings.")
+          PYEOF
           if ! command -v shellcheck >/dev/null 2>&1; then
             sudo apt-get update -y
             sudo apt-get install -y --no-install-recommends shellcheck
@@ -47,10 +71,11 @@ jobs:
           done
           shellcheck scripts/linux/*.sh
 
-      - name: Validate JSON schemas and configs
+      - name: Validate JSON schemas, configs, and packaging manifests
         run: |
           python3 -m pip install --quiet jsonschema
           python3 - <<'PYEOF'
+          import glob
           import json
           import jsonschema
 
@@ -66,6 +91,11 @@ jobs:
               jsonschema.Draft7Validator.check_schema(schema)
               jsonschema.validate(instance=data, schema=schema)
               print(f"[PASS] {data_path} validates against {schema_path}")
+
+          for pkg_json in sorted(glob.glob("packaging/**/*.json", recursive=True)):
+              with open(pkg_json, encoding="utf-8") as f:
+                  json.load(f)
+              print(f"[PASS] {pkg_json} is valid JSON")
           PYEOF
 
   windows:
@@ -100,19 +130,25 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/Config.Tests.ps1
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/Secrets.Tests.ps1
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $testFiles = Get-ChildItem -Path tests -Filter '*.Tests.ps1' | Sort-Object Name
+          if ($testFiles.Count -eq 0) { throw "No PowerShell test suites found under tests/*.Tests.ps1" }
+          foreach ($tf in $testFiles) {
+            Write-Host "=== [PS 5.1] Running $($tf.Name) ==="
+            powershell.exe -NoProfile -ExecutionPolicy Bypass -File $tf.FullName
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
 
       - name: Run PowerShell test suites (PowerShell 7)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          pwsh -NoProfile -File tests/Config.Tests.ps1
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          pwsh -NoProfile -File tests/Secrets.Tests.ps1
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $testFiles = Get-ChildItem -Path tests -Filter '*.Tests.ps1' | Sort-Object Name
+          if ($testFiles.Count -eq 0) { throw "No PowerShell test suites found under tests/*.Tests.ps1" }
+          foreach ($tf in $testFiles) {
+            Write-Host "=== [PS 7] Running $($tf.Name) ==="
+            pwsh -NoProfile -File $tf.FullName
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
 
       - name: Run PSScriptAnalyzer
         shell: pwsh
