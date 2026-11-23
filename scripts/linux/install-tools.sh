@@ -42,7 +42,8 @@ INSTALL_AIDER="$(flag installAider False)"
 INSTALL_HELM="$(flag installHelm False)"
 INSTALL_OPENTOFU="$(flag installOpenTofu False)"
 INSTALL_TERRAFORM="$(flag installTerraform False)"
-INSTALL_PLAYWRIGHT="$(flag installPlaywrightChromium False)"
+INSTALL_PLAYWRIGHT_CHROMIUM="$(flag installPlaywrightChromium False)"
+INSTALL_PLAYWRIGHT_FIREFOX="$(flag installPlaywrightFirefox False)"
 AGENT_NAME="$(python3 -c "import json; d=json.load(open('${POLICY_FILE}')); print(d['agentUser']['name'])")"
 
 ARCH="$(dpkg --print-architecture)" # amd64 or arm64
@@ -338,19 +339,25 @@ if [[ "${INSTALL_TERRAFORM}" == "1" ]] && ! command -v terraform >/dev/null 2>&1
   log "Installed $(terraform version 2>&1 | head -n 1)."
 fi
 
-# 17. Headless Playwright Chromium + system dependencies
-if [[ "${INSTALL_PLAYWRIGHT}" == "1" ]]; then
+# 17. Headless Playwright browsers (Chromium / Firefox) + system dependencies
+if [[ "${INSTALL_PLAYWRIGHT_CHROMIUM}" == "1" || "${INSTALL_PLAYWRIGHT_FIREFOX}" == "1" ]]; then
   if [[ "${INSTALL_NODE}" != "1" ]] || ! command -v npm >/dev/null 2>&1; then
-    log "WARNING: installPlaywrightChromium is enabled but Node.js/npm is unavailable (installNodeLts=${INSTALL_NODE}); skipping Playwright Chromium install."
+    log "WARNING: Playwright browser installation is enabled but Node.js/npm is unavailable (installNodeLts=${INSTALL_NODE}); skipping Playwright install."
   else
     if ! command -v playwright >/dev/null 2>&1; then
       log "Installing global playwright CLI..."
       npm install -g playwright
     fi
-    if [[ ! -d "/home/${AGENT_NAME}/.cache/ms-playwright" ]]; then
+    PW_CACHE="/home/${AGENT_NAME}/.cache/ms-playwright"
+    if [[ "${INSTALL_PLAYWRIGHT_CHROMIUM}" == "1" ]] && ! compgen -G "${PW_CACHE}/chromium-*" >/dev/null; then
       log "Installing Playwright Chromium + system dependencies..."
       playwright install-deps chromium
       su -s /bin/bash - "${AGENT_NAME}" -c 'playwright install chromium'
+    fi
+    if [[ "${INSTALL_PLAYWRIGHT_FIREFOX}" == "1" ]] && ! compgen -G "${PW_CACHE}/firefox-*" >/dev/null; then
+      log "Installing Playwright Firefox + system dependencies..."
+      playwright install-deps firefox
+      su -s /bin/bash - "${AGENT_NAME}" -c 'playwright install firefox'
     fi
   fi
 fi

@@ -94,7 +94,8 @@
     "installHelm": false,
     "installOpenTofu": false,
     "installTerraform": false,
-    "installPlaywrightChromium": false
+    "installPlaywrightChromium": false,
+    "installPlaywrightFirefox": false
   },
   "ide": {
     "configureRemoteWsl": false

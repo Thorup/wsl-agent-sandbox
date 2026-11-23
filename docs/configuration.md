@@ -128,11 +128,11 @@ Fine-tune `docker-policy-proxy` and per-UID `systemd` slice quotas (`user-<uid>.
 
 ## System `apt` Packages & Built-in Toolchains
 
-Add package names to `packages.apt` or toggle any of the **23 built-in installers** in `box.local.json` and run `.\box.ps1 apply`:
+Add package names to `packages.apt` or toggle any of the **24 built-in installers** in `box.local.json` and run `.\box.ps1 apply`:
 
 - **Core Runtimes & Package Managers:** `installDockerCli`, `installUv`, `installNodeLts`, `installPnpm`, `installDotnetSdk`, `installRust`
 - **AI Coding Agents:** `installGeminiCli`, `installClaudeCode`, `installCodexCli`, `installOpenCode`, `installAider`
-- **Cloud, Kubernetes, IaC & DevOps CLIs:** `installKubectl`, `installHelm`, `installOpenTofu`, `installTerraform`, `installAwsCli`, `installGcloudCli`, `installAzureCli`, `installAzureDevopsCli`, `installGithubCli`, `installJiraCli`, `installUpctl`, `installPlaywrightChromium`
+- **Cloud, Kubernetes, IaC & DevOps CLIs:** `installKubectl`, `installHelm`, `installOpenTofu`, `installTerraform`, `installAwsCli`, `installGcloudCli`, `installAzureCli`, `installAzureDevopsCli`, `installGithubCli`, `installJiraCli`, `installUpctl`, `installPlaywrightChromium`, `installPlaywrightFirefox`
 
 ---
 

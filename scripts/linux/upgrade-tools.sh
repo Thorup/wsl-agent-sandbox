@@ -212,10 +212,16 @@ if has_scope "toolchains"; then
     record_ver "npm:playwright" "playwright --version" "before"
     log "Updating global playwright CLI..."
     npm install -g playwright@latest
-    if [[ -d "/home/${AGENT_NAME}/.cache/ms-playwright" ]]; then
+    PW_CACHE="/home/${AGENT_NAME}/.cache/ms-playwright"
+    if compgen -G "${PW_CACHE}/chromium-*" >/dev/null; then
       log "Updating Playwright Chromium + system dependencies..."
       playwright install-deps chromium
       su -s /bin/bash - "${AGENT_NAME}" -c 'playwright install chromium'
+    fi
+    if compgen -G "${PW_CACHE}/firefox-*" >/dev/null; then
+      log "Updating Playwright Firefox + system dependencies..."
+      playwright install-deps firefox
+      su -s /bin/bash - "${AGENT_NAME}" -c 'playwright install firefox'
     fi
     record_ver "npm:playwright" "playwright --version" "after"
   fi
