@@ -2,311 +2,107 @@
   <img src="assets/banner.jpg" alt="wsl-agent-sandbox — Hardened Ubuntu 26.04 LTS WSL2 Sandbox for Autonomous AI Agents" width="760">
 </p>
 
-# `wsl-agent-sandbox` — Hardened Ubuntu 26.04 LTS WSL2 Sandbox for Autonomous AI Agents
+# `wsl-agent-sandbox`
 
-A declaratively configured, isolated **Ubuntu 26.04 LTS (Resolute Raccoon)** WSL2 distribution (`wsl-agent-sandbox`) where autonomous AI coding agents (**Gemini CLI**, **Claude Code**, **Codex**, **Antigravity / VS Code Remote-WSL**, or custom agents) can run freely inside Linux while being **strictly contained from accessing your underlying Windows host**, with explicit Windows-side control over every bridge.
+**Run autonomous AI coding agents at full Linux speed on Windows—without risking your host machine.**
 
----
-
-## Security & Isolation Guarantees
-
-| Boundary | Default Policy | Controlled Bridge |
-| :--- | :--- | :--- |
-| **Privilege Escalation** | Agent runs as non-root `agent` (UID `26040`), zero `sudo`, locked `root` password. | Admin access only from Windows via `.\box.ps1 root-shell`. |
-| **Windows Filesystem** | `/mnt/c` automount disabled (`[automount] enabled=false`), manual `mount -t drvfs` blocked. | Declarative `sharedFolders` allowlist in `box.json` mounted at `/shared/<name>` (`ro` or `rw`). |
-| **Windows `.exe` Interop** | Disabled (`[interop] enabled=false`, `appendWindowsPath=false`). | None (Antigravity / VS Code Remote-WSL uses modern script-less startup). |
-| **WSLg / Clipboard / `/mnt/wsl`** | Unmounted per-distro (`rprivate` + `umount -l` + `chmod 000`); no X11/Wayland/clipboard/raw sockets. | Root-only `/run/box-root/mnt-wsl` (`0700 root:root`) used exclusively by `docker-policy-proxy`. |
-| **Network (WSL → Windows & LAN)** | Per-UID `nftables` (`meta skuid 26040`) drops all new outbound traffic to Windows host & RFC1918 LAN (`network.logDrops: true` rate-limit logs blocked connections). | Optional `network.allowedHostPorts` in `box.json`; outbound internet is `"open"` by default or restricted via `network.egressMode: "allowlist"` (`network.allowedDomains` enforced by root `egress-proxy.service` on `127.0.0.1:3128`). |
-| **Network (Windows → WSL)** | `ct state established,related accept` + WSL `localhostForwarding`. | Browse any web app hosted in WSL at `http://localhost:<port>` from Windows! |
-| **Docker Desktop** | Docker Desktop WSL Integration stays **OFF** for this distro; root-owned Go `docker-policy-proxy` mediates `/var/run/docker.sock`. | Blocks host drive bind mounts (`/run/desktop/mnt/host/c`, `/mnt/c`, `C:\`), symlink & TOCTOU escapes (`O_NOFOLLOW` ephemeral bind pinning), `--privileged`, dangerous `CapAdd`, `host` namespaces, devices, malicious volume options, Swarm/plugins. Enforces loopback `PortBindings`, optional `forceInternalNetwork`, container `defaultLimits`/`maxLimits`, and `allowedRegistries`. Automatically rewrites allowed `/home/agent` (and opted-in `/shared/*`) bind mounts! |
-| **Resource Quotas** | Optional per-UID `systemd` slice limits on `user-<uid>.slice` (never restricts root control plane). | Declarative `resources` (`memoryMax`, `cpuQuota`, `tasksMax`) in `box.json`. |
-| **Other WSL Distros** | Zero changes to `%USERPROFILE%\.wslconfig` or other distros; `nftables` scoped strictly to UID `26040`. | Optional reference in `examples/wslconfig.optional.ini`. |
+`wsl-agent-sandbox` creates a dedicated, hardened **Ubuntu 26.04 LTS** WSL2 environment for **Claude Code**, **Gemini CLI**, **Codex**, **VS Code / Antigravity Remote-WSL**, or any custom agent. It works out of the box with zero configuration, keeps your Windows files and local network off-limits by default, and lets you open explicit bridges only when you need them.
 
 ---
 
-## Quick Start
+## Why Use It?
+
+- **Safe by default, zero config required:** No `/mnt/c`, no `sudo`, no Windows `.exe` interop, no clipboard/X11 sharing, and no access to your Windows host or local LAN.
+- **Real Docker, safely mediated:** Containers work normally inside the sandbox while host drive mounts, `--privileged`, and container escapes are blocked automatically.
+- **Controlled bridges on your terms:** Share a specific folder (`ro`/`rw`), open a single local port (like Ollama or `kubectl port-forward`), or push a git repo safely—and reload live with `.\box.ps1 apply`.
+- **Pre-loaded developer environment:** Ubuntu 26.04 LTS with Node, Python (`uv`), Rust, .NET, Docker CLI, cloud CLIs, and AI coding agents ready out of the box.
+- **Instant clean-room resets:** Take a golden snapshot once and roll back to a fresh sandbox in seconds.
+- **Zero impact on your other WSL distros:** Never modifies `%USERPROFILE%\.wslconfig` or collides with existing distros.
+
+---
+
+## Quick Start (Zero Configuration Needed)
 
 ```powershell
-# 1. Clone the repository:
+# 1. Clone the repository
 git clone https://github.com/Thorup/wsl-agent-sandbox.git
 cd wsl-agent-sandbox
 
-# 2. Provision Ubuntu 26.04 LTS, build & test the Docker policy proxy, harden, and verify:
+# 2. Provision Ubuntu 26.04 LTS, harden the sandbox, and run the isolation audit
 .\box.ps1 init
-# (Or if installed globally via Scoop / packaging/scoop/wsl-agent-sandbox.json: `wsl-sandbox init`)
 
-# 3. Open an interactive shell as the sandboxed agent user:
+# 3. Drop into the sandboxed Linux agent shell
 .\box.ps1 shell
-
-# 4. Check status (systemd health, active /shared mounts, nftables):
-.\box.ps1 status
-
-# 5. Run the full red-team isolation & capability audit at any time:
-.\box.ps1 verify
 ```
+
+> **Tip:** Prefer a global command (`wsl-sandbox`) without keeping a git clone around? See [Scoop / global installation](docs/getting-started.md#global-installation-scoop).
+> **Docker Desktop users:** Leave **WSL Integration OFF** for `wsl-agent-sandbox` in Docker Desktop—our built-in policy proxy connects automatically without exposing the raw Docker socket.
 
 ---
 
-## Controlling What WSL Can Access on Windows (`box.json` & `box.local.json`)
+## Common Next Steps
 
-> **Recommended:** Create a gitignored `box.local.json` next to `box.json` for your local `sharedFolders`, `allowedHostPorts`, or package overrides. `box.ps1` automatically deep-merges `box.local.json` over `box.json` (objects merge recursively; arrays replace cleanly) without leaving a dirty git working tree.
-
-Edit `box.local.json` (or `box.json`) on Windows (invisible to the agent inside WSL), then run `.\box.ps1 apply` to live-reload without rebuilding.
-
-### Share a Specific Windows Folder (Read-Only or Read-Write)
-```json
-"sharedFolders": [
-  {
-    "name": "reference-docs",
-    "windowsPath": "C:\\Users\\you\\Documents\\reference",
-    "mode": "ro",
-    "allowDockerBind": true
-  }
-]
-```
-After `.\box.ps1 apply`, the folder appears at `/shared/reference-docs` (mounted read-only, and if `allowDockerBind` is `true`, the Docker proxy forces `:ro` even if a container requests `:rw`).
-
-### Allow a Specific Windows Host Port or Port-Forward (e.g., `kubectl port-forward`, SSH Tunnels, Local Ollama)
-
-By default (`network.blockHostAndLan: true`, `allowedHostPorts: []`), direct processes running as `agent` inside WSL **cannot** reach ports bound on your Windows host (including `kubectl port-forward` or SSH tunnels on Windows `127.0.0.1` or LAN IPs) in either `networkingMode=nat` or `networkingMode=mirrored`.
-
-#### Port-Forward Hardening Matrix
-
-Use this table to determine what can reach a port forwarded to your Windows client:
-
-| Configuration in `box.json` | Direct WSL Processes (`agent`) | Containers via Docker Desktop (`host.docker.internal`) | Effective Hardening Level |
-| :--- | :--- | :--- | :--- |
-| `blockHostAndLan: true`, `allowedHostPorts: []`, `docker.enabled: false` | **Blocked** (NAT & Mirrored) | **Disabled** (no Docker access) | **Strictest** — WSL box cannot reach any Windows host or port-forwarded service. |
-| `blockHostAndLan: true`, `allowedHostPorts: []`, `docker.enabled: true` *(default)* | **Blocked** (NAT & Mirrored) | **Reachable via `host.docker.internal:<port>`** (unless `docker.forceInternalNetwork: true` or blocked by Windows Firewall) | **Standard** — Direct WSL egress is blocked, `PortBindings` forced to `127.0.0.1` by default. |
-| `blockHostAndLan: true`, `allowedHostPorts: [<port>]` | **Allowed on `<port>` only** | **Reachable** (if `docker.enabled: true`) | **Targeted Bridge** — Explicitly shares only the listed port(s) with WSL. |
-| `blockHostAndLan: false` | **Allowed** (all host & LAN ports) | **Reachable** (if `docker.enabled: true`) | **Open Host/LAN** — No host/LAN network isolation. |
-
-> **Security Tip:** If you run sensitive port-forwards on Windows (e.g., `kubectl port-forward` to a production cluster) while an untrusted agent runs in this box, set `"docker": { "enabled": false }` in `box.json` and run `.\box.ps1 apply` (or block Docker Desktop bridge traffic via Windows Firewall).
-
-#### How to Share a Windows Port-Forward with the WSL Box
-
-1. Add the port to `network.allowedHostPorts` in `box.json`:
-```json
-"network": {
-  "blockHostAndLan": true,
-  "allowedHostPorts": [
-    { "port": 8080, "protocol": "tcp", "comment": "k8s port-forward on Windows" },
-    { "port": 11434, "protocol": "tcp", "comment": "Local Ollama on Windows" }
-  ]
-}
-```
-2. Run `.\box.ps1 apply` to live-reload `nftables` (and mirrored loopback policy routing) immediately.
-3. Connect based on your WSL2 `networkingMode` (in `%USERPROFILE%\.wslconfig`):
-   - **Mirrored mode (`networkingMode=mirrored`):** Standard `kubectl port-forward ... 8080:<target>` (bound to `127.0.0.1` on Windows) is reachable directly at `localhost:8080` from inside WSL.
-   - **NAT mode (default WSL2):** Windows `127.0.0.1` is not routed into WSL NAT, so bind the forward to your Windows host/WSL interface (e.g., `kubectl port-forward --address 0.0.0.0 ... 8080:<target>` or the `vEthernet (WSL)` IP), allow the port through Windows Firewall if prompted, and connect from WSL to the Windows host gateway IP (`ip route show default | awk '{print $3}'`).
-
-### Restrict Public Internet Egress to an Allowlist (`network.egressMode`)
-
-By default (`"egressMode": "open"`), the agent has open outbound internet access while Windows host and RFC1918 LAN IPs are blocked. To restrict outbound HTTP/HTTPS traffic strictly to allowlisted domains (and block direct non-proxy egress and direct UDP/TCP port 53 DNS exfiltration in `nftables`), set `"egressMode": "allowlist"`:
-
-```json
-"network": {
-  "blockHostAndLan": true,
-  "logDrops": true,
-  "egressMode": "allowlist",
-  "allowedDomains": [
-    "llm-apis",
-    "github",
-    "npm",
-    "pypi",
-    "*.example.com"
-  ]
-}
-```
-- Built-in presets in `allowedDomains`: `llm-apis`, `github`, `npm`, `pypi`, and `apt`.
-- `box-apply-policy.sh` automatically starts the root-owned `egress-proxy.service` on `127.0.0.1:3128` (with SSRF and DNS-rebinding protection against host/LAN IPs) and exports `HTTP_PROXY`/`HTTPS_PROXY` into the agent environment.
-
-### Harden Docker Containers & Enforce Systemd Resource Quotas (`docker` & `resources`)
-
-Fine-tune `docker-policy-proxy` container network/resource policies and per-UID `systemd` slice quotas (`user-<uid>.slice`) in `box.json` (or `box.local.json`):
-
-```json
-"docker": {
-  "enabled": true,
-  "allowBindPrefixes": ["/home/agent"],
-  "allowBuildKit": true,
-  "allowPortBindings": true,
-  "forceLoopbackPortBindings": true,
-  "allowedPublishedPorts": [3000, 8080],
-  "forceInternalNetwork": false,
-  "defaultLimits": { "memoryBytes": 2147483648, "nanoCpus": 2000000000, "pidsLimit": 256 },
-  "maxLimits": { "memoryBytes": 4294967296, "nanoCpus": 4000000000, "pidsLimit": 512 },
-  "allowedRegistries": ["docker.io", "ghcr.io", "mcr.microsoft.com"]
-},
-```
-> **Note:** BuildKit (`/grpc`, `/session`) is automatically disabled when `forceInternalNetwork: true` or `allowedRegistries` is non-empty, preventing `docker buildx` from bypassing network or registry restrictions.
-
-```json
-"resources": {
-  "memoryMax": "8G",
-  "cpuQuota": "400%",
-  "tasksMax": 512
-}
-```
-
-### Add System `apt` Packages & Cloud/Agent/Language Toolchains
-Add package names to `packages.apt` or toggle any of the 22 built-in installers in `box.json` (or `box.local.json`) and run `.\box.ps1 apply`:
-- **Core Runtimes & Package Managers:** `installDockerCli`, `installUv`, `installNodeLts`, `installPnpm`, `installDotnetSdk`, `installRust`
-- **AI Coding Agents:** `installGeminiCli`, `installClaudeCode`, `installCodexCli`, `installOpenCode`, `installAider`
-- **Cloud, Kubernetes, IaC & DevOps CLIs:** `installKubectl`, `installHelm`, `installOpenTofu`, `installTerraform`, `installAwsCli`, `installGcloudCli`, `installAzureCli`, `installAzureDevopsCli`, `installGithubCli`, `installJiraCli`, `installUpctl`, `installPlaywrightChromium`
-
-(User-space tools via `uv`, `pip`, `npm`, `pnpm`, `cargo`, `rustup`, and `dotnet tool install -g` can also be installed freely by the agent inside `/home/agent` without `sudo`.)
-
-### Named Multi-Box Profiles (`-Profile <name>` & `.\box.ps1 list`)
-Run multiple independent, isolated sandboxes side-by-side (each with its own WSL distribution, VHDX directory, and deterministic high UID in `26100..26998` so per-UID `nftables` rules never collide):
-- Create an optional `box.<profile>.json` (or `profiles/<profile>.json`) override file, or pass `-Profile <name>` directly to any command (`.\box.ps1 init -Profile untrusted`, `.\box.ps1 shell -Profile untrusted`, `.\box.ps1 apply -Profile untrusted`).
-- Run `.\box.ps1 list` to inspect all configured sandbox profiles, their resolved distro names, UIDs, and WSL installation states.
-
----
-
-## Using Other AI Agents (Claude Code, Codex, etc.)
-
-Because every containment boundary (non-root UID `26040`, no `sudo`, no `/mnt/c`, no Windows interop, no WSLg/clipboard, per-UID `nftables` + `loopback0` blocking, and `docker-policy-proxy`) is enforced at the **Linux OS / kernel / systemd level**, this box works identically for **any** CLI or IDE agent:
-- **Gemini CLI** (`gemini` — pre-installed by default; toggle `installGeminiCli` in `box.json`)
-- **Claude Code** (`claude` — pre-installed by default; toggle `installClaudeCode` in `box.json`)
-- **OpenAI Codex CLI** (`codex` — toggle `installCodexCli: true` in `box.json`), **OpenCode** (`opencode` — toggle `installOpenCode: true`), **Aider** (`aider` — toggle `installAider: true`), or custom agents (installable via ` box.json` toggles or in user-space via `npm`/`uv`)
-
-### Dynamic Agent Instructions, `SKILL.md` & Multi-Cloud Profile Switchers (`use-gcloud`, `use-aws`, `use-github`, `box-context`)
-
-Whenever you run `.\box.ps1 apply`, `.\box.ps1 seed-secrets`, or `.\box.ps1 clear-secrets`, the sandbox automatically runs `/usr/local/sbin/box-sync-context.py` to keep agents aware of the active sandbox boundaries, mounts, allowed host ports, and seeded cloud profiles (with **zero secret values** written to disk):
-- **Global Agent Instruction Files (non-destructive marker blocks)**: Automatically updates `# >>> wsl-agent-sandbox >>>` blocks in `~/.gemini/GEMINI.md`, `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.config/opencode/AGENTS.md`, and `~/.config/wsl-agent-sandbox/SANDBOX_CONTEXT.md`.
-- **Supplementary Global Agent Skill (`SKILL.md`)**: Automatically generates `~/.gemini/skills/wsl-agent-sandbox/SKILL.md`, `~/.claude/skills/wsl-agent-sandbox/SKILL.md`, and `~/.codex/skills/wsl-agent-sandbox/SKILL.md` so that even when a repository has its own `GEMINI.md` / `CLAUDE.md` / `AGENTS.md`, agents can discover and activate the `wsl-agent-sandbox` skill.
-- **Persistent Multi-Cloud Switchers & Context CLI**:
-  - `use-gcloud <name>` (or `use-gcloud --list`) — Activates the named `gcloud` configuration **and** updates `GOOGLE_APPLICATION_CREDENTIALS`, `GOOGLE_CLOUD_PROJECT`, `CLOUDSDK_CORE_PROJECT`, and compute region/zone both in the current shell and persistently across subsequent non-interactive agent subshells (`~/.config/wsl-agent-sandbox/active-overrides.env`).
-  - `use-aws <profile>` (or `use-aws --list`) — Switches `AWS_PROFILE` both in the current shell and persistently across subshells.
-  - `use-github <profile>` (or `use-github --list`) — Switches active GitHub fine-grained PAT profile (`GH_TOKEN` / `GH_ENTERPRISE_TOKEN` and `~/.config/gh/hosts.yml`) across personal and organization Resource Owners (works seamlessly with `"proxyInject": true`).
-  - `box-context` (or `box-context --json`) — Prints the live, non-secret sandbox inventory.
-
-> **Cloud Credentials Note**: Any credentials you configure inside `/home/agent` (`~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.config/gh`, `~/.config/.jira`, `~/.config/upctl.yaml`, `~/.kube/config`) are accessible to autonomous agents running in this box. Use dedicated, least-privilege sandbox accounts/clusters or short-lived tokens rather than production admin credentials.
-
----
-
-## Seeding & Rotating CLI Service Secrets (from Windows)
-
-You can seed and rotate machine account tokens and service account credentials for your CLI tools directly from a **central Windows location** — completely outside `.\box.ps1 init` and `.\box.ps1 apply`, without navigating inside Linux or storing any secrets in `box.json` / git.
-
-### 1. Create Your Central Windows Secrets Manifest
-
-Create a folder outside the repository (default: `%USERPROFILE%\.wsl-agent-sandbox\`) and copy [examples/secrets.example.json](examples/secrets.example.json) into `%USERPROFILE%\.wsl-agent-sandbox\secrets.json` (plus any service account JSON keys, PEM certificates, kubeconfigs, or raw token files in subdirectories like `keys/` or `tokens/`):
-
+### 1. Bring a Repository In Safely (Recommended over `rw` mounts)
+Transfer any Windows git repo onto fast Linux `ext4` without exposing your Windows directory or `.git/hooks`:
 ```powershell
-New-Item -ItemType Directory -Path "$env:USERPROFILE\.wsl-agent-sandbox" -Force | Out-Null
-Copy-Item .\examples\secrets.example.json "$env:USERPROFILE\.wsl-agent-sandbox\secrets.json"
+.\box.ps1 push-repo C:\Users\you\projects\my-app
+# ...let your agent work inside WSL...
+.\box.ps1 pull-diff my-app       # Review changes from Windows
+.\box.ps1 pull-branch my-app     # Pull commits into a reviewable local branch
 ```
 
-Every secret field supports **four mutually exclusive sources**:
-- **Inline value** (e.g., `"token": "..."`)
-- **Relative or absolute Windows file** (e.g., `"tokenFile": "tokens/github.txt"`, `"serviceAccountKeyFile": "keys/gcp-sa.json"` — relative paths resolve against the directory containing `secrets.json`, and `%ENVVAR%` expansion is supported)
-- **Windows environment variable** (e.g., `"tokenEnv": "SANDBOX_GH_TOKEN"`)
-- **Password manager or cloud vault URI** (e.g., `"tokenVault": "op://Sandbox/GitHub/pat"` — supports `op://` 1Password CLI, `bw://` Bitwarden CLI, `dpapi://` Windows CurrentUser DPAPI encrypted file, `azkv://` Azure Key Vault, `awssm://` AWS Secrets Manager, and `gcpsm://` GCP Secret Manager, resolved on Windows at seed time)
+### 2. Connect VS Code or Antigravity
+Create a gitignored `box.local.json` next to `box.json`:
+```json
+{
+  "ide": { "configureRemoteWsl": true }
+}
+```
+Run `.\box.ps1 apply`, then connect via **Remote-WSL → `wsl-agent-sandbox`**. See [Getting Started & IDE Setup](docs/getting-started.md#connecting-vs-code--antigravity-remote-wsl).
 
-Manifest path resolution priority:
-1. CLI argument: `.\box.ps1 seed-secrets "D:\vault\secrets.json"` or `-SecretsPath "D:\vault\secrets.json"`
-2. Windows environment variable: `$env:WSL_AGENT_SANDBOX_SECRETS_PATH`
-3. Optional non-secret pointer in `box.json`: `"secrets": { "manifestPath": "%USERPROFILE%\\.wsl-agent-sandbox\\secrets.json" }`
-4. Default: `%USERPROFILE%\.wsl-agent-sandbox\secrets.json`
-
-### 2. Seed, Rotate, or Revoke Secrets Independently of `init` / `apply`
-
+### 3. Pass API Keys & Cloud Credentials Safely
+Keep all secrets in a central Windows folder (`%USERPROFILE%\.wsl-agent-sandbox\secrets.json`) or password manager/cloud vault—never in git or `box.json`—and push them over `stdin`:
 ```powershell
-# Preview and validate without pushing any secrets:
-.\box.ps1 seed-secrets -DryRun
-
-# Seed all enabled services from %USERPROFILE%\.wsl-agent-sandbox\secrets.json:
-.\box.ps1 seed-secrets
-
-# Rotate only specific service(s) after updating tokens in your central Windows folder:
-.\box.ps1 seed-secrets -Service github,jira
-
-# Seed and prune credentials for any service you disabled or removed from secrets.json:
-.\box.ps1 seed-secrets -Prune
-
-# Revoke managed credentials inside WSL (all, or specific service(s)):
-.\box.ps1 clear-secrets
-.\box.ps1 clear-secrets -Service aws,gcloud
+.\box.ps1 seed-secrets -DryRun   # Validate first
+.\box.ps1 seed-secrets           # Seed or rotate credentials
 ```
+Supports L7 token injection (`proxyInject`), filtered SSH agent forwarding (`agent-proxy`), ephemeral TTL expiry, and multi-cloud switchers (`use-gcloud`, `use-aws`, `use-github`). See [Secrets & Cloud Auth](docs/secrets.md).
 
-### Supported CLI Services (`secrets.schema.json`)
-
-| Service Key | CLI / Tool | Auth Mechanism & Linux Target |
-| :--- | :--- | :--- |
-| `github` | `gh` + `git` (HTTPS) | Machine account / fine-grained PAT (single or multi-profile `profiles[]` across personal and organization Resource Owners, switchable via `use-github <profile>`) → `~/.config/gh/hosts.yml`, `gh auth setup-git`, optional `GH_TOKEN` / `GH_ENTERPRISE_TOKEN` (and optional `loginOnline: true`); supports `"proxyInject": true` (`GITHUB_API_URL=http://127.0.0.1:3129/github`). |
-| `git` | `git` (SSH + signing) | Dedicated Git SSH keys (plus optional `.pub` & OpenSSH `-cert.pub` certs) → `~/.ssh/wsl-agent-sandbox-git/` (`0600`) or root-owned `ssh-agent` (`"mode": "agent-proxy"` via filtered `SSH_AUTH_SOCK=/run/ssh-agent-proxy/agent.sock`), independent Git `Host` stanzas in `~/.ssh/config`, pinned `known_hosts`, plus optional Git identity (`user.name`/`user.email`), SSH commit/tag signing (`gpg.format = ssh`, `allowed_signers`), and HTTPS-to-SSH rewrites via `~/.config/wsl-agent-sandbox/gitconfig`. |
-| `aws` | `aws` | IAM access keys / STS tokens (single or multi-profile) → `~/.aws/credentials`, `~/.aws/config`, optional `AWS_PROFILE`. |
-| `gcloud` | `gcloud` + GCP SDKs | Service Account JSON key(s) (single-project or multi-project `projects[]` / `profiles[]` with separate service accounts) → `~/.config/wsl-agent-sandbox/keys/gcloud-*.json`, named `gcloud` configurations (`~/.config/gcloud/configurations/config_<name>`), `gcloud auth activate-service-account`, project/region/zone config, `GOOGLE_APPLICATION_CREDENTIALS`. |
-| `azure` | `az` + Azure SDKs | Entra ID Service Principal (client secret or PEM cert) → `az login --service-principal`, optional subscription, `AZURE_CLIENT_ID`/`AZURE_TENANT_ID`/`AZURE_CLIENT_SECRET` (or `AZURE_CLIENT_CERTIFICATE_PATH`). |
-| `azureDevops` | `az devops` | Personal Access Token → `AZURE_DEVOPS_EXT_PAT` + `az devops configure --defaults organization=... project=...`. |
-| `jira` | `jira` (`jira-cli`) | API token → `~/.config/.jira/.config.yml` + `JIRA_API_TOKEN`; supports `"proxyInject": true` (Basic/Bearer auth stored only in root proxy, `server` set to `http://127.0.0.1:3129/jira`). |
-| `upcloud` | `upctl` | API token (or subaccount username/password) → `~/.config/upctl.yaml` + optional `UPCLOUD_TOKEN`. |
-| `kubectl` | `kubectl` | Dedicated kubeconfig file OR Service Account bearer token → `~/.kube/config` + optional context switch. |
-| `gemini` | `gemini` | `GEMINI_API_KEY` and/or Vertex AI; supports `"proxyInject": true` (`GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:3129/gemini` + placeholder token). |
-| `claude` | `claude` | `ANTHROPIC_API_KEY` and/or `CLAUDE_CODE_OAUTH_TOKEN`; supports `"proxyInject": true` (`ANTHROPIC_BASE_URL=http://127.0.0.1:3129/claude` + placeholder tokens). |
-| `ssh` | `ssh` / `scp` / `sftp` | Named SSH private keys for remote servers/bastions (plus optional `.pub` & OpenSSH user `-cert.pub` certificates) → `~/.ssh/wsl-agent-sandbox/` (`0600`) or root-owned `ssh-agent` (`"mode": "agent-proxy"` via filtered `SSH_AUTH_SOCK=/run/ssh-agent-proxy/agent.sock`), marker-delimited `Host` stanzas & optional `defaultKey` in `~/.ssh/config`, and pinned `known_hosts`. |
-| `env` | Any CLI | Additional custom token environment variables exported into `~/.config/wsl-agent-sandbox/secrets.env` (protected system vars like `PATH`/`DOCKER_HOST`/`LD_PRELOAD` are rejected). |
-| `files` | Any CLI | Additional secret files (e.g., `~/.npmrc`, `~/.netrc`) copied atomically with `0600` strictly inside `/home/<agent>/`. |
-
-> **Git SSH & Commit Signing Notes**:
-> - Rotate or revoke Git SSH keys independently of remote server `ssh` credentials with `.\box.ps1 seed-secrets -Service git` or `.\box.ps1 clear-secrets -Service git`. Managed Git keys live in `~/.ssh/wsl-agent-sandbox-git/` (or in a root-owned `ssh-agent` behind `/run/ssh-agent-proxy/agent.sock` when `"mode": "agent-proxy"` is set, so private keys never touch `/home/agent`) and use their own marker-delimited block in `~/.ssh/config` (ahead of `ssh`'s `Host *` defaults), so `git` and `ssh` never clobber each other.
-> - Supports both a concise single-host shorthand (`"host": "github.com"`, `"privateKeyFile": "..."`) and multi-host / per-repo deploy-key aliases (`keys[]` + `hosts[]` for GitHub, GitLab, Azure DevOps `ssh.dev.azure.com`, Bitbucket, etc.), plus optional `userName`/`userEmail`, SSH commit/tag signing (`signing` → `gpg.format = ssh` + `allowed_signers` in `~/.config/wsl-agent-sandbox/gitconfig` included from `~/.gitconfig`), and optional `rewriteHttpsToSsh`.
-> - `StrictHostKeyChecking` is computed per Git host (`yes` when pinned known hosts cover that host, `accept-new` otherwise), and `BatchMode` defaults to `true` so agents fail fast instead of hanging on interactive SSH prompts. If you also use `github` with `"gitProtocol": "ssh"`, configure `git` alongside `github` to supply the SSH key.
-
-> **SSH Remote Server Access Notes**:
-> - Rotate or revoke agent SSH keys at any time with `.\box.ps1 seed-secrets -Service ssh` or `.\box.ps1 clear-secrets -Service ssh`. Managed keys live strictly in `~/.ssh/wsl-agent-sandbox/` (or in the root-owned `ssh-agent` behind `ssh-agent-proxy.service` when `"mode": "agent-proxy"` is configured, which filters `SSH_AGENTC_REQUEST_IDENTITIES` and `SSH_AGENTC_SIGN_REQUEST` against an allowlist of public key blobs and blocks add/remove/lock operations) and `~/.ssh/config` uses marker-delimited blocks, so manual user keys and custom `~/.ssh/config` entries are never overwritten; stale managed keys are automatically pruned on rotation.
-> - Use dedicated, least-privilege remote accounts and passphrase-less deploy keys (or short-lived OpenSSH user certificates via `certificate`/`certificateFile`) with pinned `knownHosts` / `knownHost` entries. `StrictHostKeyChecking` defaults to `yes` when pinned known hosts are provided, or `accept-new` otherwise.
-> - `seed-secrets` never weakens `box.json` network isolation: public remote SSH servers work out of the box, while RFC1918 / LAN / Tailscale targets (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10`) remain governed by `network.blockHostAndLan` and `network.blockedCidrs` in `box.json` (or reachable via a public `proxyJump` bastion / `allowedHostPorts` tunnel).
-
-> **Security Guarantees**: Your central Windows secrets folder is **never** mounted into WSL (`/shared` or `/mnt/c`) and **never** written to `box.json` or `/etc/wsl-agent-sandbox/policy.json`. Any secret field also accepts a `<field>Vault` URI (`op://`, `bw://`, `dpapi://`, `azkv://`, `awssm://`, or `gcpsm://`) resolved on Windows at seed time so plaintext tokens never need to rest on disk. Windows resolves file/env/vault references locally, pipes the payload strictly over `stdin` to the root control plane (`wsl -u root`), writes all files atomically with `0600` permissions owned by `agent:agent`, redacts secret strings from any error output, and automatically loads `~/.config/wsl-agent-sandbox/secrets.env` in agent shells.
+### 4. Customize Without Touching Git (`box.local.json` & Starter Presets)
+Put any local overrides in a gitignored `box.local.json` and run `.\box.ps1 apply` to live-reload. Start from a ready-made preset in [`examples/presets/`](examples/presets/):
+- [`ide-dev.local.json`](examples/presets/ide-dev.local.json) — Remote-WSL IDE integration + optional IaC/K8s tools (`installTerraform`, `installHelm`).
+- [`strict-lockdown.local.json`](examples/presets/strict-lockdown.local.json) — Domain egress allowlist (`llm-apis`, `github`, `npm`, `pypi`), isolated Docker internal network, registry allowlist, and CPU/RAM quotas.
+- [`no-docker-minimal.local.json`](examples/presets/no-docker-minimal.local.json) — Disables Docker completely for maximum host isolation alongside sensitive Windows port-forwards.
 
 ---
 
-## Connecting Antigravity / VS Code Remote-WSL
+## Explore All Features
 
-1. To have `.\box.ps1 init` and `.\box.ps1 apply` automatically configure VS Code (`%APPDATA%\Code\User\settings.json`) and Antigravity (`%APPDATA%\Antigravity\User\settings.json`) for this sandbox, opt in via `box.local.json` (or `box.json`):
-   ```json
-   "ide": {
-     "configureRemoteWsl": true
-   }
-   ```
-   When enabled, `init` and `apply` set `"remote.WSL.experimental.scriptLessStartup": true` so Remote-WSL streams the server tarball over `stdin` without requiring `/mnt/c` (`[automount] enabled=false`) or Windows `.exe` interop (`[interop] enabled=false`). (Defaults to `false` so global IDE settings are left untouched unless you intend to use VS Code / Antigravity with the sandbox.)
-2. Launch Antigravity or VS Code **from Windows** (e.g., `code --remote wsl+wsl-agent-sandbox /home/agent` or `antigravity --remote wsl+wsl-agent-sandbox /home/agent`, or use the bottom-left **`><`** Remote window menu → **Connect to WSL using Distro...** → **`wsl-agent-sandbox`**).
+Everything in `wsl-agent-sandbox` is documented in focused guides so you only read what you need:
 
----
-
-## Important Security Notes
-
-1. **Keep Docker Desktop "WSL Integration" OFF for `wsl-agent-sandbox`**: Do not toggle `wsl-agent-sandbox` on in Docker Desktop's WSL Integration settings. Our root-owned `docker-policy-proxy` already connects to Docker Desktop cleanly while preventing raw socket exposure.
-2. **Docker Desktop Container Bridge Egress**: While direct WSL processes (`agent` UID `26040`) are blocked from reaching Windows host ports by `nftables`, and containers cannot use `--network=host` or `--add-host=...:host-gateway`, containers running inside Docker Desktop's default bridge network can still resolve `host.docker.internal` unless you set `"docker": { "forceInternalNetwork": true }` (or `"enabled": false`) in `box.json`, or restrict Docker Desktop bridge traffic via Windows Firewall. Filesystem, symlink/TOCTOU (`O_NOFOLLOW` bind pinning), port-binding (`forceLoopbackPortBindings`), resource cap (`defaultLimits`/`maxLimits`), registry (`allowedRegistries`), and privilege escapes via Docker are enforced by `docker-policy-proxy`.
-3. **Global `.wslconfig` (`networkingMode`)**: `wsl-agent-sandbox` works cleanly in **both** `networkingMode=nat` and `networkingMode=mirrored` without modifying your global `%USERPROFILE%\.wslconfig`. In `networkingMode=mirrored`, `box-hardening.sh` installs per-UID (`uidrange 26040-26040`) policy routing + `nftables` `ct mark 0x2604` rules on `loopback0` so `agent` is blocked from reaching Windows `127.0.0.1` ports while Windows → WSL `localhost` web browsing and WSL-internal `127.0.0.1` services continue working seamlessly.
+| Guide | What You'll Find |
+| :--- | :--- |
+| **[Getting Started & IDE Setup](docs/getting-started.md)** | Prerequisites, Scoop global install, VS Code / Antigravity Remote-WSL, Windows Terminal profile, supported AI agents, and automatic agent context (`SKILL.md` & `box-context`). |
+| **[Configuration & Networking](docs/configuration.md)** | `box.json` & `box.local.json` deep-merge, shared folders (`ro`/`rw`), Windows port-forwards (NAT vs. Mirrored matrix), domain egress allowlists, 23 built-in tool toggles, and multi-box `-Profile` isolation. |
+| **[Secrets & Cloud Auth](docs/secrets.md)** | Central Windows `secrets.json`, 14 supported CLI services, password manager & cloud vault URIs (`op://`, `bw://`, `dpapi://`, `azkv://`, `awssm://`, `gcpsm://`), L7 `proxyInject`, SSH `agent-proxy`, TTLs, and `use-gcloud` / `use-aws` / `use-github`. |
+| **[Security Architecture](docs/security-architecture.md)** | Full containment boundary matrix, `nftables` & mirrored `loopback0` rules, `docker-policy-proxy` protections, BuildKit & `host.docker.internal` advisories, systemd resource quotas, `verify`, and `audit` logs. |
+| **[CLI Command Reference](docs/cli-reference.md)** | Complete reference for all `box.ps1` commands, flags, snapshots/resets, `doctor`, `upgrade`, `compact`, and multi-profile workflows. |
 
 ---
 
-## Lifecycle Commands
+## Everyday Commands
 
-All commands accept `-Profile <name>` (alias `-ProfileName`) to target a named sandbox profile and `-ConfigPath <path>` to use a custom config file.
+| Command | What It Does |
+| :--- | :--- |
+| `.\box.ps1 init [-SaveGolden]` | Provision, harden, and verify the sandbox from scratch. |
+| `.\box.ps1 shell` | Open an interactive shell as the sandboxed `agent` user. |
+| `.\box.ps1 apply` | Live-reload `box.json` / `box.local.json` changes without rebuilding. |
+| `.\box.ps1 push-repo <path>` / `pull-diff <name>` | Safely move a Windows git repo into WSL and review agent diffs. |
+| `.\box.ps1 seed-secrets` / `clear-secrets` | Push, rotate, or revoke CLI tokens and cloud credentials from Windows. |
+| `.\box.ps1 verify` / `doctor` | Run the red-team isolation audit or Windows + WSL preflight checks. |
+| `.\box.ps1 reset` | Roll back to a clean golden snapshot in seconds. |
 
-- `.\box.ps1 init [-SaveGolden]` — Full download (with SHA256 verification), import, provision, harden, verify, and save initial golden snapshot.
-- `.\box.ps1 up` — Ensure the distro is running and systemd hardening services are active (runs `init` if not installed).
-- `.\box.ps1 apply [-RebuildProxy]` — Hot-reload `box.json` / `box.local.json` changes (mounts, ports, Docker policy, `apt` packages, CLI/language toolchains); pass `-RebuildProxy` to rebuild `docker-policy-proxy`.
-- `.\box.ps1 upgrade [-Scope all|apt,agents,toolchains]` — Update installed `apt` packages, AI agents, and toolchains in place.
-- `.\box.ps1 doctor` — Run Windows + WSL preflight diagnostics (WSL2, `.wslconfig`, Docker Desktop, systemd, VHDX size, image cache).
-- `.\box.ps1 compact` — Run `fstrim` inside WSL and compact `ext4.vhdx` to reclaim disk space (requires elevated Administrator PowerShell).
-- `.\box.ps1 logs` / `.\box.ps1 audit` — View root-owned security events (`nftables` drops, `docker-policy-proxy` denials, `box-hardening` reloads) filtered by `-Source <all|docker|network|hardening>`, `-Since <time>`, and `-Lines <1..100000>`.
-- `.\box.ps1 list` — List all configured sandbox profiles (`default` + `box.<profile>.json` / `profiles/<profile>.json`), their distro names, UIDs, and WSL installation states.
-- `.\box.ps1 push-repo <path> [-Dest <relpath>] [-Branch <ref>] [-Force]` / `pull-diff <name>` / `pull-branch <name> [-RepoPath <winPath>] [-Branch <ref>]` — Transfer git repos via bundle onto native Linux `ext4` (`~/work/<name>`) and pull reviewable `sandbox/<name>` branches back without `rw` `/shared` mounts.
-- `.\box.ps1 seed-secrets [path]` — Seed or rotate CLI service tokens and service account credentials from a central Windows manifest (independently of `init`/`apply`); supports `-SecretsPath <path>`, `-Service <names>`, `-Ttl <dur>` (ephemeral auto-expiration enforced by root systemd timers, also configurable per service via `ttl`), `-Prune`, and `-DryRun`.
-- `.\box.ps1 clear-secrets [-Service <names>]` — Revoke managed seeded CLI credentials inside WSL (all or scoped to specific service(s)).
-- `.\box.ps1 verify` — Run full red-team isolation audit + Windows ↔ WSL `localhost` web test.
-- `.\box.ps1 status` — Inspect systemd services, active `/shared` mounts, seeded CLI secrets, VHDX disk footprint, resource quotas, and `nftables` rules.
-- `.\box.ps1 register-terminal [-Unregister]` — Add or update a dedicated Windows Terminal profile for this sandbox (pass `-Unregister` to remove it).
-- `.\box.ps1 shell` / `.\box.ps1 root-shell` — Open agent shell or Windows-side admin root shell.
-- `.\box.ps1 snapshot [path] [-Golden]` — Export a `.tar` backup of the distro (pass `-Golden` to save `.cache\<distro>-golden.tar`).
-- `.\box.ps1 restore <path> [-Force]` — Import a `.tar` backup, re-apply `box.json` policy, and run `verify`.
-- `.\box.ps1 reset [-Full] [-SaveGolden] [-Force]` / `.\box.ps1 destroy [-Force]` — Fast-restore from golden snapshot (pass `-Full` for clean Ubuntu rebuild) or remove the distro completely.
+See the full 18-command reference in [docs/cli-reference.md](docs/cli-reference.md).
 
 ---
 

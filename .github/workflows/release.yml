@@ -23,7 +23,7 @@ jobs:
           PKG_NAME="wsl-agent-sandbox-${TAG}"
           mkdir -p "dist/${PKG_NAME}"
           cp -r box.ps1 wsl-sandbox.ps1 box.json box.schema.json secrets.schema.json LICENSE README.md \
-            scripts systemd docker-policy-proxy examples packaging "dist/${PKG_NAME}/"
+            docs scripts systemd docker-policy-proxy examples packaging "dist/${PKG_NAME}/"
           (cd dist && zip -r "${PKG_NAME}.zip" "${PKG_NAME}")
           (cd dist && sha256sum "${PKG_NAME}.zip" > SHA256SUMS.txt)
 

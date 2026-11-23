@@ -1,0 +1,9 @@
+{
+  "ide": {
+    "configureRemoteWsl": true
+  },
+  "packages": {
+    "installHelm": true,
+    "installTerraform": true
+  }
+}
