@@ -41,6 +41,7 @@ INSTALL_OPENCODE="$(flag installOpenCode False)"
 INSTALL_AIDER="$(flag installAider False)"
 INSTALL_HELM="$(flag installHelm False)"
 INSTALL_OPENTOFU="$(flag installOpenTofu False)"
+INSTALL_TERRAFORM="$(flag installTerraform False)"
 INSTALL_PLAYWRIGHT="$(flag installPlaywrightChromium False)"
 AGENT_NAME="$(python3 -c "import json; d=json.load(open('${POLICY_FILE}')); print(d['agentUser']['name'])")"
 
@@ -321,6 +322,20 @@ EOF
   apt-get update -y
   apt-get install -y --no-install-recommends tofu
   log "Installed $(tofu version 2>&1 | head -n 1)."
+fi
+
+# 16b. Terraform (official HashiCorp signed APT repository)
+if [[ "${INSTALL_TERRAFORM}" == "1" ]] && ! command -v terraform >/dev/null 2>&1; then
+  log "Installing Terraform via official HashiCorp signed APT repository..."
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL https://apt.releases.hashicorp.com/gpg | gpg --dearmor --yes -o /etc/apt/keyrings/hashicorp-archive-keyring.gpg
+  chmod a+r /etc/apt/keyrings/hashicorp-archive-keyring.gpg
+  ARCH="$(dpkg --print-architecture)"
+  CODENAME="$(awk -F= '/^VERSION_CODENAME=/{gsub(/"/, "", $2); print $2}' /etc/os-release)"
+  echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com ${CODENAME} main" >/etc/apt/sources.list.d/hashicorp.list
+  apt-get update -y
+  apt-get install -y --no-install-recommends terraform
+  log "Installed $(terraform version 2>&1 | head -n 1)."
 fi
 
 # 17. Headless Playwright Chromium + system dependencies

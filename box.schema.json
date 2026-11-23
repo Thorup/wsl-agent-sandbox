@@ -266,6 +266,7 @@
         "installAider": { "type": "boolean" },
         "installHelm": { "type": "boolean" },
         "installOpenTofu": { "type": "boolean" },
+        "installTerraform": { "type": "boolean" },
         "installPlaywrightChromium": { "type": "boolean" },
         "configureVsCodeRemoteWsl": {
           "type": "boolean",
