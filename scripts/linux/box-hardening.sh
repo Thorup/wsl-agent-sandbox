@@ -276,7 +276,7 @@ if pkgs.get("installNodeLts", True):
         expected_tools.append("codex")
     if pkgs.get("installOpenCode", False):
         expected_tools.append("opencode")
-    if pkgs.get("installPlaywrightChromium", False):
+    if pkgs.get("installPlaywrightChromium", False) or pkgs.get("installPlaywrightFirefox", False):
         expected_tools.append("playwright")
 if pkgs.get("installKubectl", False):
     expected_tools.append("kubectl")
