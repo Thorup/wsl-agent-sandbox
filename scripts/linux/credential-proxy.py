@@ -8,21 +8,34 @@ placeholder token presented by the client.
 """
 
 import base64
+import fnmatch
 import hmac
 import http.client
 import http.server
+import ipaddress
 import json
 import os
+import socket
 import socketserver
 import ssl
 import sys
 from urllib.parse import urlparse
 
 CONFIG_FILE = sys.argv[1] if len(sys.argv) > 1 else "/etc/wsl-agent-sandbox/credential-proxy.json"
+EGRESS_ALLOWLIST_FILE = sys.argv[2] if len(sys.argv) > 2 else "/etc/wsl-agent-sandbox/egress-allowlist.json"
 LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 3129
 UPSTREAM_TIMEOUT = 300.0
 ALLOW_INSECURE_HTTP_FOR_TEST = False
+RESOLVER = socket.getaddrinfo
+
+PRESETS = {
+    "llm-apis": ["generativelanguage.googleapis.com", "api.anthropic.com", "api.openai.com"],
+    "github": ["github.com", "*.github.com", "*.githubusercontent.com"],
+    "npm": ["registry.npmjs.org"],
+    "pypi": ["pypi.org", "files.pythonhosted.org"],
+    "apt": ["archive.ubuntu.com", "security.ubuntu.com", "*.archive.ubuntu.com"],
+}
 
 HOP_BY_HOP_HEADERS = frozenset({
     "connection",
@@ -49,6 +62,179 @@ def load_routes(path=CONFIG_FILE):
         return routes if isinstance(routes, dict) else {}
     except (OSError, ValueError):
         return {}
+
+
+def load_egress_config(path=None):
+    """Load egress allowlist config; fail closed if file exists but is corrupt."""
+    target = EGRESS_ALLOWLIST_FILE if path is None else path
+    if not os.path.isfile(target):
+        return {
+            "egressMode": "open",
+            "patterns": [],
+            "blockHostAndLan": True,
+            "hostIps": set(),
+            "blockedNets": [],
+        }
+    fail_closed = {
+        "egressMode": "allowlist",
+        "patterns": [],
+        "blockHostAndLan": True,
+        "hostIps": set(),
+        "blockedNets": [],
+    }
+    try:
+        with open(target, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return fail_closed
+    except (OSError, ValueError):
+        return fail_closed
+
+    patterns = []
+    for item in data.get("allowedDomains", []):
+        if not isinstance(item, str):
+            continue
+        item = item.strip().lower()
+        if item in PRESETS:
+            patterns.extend(PRESETS[item])
+        elif item:
+            patterns.append(item)
+
+    host_ips = set()
+    for raw_ip in data.get("hostIps", []):
+        if not isinstance(raw_ip, str):
+            continue
+        try:
+            host_ips.add(ipaddress.ip_address(raw_ip.split("%")[0].strip()))
+        except ValueError:
+            pass
+
+    blocked_nets = []
+    for raw_cidr in data.get("blockedCidrs", []):
+        if not isinstance(raw_cidr, str):
+            continue
+        try:
+            blocked_nets.append(ipaddress.ip_network(raw_cidr.strip(), strict=False))
+        except ValueError:
+            pass
+
+    return {
+        "egressMode": data.get("egressMode", "open"),
+        "patterns": patterns,
+        "blockHostAndLan": bool(data.get("blockHostAndLan", True)),
+        "hostIps": host_ips,
+        "blockedNets": blocked_nets,
+    }
+
+
+def is_domain_allowed(host, patterns):
+    host = (host or "").lower().strip().strip(".")
+    if not host:
+        return False
+    for pat in patterns:
+        if pat.startswith("*."):
+            suffix = pat[2:]
+            if host == suffix or host.endswith("." + suffix):
+                return True
+        elif fnmatch.fnmatch(host, pat):
+            return True
+    return False
+
+
+def is_ip_blocked(ip_str, cfg):
+    """Return reason string if an IP is loopback, host, private/LAN, or blocked CIDR."""
+    clean = ip_str.split("%")[0].strip()
+    try:
+        ip_obj = ipaddress.ip_address(clean)
+    except ValueError:
+        return f"invalid resolved address {ip_str!r}"
+
+    candidates = [ip_obj]
+    if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped is not None:
+        candidates.append(ip_obj.ipv4_mapped)
+
+    if not cfg.get("blockHostAndLan", True):
+        return None
+
+    for cand in candidates:
+        if (
+            cand.is_loopback
+            or cand.is_private
+            or cand.is_link_local
+            or cand.is_multicast
+            or cand.is_reserved
+            or cand.is_unspecified
+        ):
+            return f"non-global target IP {cand} forbidden"
+        if cand in cfg.get("hostIps", ()):
+            return f"Windows host IP {cand} forbidden"
+        for net in cfg.get("blockedNets", ()):
+            if cand.version == net.version and cand in net:
+                return f"target IP {cand} matches blocked CIDR {net}"
+    return None
+
+
+def resolve_and_validate_addresses(host, port, cfg, resolver=None):
+    """Resolve host once, validate every returned IP, and return list of sockaddr info tuples."""
+    res = RESOLVER if resolver is None else resolver
+    try:
+        infos = res(host, port, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise PermissionError(f"DNS resolution failed for {host}: {exc}") from exc
+    if not infos:
+        raise PermissionError(f"no addresses resolved for {host}")
+
+    validated = []
+    for family, socktype, proto, canonname, sockaddr in infos:
+        ip_str = sockaddr[0]
+        reason = is_ip_blocked(ip_str, cfg)
+        if reason is not None:
+            raise PermissionError(reason)
+        validated.append((family, socktype, proto, canonname, sockaddr))
+    return validated
+
+
+def _connect_validated_socket(addrs, timeout=UPSTREAM_TIMEOUT):
+    last_exc = None
+    for family, socktype, proto, _, sockaddr in addrs:
+        sock = socket.socket(family, socktype, proto)
+        try:
+            sock.settimeout(timeout)
+            sock.connect(sockaddr)
+            return sock
+        except OSError as exc:
+            last_exc = exc
+            try:
+                sock.close()
+            except OSError:
+                pass
+    raise last_exc or OSError("failed to connect to any validated address")
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, host, port, addrs, timeout=UPSTREAM_TIMEOUT):
+        super().__init__(host, port, timeout=timeout)
+        self._addrs = addrs
+
+    def connect(self):
+        self.sock = _connect_validated_socket(self._addrs, timeout=self.timeout)
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host, port, addrs, timeout=UPSTREAM_TIMEOUT, context=None):
+        super().__init__(host, port, timeout=timeout, context=context)
+        self._addrs = addrs
+
+    def connect(self):
+        raw_sock = _connect_validated_socket(self._addrs, timeout=self.timeout)
+        try:
+            self.sock = self._context.wrap_socket(raw_sock, server_hostname=self.host)
+        except Exception:
+            try:
+                raw_sock.close()
+            except OSError:
+                pass
+            raise
 
 
 def extract_client_tokens(headers):
@@ -172,6 +358,21 @@ class CredentialProxyHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(403, "credential-proxy: invalid upstreamBaseUrl")
             return
 
+        egress_cfg = load_egress_config()
+        if egress_cfg.get("egressMode") == "allowlist":
+            if not is_domain_allowed(upstream.hostname, egress_cfg.get("patterns", [])):
+                self.send_error(403, f"credential-proxy: upstream domain '{upstream.hostname}' is not allowlisted")
+                return
+
+        upstream_port = upstream.port or (80 if upstream.scheme == "http" else 443)
+        validated_addrs = None
+        if not ALLOW_INSECURE_HTTP_FOR_TEST:
+            try:
+                validated_addrs = resolve_and_validate_addresses(upstream.hostname, upstream_port, egress_cfg)
+            except PermissionError as exc:
+                self.send_error(403, f"credential-proxy: upstream address blocked: {exc}")
+                return
+
         te = (self.headers.get("Transfer-Encoding") or "").lower()
         cl_raw = self.headers.get("Content-Length")
         body = None
@@ -204,14 +405,27 @@ class CredentialProxyHandler(http.server.BaseHTTPRequestHandler):
             headers[hk] = hv
 
         if upstream.scheme == "http":
-            conn = http.client.HTTPConnection(upstream.hostname, upstream.port or 80, timeout=UPSTREAM_TIMEOUT)
+            if validated_addrs is not None:
+                conn = _PinnedHTTPConnection(upstream.hostname, upstream_port, validated_addrs, timeout=UPSTREAM_TIMEOUT)
+            else:
+                conn = http.client.HTTPConnection(upstream.hostname, upstream_port, timeout=UPSTREAM_TIMEOUT)
         else:
-            conn = http.client.HTTPSConnection(
-                upstream.hostname,
-                upstream.port or 443,
-                timeout=UPSTREAM_TIMEOUT,
-                context=ssl.create_default_context(),
-            )
+            ssl_ctx = ssl.create_default_context()
+            if validated_addrs is not None:
+                conn = _PinnedHTTPSConnection(
+                    upstream.hostname,
+                    upstream_port,
+                    validated_addrs,
+                    timeout=UPSTREAM_TIMEOUT,
+                    context=ssl_ctx,
+                )
+            else:
+                conn = http.client.HTTPSConnection(
+                    upstream.hostname,
+                    upstream_port,
+                    timeout=UPSTREAM_TIMEOUT,
+                    context=ssl_ctx,
+                )
         try:
             target_path = upstream.path.rstrip("/") + rest
             conn.request(self.command, target_path, body=body, headers=headers)
