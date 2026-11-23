@@ -10,6 +10,12 @@ Group=root
 ExecStart=/usr/bin/python3 /usr/local/sbin/box-ssh-agent-proxy.py
 Restart=on-failure
 RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/run/ssh-agent-proxy
+MemoryMax=128M
 
 [Install]
 WantedBy=multi-user.target

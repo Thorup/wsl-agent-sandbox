@@ -191,6 +191,67 @@ class EgressProxyTests(unittest.TestCase):
                 except OSError:
                     pass
 
+    def test_oversized_content_length_and_chunked_body_return_413(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "egressMode": "allowlist",
+                    "allowedDomains": ["localhost"],
+                    "blockHostAndLan": False,
+                    "allowedPorts": [443],
+                    "allowedHttpPorts": [8080],
+                },
+                f,
+            )
+            cfg_path = f.name
+
+        orig_file = egress_proxy.ALLOWLIST_FILE
+        orig_load = egress_proxy.load_config
+        orig_max = egress_proxy.MAX_REQUEST_BODY_BYTES
+        egress_proxy.ALLOWLIST_FILE = cfg_path
+        egress_proxy.load_config = lambda p=cfg_path: orig_load(p)
+        egress_proxy.MAX_REQUEST_BODY_BYTES = 16
+
+        proxy_srv = egress_proxy.ThreadingHTTPServer(("127.0.0.1", 0), egress_proxy.EgressProxyHandler)
+        proxy_port = proxy_srv.server_address[1]
+        threading.Thread(target=proxy_srv.serve_forever, daemon=True).start()
+
+        def raw_http(req_bytes):
+            with socket.create_connection(("127.0.0.1", proxy_port), timeout=5) as s:
+                s.sendall(req_bytes)
+                chunks = []
+                while True:
+                    d = s.recv(4096)
+                    if not d:
+                        break
+                    chunks.append(d)
+                return b"".join(chunks).decode("utf-8", errors="replace")
+
+        try:
+            # 1. Oversized Content-Length rejected immediately with 413 without buffering
+            r413_cl = raw_http(
+                b"POST http://localhost:8080/upload HTTP/1.1\r\n"
+                b"Host: localhost:8080\r\n"
+                b"Content-Length: 999999999\r\n\r\n"
+            )
+            self.assertIn("413", r413_cl.splitlines()[0])
+
+            # 2. Oversized chunked payload rejected immediately with 413
+            r413_chunked = raw_http(
+                b"POST http://localhost:8080/upload HTTP/1.1\r\n"
+                b"Host: localhost:8080\r\n"
+                b"Transfer-Encoding: chunked\r\n\r\n"
+                b"20\r\n" + (b"A" * 32) + b"\r\n0\r\n\r\n"
+            )
+            self.assertIn("413", r413_chunked.splitlines()[0])
+        finally:
+            proxy_srv.shutdown()
+            proxy_srv.server_close()
+            egress_proxy.ALLOWLIST_FILE = orig_file
+            egress_proxy.load_config = orig_load
+            egress_proxy.MAX_REQUEST_BODY_BYTES = orig_max
+            os.unlink(cfg_path)
+
 
 if __name__ == "__main__":
     unittest.main()
