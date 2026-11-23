@@ -1,0 +1,40 @@
+{
+  "distroName": "wsl-agent-sandbox",
+  "installDir": "%LOCALAPPDATA%\\WSL\\wsl-agent-sandbox",
+  "agentUser": {
+    "name": "agent",
+    "uid": 26040,
+    "gid": 26040
+  },
+  "image": {
+    "release": "26.04",
+    "arch": "amd64",
+    "cacheDir": ".cache"
+  },
+  "sharedFolders": [],
+  "network": {
+    "blockHostAndLan": true,
+    "allowedHostPorts": [],
+    "blockedCidrs": [
+      "10.0.0.0/8",
+      "172.16.0.0/12",
+      "192.168.0.0/16"
+    ]
+  },
+  "docker": {
+    "enabled": true,
+    "allowBindPrefixes": [
+      "/home/agent"
+    ],
+    "allowBuildKit": true,
+    "allowCapAdd": []
+  },
+  "packages": {
+    "apt": [
+      "ca-certificates",
+      "curl",
+      "git",
+      "python3"
+    ]
+  }
+}
