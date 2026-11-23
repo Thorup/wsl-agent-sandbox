@@ -23,10 +23,12 @@ class TestBoxSyncContext(unittest.TestCase):
         os.makedirs(self.agent_home, exist_ok=True)
         os.makedirs(self.bin_dir, exist_ok=True)
 
+        uid = os.getuid() if hasattr(os, "getuid") else 26040
+        gid = os.getgid() if hasattr(os, "getgid") else 26040
         self.policy_path = os.path.join(self.root, "policy.json")
         self.policy = {
             "distroName": "wsl-agent-sandbox",
-            "agentUser": {"name": "agent", "uid": 26040, "gid": 26040},
+            "agentUser": {"name": "agent", "uid": uid, "gid": gid},
             "sharedFolders": [
                 {"name": "docs", "windowsPath": "C:\\docs", "mode": "ro", "allowDockerBind": True}
             ],
