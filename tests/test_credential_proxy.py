@@ -199,6 +199,121 @@ class CredentialProxyTests(unittest.TestCase):
             credential_proxy.ALLOW_INSECURE_HTTP_FOR_TEST = orig_insecure
             os.unlink(cfg_path)
 
+    def test_egress_allowlist_and_ssrf_ip_enforcement(self):
+        class OkHandler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"OK")
+
+            def log_message(self, *args):
+                pass
+
+        up_srv = http.server.HTTPServer(("127.0.0.1", 0), OkHandler)
+        up_port = up_srv.server_address[1]
+        threading.Thread(target=up_srv.serve_forever, daemon=True).start()
+
+        cfg_data = {
+            "routes": {
+                "allowed_svc": {
+                    "upstreamBaseUrl": f"http://localhost:{up_port}/api",
+                    "expectedToken": "ph-allow-123",
+                    "injectHeaders": {"x-api-key": "real-key"},
+                },
+                "blocked_domain_svc": {
+                    "upstreamBaseUrl": f"http://127.0.0.1:{up_port}/api",
+                    "expectedToken": "ph-block-456",
+                    "injectHeaders": {"x-api-key": "real-key"},
+                },
+                "https_rebind_svc": {
+                    "upstreamBaseUrl": "https://api.anthropic.com/v1",
+                    "expectedToken": "ph-rebind-789",
+                    "injectHeaders": {"x-api-key": "real-key"},
+                },
+            }
+        }
+        egress_data = {
+            "egressMode": "allowlist",
+            "allowedDomains": ["localhost", "llm-apis"],
+            "blockHostAndLan": True,
+            "hostIps": ["203.0.113.50"],
+            "blockedCidrs": ["10.0.0.0/8", "192.168.0.0/16", "100.64.0.0/10"],
+        }
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+            json.dump(cfg_data, f)
+            cfg_path = f.name
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+            json.dump(egress_data, f)
+            egress_path = f.name
+
+        orig_load = credential_proxy.load_routes
+        orig_egress_file = credential_proxy.EGRESS_ALLOWLIST_FILE
+        orig_insecure = credential_proxy.ALLOW_INSECURE_HTTP_FOR_TEST
+        orig_resolver = credential_proxy.RESOLVER
+
+        credential_proxy.load_routes = lambda p=cfg_path: orig_load(p)
+        credential_proxy.EGRESS_ALLOWLIST_FILE = egress_path
+
+        proxy_srv = credential_proxy.ThreadingHTTPServer(("127.0.0.1", 0), credential_proxy.CredentialProxyHandler)
+        proxy_port = proxy_srv.server_address[1]
+        threading.Thread(target=proxy_srv.serve_forever, daemon=True).start()
+
+        def raw_req(payload):
+            with socket.create_connection(("127.0.0.1", proxy_port), timeout=5) as s:
+                s.sendall(payload)
+                chunks = []
+                while True:
+                    d = s.recv(4096)
+                    if not d:
+                        break
+                    chunks.append(d)
+                return b"".join(chunks).decode("utf-8", errors="replace")
+
+        try:
+            # 1. Domain allowlist check (with ALLOW_INSECURE_HTTP_FOR_TEST=True for local HTTP test server)
+            credential_proxy.ALLOW_INSECURE_HTTP_FOR_TEST = True
+            r_ok = raw_req(b"GET /allowed_svc/ping HTTP/1.1\r\nHost: 127.0.0.1\r\nx-api-key: ph-allow-123\r\n\r\n")
+            self.assertIn("200", r_ok.splitlines()[0])
+
+            r_denied_domain = raw_req(
+                b"GET /blocked_domain_svc/ping HTTP/1.1\r\nHost: 127.0.0.1\r\nx-api-key: ph-block-456\r\n\r\n"
+            )
+            self.assertIn("403", r_denied_domain.splitlines()[0])
+            self.assertIn("not allowlisted", r_denied_domain)
+
+            # 2. SSRF & DNS-rebinding IP check (with ALLOW_INSECURE_HTTP_FOR_TEST=False)
+            credential_proxy.ALLOW_INSECURE_HTTP_FOR_TEST = False
+            for bad_ip in ("127.0.0.1", "10.0.0.5", "192.168.1.1", "169.254.169.254", "::1", "::ffff:127.0.0.1", "203.0.113.50"):
+                credential_proxy.RESOLVER = lambda h, p, type=None, ip=bad_ip: [
+                    (socket.AF_INET6 if ":" in ip else socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, p))
+                ]
+                r_ssrf = raw_req(
+                    b"GET /https_rebind_svc/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nx-api-key: ph-rebind-789\r\n\r\n"
+                )
+                self.assertIn("403", r_ssrf.splitlines()[0], f"Expected 403 for blocked IP {bad_ip}, got {r_ssrf}")
+
+            # 3. Corrupt egress-allowlist.json fails closed (403)
+            credential_proxy.ALLOW_INSECURE_HTTP_FOR_TEST = True
+            with open(egress_path, "w", encoding="utf-8") as f:
+                f.write("{corrupt")
+            r_corrupt = raw_req(b"GET /allowed_svc/ping HTTP/1.1\r\nHost: 127.0.0.1\r\nx-api-key: ph-allow-123\r\n\r\n")
+            self.assertIn("403", r_corrupt.splitlines()[0])
+        finally:
+            proxy_srv.shutdown()
+            proxy_srv.server_close()
+            up_srv.shutdown()
+            up_srv.server_close()
+            credential_proxy.load_routes = orig_load
+            credential_proxy.EGRESS_ALLOWLIST_FILE = orig_egress_file
+            credential_proxy.ALLOW_INSECURE_HTTP_FOR_TEST = orig_insecure
+            credential_proxy.RESOLVER = orig_resolver
+            os.unlink(cfg_path)
+            os.unlink(egress_path)
+
 
 if __name__ == "__main__":
     unittest.main()
