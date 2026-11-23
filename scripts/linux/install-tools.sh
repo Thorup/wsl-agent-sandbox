@@ -331,7 +331,7 @@ if [[ "${INSTALL_TERRAFORM}" == "1" ]] && ! command -v terraform >/dev/null 2>&1
   curl -fsSL https://apt.releases.hashicorp.com/gpg | gpg --dearmor --yes -o /etc/apt/keyrings/hashicorp-archive-keyring.gpg
   chmod a+r /etc/apt/keyrings/hashicorp-archive-keyring.gpg
   ARCH="$(dpkg --print-architecture)"
-  CODENAME="$(. /etc/os-release && echo "${VERSION_CODENAME}")"
+  CODENAME="$(awk -F= '/^VERSION_CODENAME=/{gsub(/"/, "", $2); print $2}' /etc/os-release)"
   echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com ${CODENAME} main" >/etc/apt/sources.list.d/hashicorp.list
   apt-get update -y
   apt-get install -y --no-install-recommends terraform
