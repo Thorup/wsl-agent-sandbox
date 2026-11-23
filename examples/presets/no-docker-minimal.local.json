@@ -1,0 +1,10 @@
+{
+  "docker": {
+    "enabled": false
+  },
+  "resources": {
+    "memoryMax": "8G",
+    "cpuQuota": "400%",
+    "tasksMax": 512
+  }
+}

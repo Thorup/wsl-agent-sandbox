@@ -1,0 +1,38 @@
+{
+  "network": {
+    "blockHostAndLan": true,
+    "logDrops": true,
+    "egressMode": "allowlist",
+    "allowedDomains": [
+      "llm-apis",
+      "github",
+      "npm",
+      "pypi"
+    ]
+  },
+  "docker": {
+    "enabled": true,
+    "forceInternalNetwork": true,
+    "forceLoopbackPortBindings": true,
+    "defaultLimits": {
+      "memoryBytes": 2147483648,
+      "nanoCpus": 2000000000,
+      "pidsLimit": 256
+    },
+    "maxLimits": {
+      "memoryBytes": 4294967296,
+      "nanoCpus": 4000000000,
+      "pidsLimit": 512
+    },
+    "allowedRegistries": [
+      "docker.io",
+      "ghcr.io",
+      "mcr.microsoft.com"
+    ]
+  },
+  "resources": {
+    "memoryMax": "8G",
+    "cpuQuota": "400%",
+    "tasksMax": 512
+  }
+}
