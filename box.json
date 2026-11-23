@@ -93,6 +93,7 @@
     "installAider": false,
     "installHelm": false,
     "installOpenTofu": false,
+    "installTerraform": false,
     "installPlaywrightChromium": false
   },
   "ide": {

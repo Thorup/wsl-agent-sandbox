@@ -284,6 +284,8 @@ if pkgs.get("installHelm", False):
     expected_tools.append("helm")
 if pkgs.get("installOpenTofu", False):
     expected_tools.append("tofu")
+if pkgs.get("installTerraform", False):
+    expected_tools.append("terraform")
 if pkgs.get("installAwsCli", False):
     expected_tools.append("aws")
 if pkgs.get("installGcloudCli", False):
