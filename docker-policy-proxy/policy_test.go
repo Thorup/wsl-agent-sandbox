@@ -1086,3 +1086,64 @@ func TestResourceLimitsAndRegistryAllowlist(t *testing.T) {
 		t.Fatalf("expected overflowing float Memory to be rejected")
 	}
 }
+
+func TestBuildKitDisabledWithNetworkOrRegistryRestrictions(t *testing.T) {
+	endpoints := []string{"/grpc", "/session", "/v1.47/grpc", "/v1.47/session"}
+
+	// Allowed when AllowBuildKit is true and neither ForceInternalNetwork nor AllowedRegistries is set.
+	polOpen := &Policy{
+		Enabled:       true,
+		AllowBuildKit: true,
+	}
+	for _, ep := range endpoints {
+		if err := polOpen.CheckEndpoint(http.MethodPost, ep, nil); err != nil {
+			t.Fatalf("expected %s to be allowed when no network/registry restrictions are active, got %v", ep, err)
+		}
+	}
+
+	// Denied when ForceInternalNetwork is true, even if AllowBuildKit is true.
+	polInternal := &Policy{
+		Enabled:              true,
+		AllowBuildKit:        true,
+		ForceInternalNetwork: true,
+	}
+	for _, ep := range endpoints {
+		if err := polInternal.CheckEndpoint(http.MethodPost, ep, nil); err == nil {
+			t.Fatalf("expected %s to be denied when ForceInternalNetwork is true", ep)
+		}
+	}
+
+	// Denied when AllowedRegistries is non-empty, even if AllowBuildKit is true.
+	polRegistries := &Policy{
+		Enabled:           true,
+		AllowBuildKit:     true,
+		AllowedRegistries: []string{"docker.io"},
+	}
+	for _, ep := range endpoints {
+		if err := polRegistries.CheckEndpoint(http.MethodPost, ep, nil); err == nil {
+			t.Fatalf("expected %s to be denied when AllowedRegistries is non-empty", ep)
+		}
+	}
+}
+
+func TestLegacyBuildWithForceInternalNetwork(t *testing.T) {
+	pol := &Policy{
+		Enabled:              true,
+		ForceInternalNetwork: true,
+	}
+
+	// Missing networkmode must be denied.
+	if err := pol.CheckEndpoint(http.MethodPost, "/build", nil); err == nil {
+		t.Fatalf("expected POST /build without networkmode to be denied when ForceInternalNetwork is true")
+	}
+
+	// Non-none networkmode must be denied.
+	if err := pol.CheckEndpoint(http.MethodPost, "/build", map[string][]string{"networkmode": {"bridge"}}); err == nil {
+		t.Fatalf("expected POST /build with networkmode=bridge to be denied when ForceInternalNetwork is true")
+	}
+
+	// networkmode=none must be allowed.
+	if err := pol.CheckEndpoint(http.MethodPost, "/build", map[string][]string{"networkmode": {"none"}}); err != nil {
+		t.Fatalf("expected POST /build with networkmode=none to be allowed, got %v", err)
+	}
+}

@@ -224,9 +224,12 @@ else:
     })
 
 docker_cfg = policy.get("docker", {})
+force_internal = bool(docker_cfg.get("forceInternalNetwork", False))
+allowed_registries = docker_cfg.get("allowedRegistries", [])
+effective_buildkit = bool(docker_cfg.get("allowBuildKit", True)) and not force_internal and not allowed_registries
 compiled_docker_policy = {
     "enabled": bool(docker_cfg.get("enabled", True)),
-    "allowBuildKit": bool(docker_cfg.get("allowBuildKit", True)),
+    "allowBuildKit": effective_buildkit,
     "allowCapAdd": docker_cfg.get("allowCapAdd", []),
     "denyEndpoints": docker_cfg.get("denyEndpoints", [
         "/plugins", "/swarm", "/services", "/nodes", "/secrets", "/configs", "/tasks"

@@ -138,6 +138,10 @@ Fine-tune `docker-policy-proxy` container network/resource policies and per-UID 
   "maxLimits": { "memoryBytes": 4294967296, "nanoCpus": 4000000000, "pidsLimit": 512 },
   "allowedRegistries": ["docker.io", "ghcr.io", "mcr.microsoft.com"]
 },
+```
+> **Note:** BuildKit (`/grpc`, `/session`) is automatically disabled when `forceInternalNetwork: true` or `allowedRegistries` is non-empty, preventing `docker buildx` from bypassing network or registry restrictions.
+
+```json
 "resources": {
   "memoryMax": "8G",
   "cpuQuota": "400%",
