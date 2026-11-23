@@ -26,7 +26,12 @@ EGRESS_ALLOWLIST_FILE = sys.argv[2] if len(sys.argv) > 2 else "/etc/wsl-agent-sa
 LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 3129
 UPSTREAM_TIMEOUT = 300.0
+MAX_REQUEST_BODY_BYTES = 32 * 1024 * 1024
 ALLOW_INSECURE_HTTP_FOR_TEST = False
+
+
+class PayloadTooLargeError(ValueError):
+    """Raised when an HTTP request body exceeds MAX_REQUEST_BODY_BYTES."""
 RESOLVER = socket.getaddrinfo
 
 PRESETS = {
@@ -298,9 +303,11 @@ def verify_placeholder_token(headers, route):
     return ok
 
 
-def read_chunked_body(rfile):
-    """Decode an HTTP/1.1 Transfer-Encoding: chunked request body."""
+def read_chunked_body(rfile, max_bytes=None):
+    """Decode an HTTP/1.1 Transfer-Encoding: chunked request body with a strict size cap."""
+    limit = MAX_REQUEST_BODY_BYTES if max_bytes is None else max_bytes
     chunks = []
+    total = 0
     while True:
         size_line = rfile.readline(65536)
         if not size_line:
@@ -318,10 +325,13 @@ def read_chunked_body(rfile):
                 if not trailer or trailer in (b"\r\n", b"\n"):
                     break
             break
+        if total + chunk_size > limit:
+            raise PayloadTooLargeError(f"chunked request body exceeds {limit} bytes")
         data = rfile.read(chunk_size)
         if len(data) != chunk_size:
             raise ValueError("unexpected EOF in chunk body")
         chunks.append(data)
+        total += chunk_size
         crlf = rfile.readline(65536)
         if crlf not in (b"\r\n", b"\n"):
             raise ValueError("missing chunk terminator")
@@ -378,7 +388,11 @@ class CredentialProxyHandler(http.server.BaseHTTPRequestHandler):
         body = None
         if "chunked" in te:
             try:
-                body = read_chunked_body(self.rfile)
+                body = read_chunked_body(self.rfile, MAX_REQUEST_BODY_BYTES)
+            except PayloadTooLargeError as exc:
+                self.close_connection = True
+                self.send_error(413, f"credential-proxy: {exc}")
+                return
             except ValueError as exc:
                 self.send_error(400, f"credential-proxy: invalid chunked body: {exc}")
                 return
@@ -389,6 +403,10 @@ class CredentialProxyHandler(http.server.BaseHTTPRequestHandler):
                     raise ValueError("negative Content-Length")
             except ValueError:
                 self.send_error(400, f"credential-proxy: invalid Content-Length {cl_raw!r}")
+                return
+            if length > MAX_REQUEST_BODY_BYTES:
+                self.close_connection = True
+                self.send_error(413, f"credential-proxy: request body exceeds {MAX_REQUEST_BODY_BYTES} bytes")
                 return
             if length > 0:
                 body = self.rfile.read(length)

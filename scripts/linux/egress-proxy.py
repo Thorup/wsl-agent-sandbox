@@ -19,6 +19,46 @@ LISTEN_PORT = 3128
 TUNNEL_IDLE_TIMEOUT = 600.0
 UPSTREAM_CONNECT_TIMEOUT = 3.0
 UPSTREAM_RESPONSE_TIMEOUT = 30.0
+MAX_REQUEST_BODY_BYTES = 32 * 1024 * 1024
+
+
+class PayloadTooLargeError(ValueError):
+    """Raised when an HTTP request body exceeds MAX_REQUEST_BODY_BYTES."""
+
+
+def read_chunked_body(rfile, max_bytes=None):
+    """Decode an HTTP/1.1 Transfer-Encoding: chunked request body with a strict size cap."""
+    limit = MAX_REQUEST_BODY_BYTES if max_bytes is None else max_bytes
+    chunks = []
+    total = 0
+    while True:
+        size_line = rfile.readline(65536)
+        if not size_line:
+            raise ValueError("unexpected EOF reading chunk size")
+        size_token = size_line.strip().split(b";", 1)[0]
+        try:
+            chunk_size = int(size_token, 16)
+        except ValueError as exc:
+            raise ValueError(f"invalid chunk size {size_token!r}") from exc
+        if chunk_size < 0:
+            raise ValueError("negative chunk size")
+        if chunk_size == 0:
+            while True:
+                trailer = rfile.readline(65536)
+                if not trailer or trailer in (b"\r\n", b"\n"):
+                    break
+            break
+        if total + chunk_size > limit:
+            raise PayloadTooLargeError(f"chunked request body exceeds {limit} bytes")
+        data = rfile.read(chunk_size)
+        if len(data) != chunk_size:
+            raise ValueError("unexpected EOF in chunk body")
+        chunks.append(data)
+        total += chunk_size
+        crlf = rfile.readline(65536)
+        if crlf not in (b"\r\n", b"\n"):
+            raise ValueError("missing chunk terminator")
+    return b"".join(chunks)
 
 PRESETS = {
     "llm-apis": ["generativelanguage.googleapis.com", "api.anthropic.com", "api.openai.com"],
@@ -304,9 +344,20 @@ class EgressProxyHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(403, f"egress-proxy blocked domain: {host}")
             return
 
+        te_header = (self.headers.get("Transfer-Encoding") or "").lower()
         cl_header = self.headers.get("Content-Length")
         req_body = None
-        if cl_header is not None:
+        if "chunked" in te_header:
+            try:
+                req_body = read_chunked_body(self.rfile, MAX_REQUEST_BODY_BYTES)
+            except PayloadTooLargeError as exc:
+                self.close_connection = True
+                self.send_error(413, f"egress-proxy: {exc}")
+                return
+            except ValueError as exc:
+                self.send_error(400, f"invalid chunked body: {exc}")
+                return
+        elif cl_header is not None:
             try:
                 cl = int(cl_header.strip())
                 if cl < 0:
@@ -314,7 +365,12 @@ class EgressProxyHandler(http.server.BaseHTTPRequestHandler):
             except ValueError:
                 self.send_error(400, "invalid Content-Length header")
                 return
-            req_body = self.rfile.read(cl)
+            if cl > MAX_REQUEST_BODY_BYTES:
+                self.close_connection = True
+                self.send_error(413, f"egress-proxy: request body exceeds {MAX_REQUEST_BODY_BYTES} bytes")
+                return
+            if cl > 0:
+                req_body = self.rfile.read(cl)
 
         try:
             addrs = resolve_and_validate_addresses(host, port, cfg)

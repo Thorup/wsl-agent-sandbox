@@ -314,6 +314,67 @@ class CredentialProxyTests(unittest.TestCase):
             os.unlink(cfg_path)
             os.unlink(egress_path)
 
+    def test_oversized_content_length_and_chunked_body_return_413(self):
+        cfg_data = {
+            "routes": {
+                "claude": {
+                    "upstreamBaseUrl": "http://127.0.0.1:9/api",
+                    "expectedToken": "ph-cap-123",
+                    "injectHeaders": {"x-api-key": "real-key"},
+                }
+            }
+        }
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+            json.dump(cfg_data, f)
+            cfg_path = f.name
+
+        orig_load = credential_proxy.load_routes
+        orig_insecure = credential_proxy.ALLOW_INSECURE_HTTP_FOR_TEST
+        orig_max = credential_proxy.MAX_REQUEST_BODY_BYTES
+        credential_proxy.load_routes = lambda p=cfg_path: orig_load(p)
+        credential_proxy.ALLOW_INSECURE_HTTP_FOR_TEST = True
+        credential_proxy.MAX_REQUEST_BODY_BYTES = 16
+
+        proxy_srv = credential_proxy.ThreadingHTTPServer(("127.0.0.1", 0), credential_proxy.CredentialProxyHandler)
+        proxy_port = proxy_srv.server_address[1]
+        threading.Thread(target=proxy_srv.serve_forever, daemon=True).start()
+
+        def raw_req(payload):
+            with socket.create_connection(("127.0.0.1", proxy_port), timeout=5) as s:
+                s.sendall(payload)
+                chunks = []
+                while True:
+                    d = s.recv(4096)
+                    if not d:
+                        break
+                    chunks.append(d)
+                return b"".join(chunks).decode("utf-8", errors="replace")
+
+        try:
+            r413_cl = raw_req(
+                b"POST /claude/v1/messages HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"x-api-key: ph-cap-123\r\n"
+                b"Content-Length: 999999999\r\n\r\n"
+            )
+            self.assertIn("413", r413_cl.splitlines()[0])
+
+            r413_chunked = raw_req(
+                b"POST /claude/v1/messages HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"x-api-key: ph-cap-123\r\n"
+                b"Transfer-Encoding: chunked\r\n\r\n"
+                b"20\r\n" + (b"B" * 32) + b"\r\n0\r\n\r\n"
+            )
+            self.assertIn("413", r413_chunked.splitlines()[0])
+        finally:
+            proxy_srv.shutdown()
+            proxy_srv.server_close()
+            credential_proxy.load_routes = orig_load
+            credential_proxy.ALLOW_INSECURE_HTTP_FOR_TEST = orig_insecure
+            credential_proxy.MAX_REQUEST_BODY_BYTES = orig_max
+            os.unlink(cfg_path)
+
 
 if __name__ == "__main__":
     unittest.main()
