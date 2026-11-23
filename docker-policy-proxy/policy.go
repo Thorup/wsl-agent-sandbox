@@ -167,11 +167,14 @@ func (p *Policy) CheckEndpoint(method, rawPath string, query map[string][]string
 		}
 	}
 
-	// BuildKit endpoints require allowBuildKit.
+	// BuildKit endpoints require allowBuildKit and must not bypass network/registry restrictions.
 	for _, bk := range buildKitEndpointPrefixes {
 		if norm == bk || strings.HasPrefix(norm, bk+"/") {
 			if !p.AllowBuildKit {
 				return deny("BuildKit endpoint %q is disabled by policy", norm)
+			}
+			if p.ForceInternalNetwork || len(p.AllowedRegistries) > 0 {
+				return deny("BuildKit endpoint %q is disabled when docker.forceInternalNetwork or docker.allowedRegistries is active", norm)
 			}
 			return nil
 		}
@@ -191,17 +194,35 @@ func (p *Policy) CheckEndpoint(method, rawPath string, query map[string][]string
 
 	// Legacy /build query-parameter checks.
 	if method == http.MethodPost && norm == "/build" {
+		hasNetworkNone := false
 		for k, vals := range query {
 			lk := strings.ToLower(k)
 			for _, v := range vals {
 				lv := strings.ToLower(strings.TrimSpace(v))
-				if lk == "networkmode" && (lv == "host" || strings.HasPrefix(lv, "host:") || strings.HasPrefix(lv, "ns:")) {
-					return deny("build networkmode %q is forbidden", v)
+				if lk == "networkmode" {
+					if lv == "host" || strings.HasPrefix(lv, "host:") || strings.HasPrefix(lv, "ns:") {
+						return deny("build networkmode %q is forbidden", v)
+					}
+					if lv == "none" {
+						hasNetworkNone = true
+					} else if p.ForceInternalNetwork {
+						return deny("build networkmode %q is forbidden when docker.forceInternalNetwork is active (must be \"none\")", v)
+					}
 				}
 				if lk == "securityopt" && isDangerousSecurityOpt(v) {
 					return deny("build securityopt %q is forbidden", v)
 				}
+				if len(p.AllowedRegistries) > 0 && lk == "from" {
+					if trimmed := strings.TrimSpace(v); trimmed != "" {
+						if err := p.checkImageRegistry(trimmed); err != nil {
+							return err
+						}
+					}
+				}
 			}
+		}
+		if p.ForceInternalNetwork && !hasNetworkNone {
+			return deny("POST /build requires networkmode=none when docker.forceInternalNetwork is active")
 		}
 	}
 
