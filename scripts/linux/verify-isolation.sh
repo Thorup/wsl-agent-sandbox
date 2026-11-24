@@ -93,11 +93,43 @@ else
   pass "No Windows .exe binaries in PATH"
 fi
 
-if [[ -f /proc/sys/fs/binfmt_misc/WSLInterop ]]; then
-  fail "WSLInterop binfmt_misc handler is registered!"
-else
-  pass "WSLInterop binfmt_misc handler is absent (interop disabled)"
-fi
+interop_disabled_in_wslconf() {
+  local conf_file="${1:-/etc/wsl.conf}"
+  [[ -r "${conf_file}" ]] || return 1
+  # True when wsl.conf has 'enabled = false' inside the [interop] section.
+  awk '
+    /^[[:space:]]*\[/ {
+      in_sec = ($0 ~ /^[[:space:]]*\[interop\][[:space:]]*([#;].*)?$/)
+      next
+    }
+    in_sec && /^[[:space:]]*enabled[[:space:]]*=/ {
+      v = $0
+      sub(/^[^=]*=[[:space:]]*/, "", v)
+      sub(/[[:space:]#;].*$/, "", v)
+      found = (tolower(v) == "false") ? 1 : 0
+    }
+    END { exit(found ? 0 : 1) }
+  ' "${conf_file}" 2>/dev/null
+}
+
+check_wslinterop_binfmt() {
+  local binfmt_path="$1"
+  local wsl_conf="$2"
+  if [[ -f "${binfmt_path}" ]]; then
+    if interop_disabled_in_wslconf "${wsl_conf}"; then
+      # binfmt_misc is shared across all distros in the WSL2 utility VM, so another distro with
+      # interop enabled registers this handler VM-wide. With [interop] enabled=false, this distro's
+      # /init refuses to launch Windows processes (the vsock handshake never completes).
+      warn "WSLInterop binfmt_misc handler is registered VM-wide by another distro; interop is disabled for this distro in /etc/wsl.conf"
+    else
+      fail "WSLInterop binfmt_misc handler is registered and [interop] is not disabled in /etc/wsl.conf!"
+    fi
+  else
+    pass "WSLInterop binfmt_misc handler is absent (interop disabled)"
+  fi
+}
+
+check_wslinterop_binfmt /proc/sys/fs/binfmt_misc/WSLInterop /etc/wsl.conf
 
 if [[ -n "${WSL_INTEROP:-}" ]]; then
   fail "WSL_INTEROP environment variable is set!"
