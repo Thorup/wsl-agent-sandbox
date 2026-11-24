@@ -144,19 +144,82 @@ EOF
   log "Installed $(gcloud version --format='value(Google Cloud SDK)' 2>/dev/null || echo 'google-cloud-cli')."
 fi
 
-# 7. .NET SDK (LTS) installed globally to /usr/local/share/dotnet (+ user-space ~/.dotnet/tools on PATH)
-if [[ "${INSTALL_DOTNET}" == "1" ]] && ! command -v dotnet >/dev/null 2>&1; then
-  log "Installing .NET SDK (LTS) to /usr/local/share/dotnet..."
-  TMP_DIR="$(mktemp -d)"
-  trap 'rm -rf "${TMP_DIR}"' EXIT
-  curl -fsSL https://dot.net/v1/dotnet-install.sh -o "${TMP_DIR}/dotnet-install.sh"
-  chmod +x "${TMP_DIR}/dotnet-install.sh"
-  mkdir -p /usr/local/share/dotnet
-  "${TMP_DIR}/dotnet-install.sh" --channel LTS --install-dir /usr/local/share/dotnet --no-path
-  ln -sf /usr/local/share/dotnet/dotnet /usr/local/bin/dotnet
-  rm -rf "${TMP_DIR}"
+# 7. .NET SDK (LTS) + optional side-by-side channels installed globally to /usr/local/share/dotnet (+ user-space ~/.dotnet/tools on PATH)
+install_dotnet_toolchains() {
+  local policy_file="$1"
+  local install_dir="${2:-/usr/local/share/dotnet}"
+  local bin_link="${3:-/usr/local/bin/dotnet}"
+  local installer_url="${4:-https://dot.net/v1/dotnet-install.sh}"
+  local dotnet_bin="${install_dir}/dotnet"
+  local installer_bin=""
+  DOTNET_TMP_DIR=""
+  trap 'rm -rf "${DOTNET_TMP_DIR:-}"' EXIT
+
+  if [[ ! -x "${dotnet_bin}" ]]; then
+    log "Installing .NET SDK (LTS) to ${install_dir}..."
+    DOTNET_TMP_DIR="$(mktemp -d)"
+    installer_bin="${DOTNET_TMP_DIR}/dotnet-install.sh"
+    curl -fsSL "${installer_url}" -o "${installer_bin}"
+    chmod +x "${installer_bin}"
+    mkdir -p "${install_dir}"
+    "${installer_bin}" --channel LTS --install-dir "${install_dir}" --no-path
+    ln -sf "${dotnet_bin}" "${bin_link}"
+    log "Installed .NET SDK $("${bin_link}" --version 2>&1)."
+  fi
+
+  # 7b. Optional side-by-side .NET SDK channels (e.g., ["8.0"])
+  local -a dotnet_channels=()
+  mapfile -t dotnet_channels < <(python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+channels = d.get("packages", {}).get("dotnetChannels")
+if channels is None:
+    sys.exit(0)
+if not isinstance(channels, list):
+    print(f"[install-tools] WARN: packages.dotnetChannels must be an array; ignoring {type(channels).__name__}.", file=sys.stderr)
+    sys.exit(0)
+for ch in channels:
+    if ch is not None:
+        print(str(ch))
+' "${policy_file}")
+
+  if [[ "${#dotnet_channels[@]}" -gt 0 ]]; then
+    local installed_sdks=""
+    if [[ -x "${dotnet_bin}" ]]; then
+      installed_sdks="$("${dotnet_bin}" --list-sdks 2>/dev/null || true)"
+    fi
+
+    local ch escaped_ch
+    for ch in "${dotnet_channels[@]}"; do
+      if [[ ! "${ch}" =~ ^[0-9]+\.[0-9]+$ ]]; then
+        log "WARN: skipping invalid packages.dotnetChannels entry '${ch}' (expected '<major>.<minor>', e.g. '8.0')."
+        continue
+      fi
+      escaped_ch="${ch//./\\.}"
+      if printf '%s\n' "${installed_sdks}" | grep -qE "^${escaped_ch}\."; then
+        continue
+      fi
+      log "Installing additional .NET SDK channel ${ch} to ${install_dir}..."
+      if [[ -z "${installer_bin}" ]]; then
+        DOTNET_TMP_DIR="$(mktemp -d)"
+        installer_bin="${DOTNET_TMP_DIR}/dotnet-install.sh"
+        curl -fsSL "${installer_url}" -o "${installer_bin}"
+        chmod +x "${installer_bin}"
+      fi
+      mkdir -p "${install_dir}"
+      "${installer_bin}" --channel "${ch}" --install-dir "${install_dir}" --no-path
+      ln -sf "${dotnet_bin}" "${bin_link}"
+      installed_sdks="$("${dotnet_bin}" --list-sdks 2>/dev/null || true)"
+      log "Installed .NET SDK channel ${ch}."
+    done
+  fi
+
+  rm -rf "${DOTNET_TMP_DIR:-}"
   trap - EXIT
-  log "Installed .NET SDK $(/usr/local/bin/dotnet --version 2>&1)."
+}
+
+if [[ "${INSTALL_DOTNET}" == "1" ]]; then
+  install_dotnet_toolchains "${POLICY_FILE}"
 fi
 
 # 8. Rust toolchain (rustup, rustc, cargo, clippy, rustfmt) owned by agent user in $HOME
