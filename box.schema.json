@@ -260,6 +260,15 @@
         "installJiraCli": { "type": "boolean" },
         "installUpctl": { "type": "boolean" },
         "installDotnetSdk": { "type": "boolean" },
+        "dotnetChannels": {
+          "type": "array",
+          "description": "Additional .NET SDK channels (e.g., [\"8.0\"]) to install side by side with the LTS SDK in /usr/local/share/dotnet when installDotnetSdk is true.",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[0-9]+\\.[0-9]+$"
+          }
+        },
         "installRust": { "type": "boolean" },
         "installCodexCli": { "type": "boolean" },
         "installOpenCode": { "type": "boolean" },
