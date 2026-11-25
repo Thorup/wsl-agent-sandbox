@@ -19,7 +19,11 @@ import (
 	"time"
 )
 
-const maxInspectBodyBytes = 10 * 1024 * 1024 // 10 MiB max JSON body for container/volume/exec create
+const (
+	maxInspectBodyBytes = 10 * 1024 * 1024 // 10 MiB max JSON body for container/volume/exec create
+	maxTrackedExecs     = 4096
+	trackedExecTTL      = 24 * time.Hour
+)
 
 // PolicyProxy mediates HTTP/1.1 + Upgrade (101 hijack / h2c) requests to an upstream
 // Docker Engine Unix domain socket while enforcing a Policy.
@@ -34,7 +38,7 @@ type PolicyProxy struct {
 	cancel         context.CancelFunc
 	wakeCh         chan struct{}
 	execMu         sync.RWMutex
-	trackedExecs   map[string]bool
+	trackedExecs   map[string]time.Time
 }
 
 func NewPolicyProxy(upstreamSocket string, initial *Policy, logger *log.Logger) *PolicyProxy {
@@ -56,7 +60,7 @@ func NewPolicyProxy(upstreamSocket string, initial *Policy, logger *log.Logger) 
 		ctx:            ctx,
 		cancel:         cancel,
 		wakeCh:         make(chan struct{}, 1),
-		trackedExecs:   make(map[string]bool),
+		trackedExecs:   make(map[string]time.Time),
 	}
 	pp.policy.Store(initial)
 
@@ -78,7 +82,12 @@ func NewPolicyProxy(upstreamSocket string, initial *Policy, logger *log.Logger) 
 		writeDockerJSONError(w, http.StatusBadGateway, "upstream Docker Desktop socket unreachable: "+err.Error())
 	}
 	pp.reverseProxy = rp
-	pp.upstreamClient = &http.Client{Transport: transport}
+	pp.upstreamClient = &http.Client{
+		Transport: transport,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	if initial != nil {
 		pp.wirePolicyCheckers(initial)
 	}
@@ -107,10 +116,21 @@ func (pp *PolicyProxy) wirePolicyCheckers(p *Policy) {
 	}
 }
 
+func validateResourceRef(ref, kind string) error {
+	trimmed := strings.TrimSpace(ref)
+	if trimmed == "" || trimmed == "." || trimmed == ".." || strings.ContainsAny(trimmed, `/\`) {
+		return deny("invalid %s identifier %q", kind, ref)
+	}
+	return nil
+}
+
 func (pp *PolicyProxy) checkNetworkInternal(nameOrID string) (bool, error) {
+	if err := validateResourceRef(nameOrID, "network"); err != nil {
+		return false, err
+	}
 	reqCtx, cancel := context.WithTimeout(pp.ctx, 3*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, "http://docker/networks/"+url.PathEscape(nameOrID), nil)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, "http://docker/networks/"+url.PathEscape(strings.TrimSpace(nameOrID)), nil)
 	if err != nil {
 		return false, err
 	}
@@ -135,28 +155,95 @@ func (pp *PolicyProxy) trackExec(id string) {
 	if id == "" {
 		return
 	}
+	now := time.Now()
 	pp.execMu.Lock()
 	if pp.trackedExecs == nil {
-		pp.trackedExecs = make(map[string]bool)
+		pp.trackedExecs = make(map[string]time.Time)
 	}
-	pp.trackedExecs[id] = true
+	if len(pp.trackedExecs) >= maxTrackedExecs {
+		var oldestID string
+		var oldestTime time.Time
+		for k, ts := range pp.trackedExecs {
+			if now.Sub(ts) > trackedExecTTL {
+				delete(pp.trackedExecs, k)
+				continue
+			}
+			if oldestID == "" || ts.Before(oldestTime) {
+				oldestID = k
+				oldestTime = ts
+			}
+		}
+		if len(pp.trackedExecs) >= maxTrackedExecs && oldestID != "" {
+			delete(pp.trackedExecs, oldestID)
+		}
+	}
+	pp.trackedExecs[id] = now
 	pp.execMu.Unlock()
 }
 
 func (pp *PolicyProxy) isTrackedExec(id string) bool {
 	pp.execMu.RLock()
-	ok := pp.trackedExecs[id]
+	ts, ok := pp.trackedExecs[id]
 	pp.execMu.RUnlock()
-	return ok
+	if !ok {
+		return false
+	}
+	return time.Since(ts) <= trackedExecTTL
+}
+
+func (pp *PolicyProxy) checkExecOwned(execID, distro string) error {
+	if distro == "" {
+		return nil
+	}
+	if err := validateResourceRef(execID, "exec"); err != nil {
+		return err
+	}
+	trimmed := strings.TrimSpace(execID)
+	if pp.isTrackedExec(trimmed) {
+		return nil
+	}
+	reqCtx, cancel := context.WithTimeout(pp.ctx, 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, "http://docker/exec/"+url.PathEscape(trimmed)+"/json", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := pp.upstreamClient.Do(req)
+	if err != nil {
+		return deny("failed verifying ownership of exec %q: %v", execID, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return deny("exec instance %q is not owned by this sandbox", execID)
+	}
+	var info struct {
+		ContainerID string `json:"ContainerID"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1024*1024)).Decode(&info); err != nil {
+		return deny("failed decoding exec %q metadata: %v", execID, err)
+	}
+	cid := strings.TrimSpace(info.ContainerID)
+	if cid == "" {
+		return deny("exec instance %q is not owned by this sandbox", execID)
+	}
+	if err := pp.checkContainerOwned(cid, distro); err != nil {
+		return deny("exec instance %q is not owned by this sandbox", execID)
+	}
+	pp.trackExec(trimmed)
+	return nil
 }
 
 func (pp *PolicyProxy) checkContainerOwned(idOrName, distro string) error {
 	if distro == "" {
 		return nil
 	}
+	if err := validateResourceRef(idOrName, "container"); err != nil {
+		return err
+	}
+	trimmed := strings.TrimSpace(idOrName)
 	reqCtx, cancel := context.WithTimeout(pp.ctx, 3*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, "http://docker/containers/"+url.PathEscape(idOrName)+"/json", nil)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, "http://docker/containers/"+url.PathEscape(trimmed)+"/json", nil)
 	if err != nil {
 		return err
 	}
@@ -186,9 +273,13 @@ func (pp *PolicyProxy) checkContainerOwned(idOrName, distro string) error {
 }
 
 func (pp *PolicyProxy) inspectVolumeLabels(volName string) (exists bool, labels map[string]string, err error) {
+	if err := validateResourceRef(volName, "volume"); err != nil {
+		return false, nil, err
+	}
+	trimmed := strings.TrimSpace(volName)
 	reqCtx, cancel := context.WithTimeout(pp.ctx, 3*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, "http://docker/volumes/"+url.PathEscape(volName), nil)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, "http://docker/volumes/"+url.PathEscape(trimmed), nil)
 	if err != nil {
 		return false, nil, err
 	}
@@ -271,17 +362,17 @@ func (pp *PolicyProxy) ensureVolumeOwned(volName, distro string) error {
 	return nil
 }
 
-func (pp *PolicyProxy) checkNetworkOwnedOrBuiltin(netRef, distro string, forceInternal bool) error {
+func (pp *PolicyProxy) checkNetworkStrictlyOwned(netRef, distro string) error {
 	if distro == "" {
 		return nil
 	}
-	lt := strings.ToLower(strings.TrimSpace(netRef))
-	if lt == "none" || (!forceInternal && (lt == "bridge" || lt == "default" || lt == "")) {
-		return nil
+	if err := validateResourceRef(netRef, "network"); err != nil {
+		return err
 	}
+	trimmed := strings.TrimSpace(netRef)
 	reqCtx, cancel := context.WithTimeout(pp.ctx, 3*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, "http://docker/networks/"+url.PathEscape(netRef), nil)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, "http://docker/networks/"+url.PathEscape(trimmed), nil)
 	if err != nil {
 		return err
 	}
@@ -308,12 +399,26 @@ func (pp *PolicyProxy) checkNetworkOwnedOrBuiltin(netRef, distro string, forceIn
 	return nil
 }
 
+func (pp *PolicyProxy) checkNetworkOwnedOrBuiltin(netRef, distro string, forceInternal bool) error {
+	if distro == "" {
+		return nil
+	}
+	lt := strings.ToLower(strings.TrimSpace(netRef))
+	if lt == "none" || (!forceInternal && (lt == "bridge" || lt == "default" || lt == "")) {
+		return nil
+	}
+	return pp.checkNetworkStrictlyOwned(netRef, distro)
+}
+
 func injectLabelFilter(r *http.Request, distro string) error {
 	q := r.URL.Query()
 	filtersMap := map[string]any{}
 	if rawFilters := q.Get("filters"); rawFilters != "" {
 		if err := json.Unmarshal([]byte(rawFilters), &filtersMap); err != nil {
 			return deny("invalid filters query parameter: %v", err)
+		}
+		if filtersMap == nil {
+			filtersMap = map[string]any{}
 		}
 	}
 	wantLabel := sandboxDistroLabel + "=" + distro
@@ -352,33 +457,58 @@ func (pp *PolicyProxy) enforceTenantIsolation(r *http.Request, norm string, pol 
 		(r.Method == http.MethodPost && norm == "/networks/prune") ||
 		norm == "/events":
 		return injectLabelFilter(r, pol.DistroName)
+	case r.Method == http.MethodPost && (norm == "/containers/create" || norm == "/volumes/create" || norm == "/networks/create"):
+		return nil
 	case strings.HasPrefix(norm, "/containers/"):
 		rest := strings.TrimPrefix(norm, "/containers/")
 		cid, _, _ := strings.Cut(rest, "/")
-		if cid != "" && cid != "create" && cid != "json" && cid != "prune" {
+		if cid != "" {
 			return pp.checkContainerOwned(cid, pol.DistroName)
 		}
 	case norm == "/commit":
 		if cid := r.URL.Query().Get("container"); cid != "" {
 			return pp.checkContainerOwned(cid, pol.DistroName)
 		}
+	case r.Method == http.MethodPost && norm == "/build":
+		for k, vals := range r.URL.Query() {
+			if !strings.EqualFold(k, "networkmode") {
+				continue
+			}
+			for _, v := range vals {
+				trimmed := strings.TrimSpace(v)
+				lv := strings.ToLower(trimmed)
+				if strings.HasPrefix(lv, "container:") {
+					targetCID := strings.TrimSpace(trimmed[len("container:"):])
+					if err := pp.checkContainerOwned(targetCID, pol.DistroName); err != nil {
+						return err
+					}
+				} else if lv != "" && lv != "default" && lv != "bridge" && lv != "none" {
+					if err := pp.checkNetworkOwnedOrBuiltin(trimmed, pol.DistroName, pol.ForceInternalNetwork); err != nil {
+						return err
+					}
+				}
+			}
+		}
 	case strings.HasPrefix(norm, "/exec/"):
 		rest := strings.TrimPrefix(norm, "/exec/")
 		execID, _, _ := strings.Cut(rest, "/")
-		if execID != "" && !pp.isTrackedExec(execID) {
-			return deny("exec instance %q is not owned by this sandbox", execID)
+		if execID != "" {
+			return pp.checkExecOwned(execID, pol.DistroName)
 		}
 	case strings.HasPrefix(norm, "/volumes/"):
 		rest := strings.TrimPrefix(norm, "/volumes/")
 		volName, _, _ := strings.Cut(rest, "/")
-		if volName != "" && volName != "create" && volName != "prune" {
+		if volName != "" {
 			return pp.checkVolumeOwned(volName, pol.DistroName)
 		}
 	case strings.HasPrefix(norm, "/networks/"):
 		rest := strings.TrimPrefix(norm, "/networks/")
-		netRef, _, _ := strings.Cut(rest, "/")
-		if netRef != "" && netRef != "create" && netRef != "prune" {
-			return pp.checkNetworkOwnedOrBuiltin(netRef, pol.DistroName, pol.ForceInternalNetwork)
+		netRef, action, hasSub := strings.Cut(rest, "/")
+		if netRef != "" {
+			if r.Method == http.MethodPost && hasSub && (action == "connect" || action == "disconnect") {
+				return pp.checkNetworkOwnedOrBuiltin(netRef, pol.DistroName, pol.ForceInternalNetwork)
+			}
+			return pp.checkNetworkStrictlyOwned(netRef, pol.DistroName)
 		}
 	}
 	return nil
@@ -521,10 +651,64 @@ func (w *statusCaptureWriter) Write(p []byte) (int, error) {
 	return w.ResponseWriter.Write(p)
 }
 
+type bufferedResponseWriter struct {
+	header http.Header
+	status int
+	body   bytes.Buffer
+}
+
+func (w *bufferedResponseWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *bufferedResponseWriter) WriteHeader(code int) {
+	if w.status == 0 {
+		w.status = code
+	}
+}
+
+func (w *bufferedResponseWriter) Write(p []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.body.Write(p)
+}
+
+func (w *bufferedResponseWriter) flushTo(dst http.ResponseWriter) {
+	for k, vals := range w.header {
+		for _, v := range vals {
+			dst.Header().Add(k, v)
+		}
+	}
+	code := w.status
+	if code == 0 {
+		code = http.StatusOK
+	}
+	dst.WriteHeader(code)
+	_, _ = dst.Write(w.body.Bytes())
+}
+
+func isSmuggledFormContentType(ct string) bool {
+	lct := strings.ToLower(strings.TrimSpace(ct))
+	return strings.HasPrefix(lct, "application/x-www-form-urlencoded") || strings.HasPrefix(lct, "multipart/form-data")
+}
+
 func (pp *PolicyProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	pol := pp.policy.Load()
 	if pol == nil {
 		writeDockerJSONError(w, http.StatusServiceUnavailable, "docker policy not loaded")
+		return
+	}
+
+	if r.URL.RawQuery != "" {
+		if _, err := url.ParseQuery(r.URL.RawQuery); err != nil {
+			writeDockerJSONError(w, http.StatusBadRequest, "invalid query string")
+			return
+		}
+	}
+	if isSmuggledFormContentType(r.Header.Get("Content-Type")) {
+		pp.logger.Printf("DENY method=%s path=%s reason=form-encoded body is forbidden on Docker API", r.Method, r.URL.Path)
+		writeDockerJSONError(w, http.StatusForbidden, "docker-policy-proxy blocked request: form-encoded Content-Type is forbidden")
 		return
 	}
 
@@ -600,16 +784,17 @@ func (pp *PolicyProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if pol.DistroName != "" && r.Method == http.MethodPost && hasPrefixSuffix(norm, "/containers/", "/exec") {
-		capW := &statusCaptureWriter{ResponseWriter: w}
-		pp.reverseProxy.ServeHTTP(capW, r)
-		if capW.status >= 200 && capW.status < 300 {
+		bufW := &bufferedResponseWriter{header: make(http.Header)}
+		pp.reverseProxy.ServeHTTP(bufW, r)
+		if bufW.status >= 200 && bufW.status < 300 {
 			var resp struct {
 				ID string `json:"Id"`
 			}
-			if json.Unmarshal(capW.body.Bytes(), &resp) == nil && resp.ID != "" {
+			if json.Unmarshal(bufW.body.Bytes(), &resp) == nil && resp.ID != "" {
 				pp.trackExec(resp.ID)
 			}
 		}
+		bufW.flushTo(w)
 		return
 	}
 
@@ -653,6 +838,8 @@ func needsJSONBodyInspection(method, rawPath string) bool {
 	case norm == "/networks/create":
 		return true
 	case hasPrefixSuffix(norm, "/networks/", "/connect"):
+		return true
+	case hasPrefixSuffix(norm, "/networks/", "/disconnect"):
 		return true
 	case hasPrefixSuffix(norm, "/containers/", "/update"):
 		return true

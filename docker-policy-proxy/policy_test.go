@@ -1582,3 +1582,208 @@ func TestCrossTenantLabelIsolation(t *testing.T) {
 		t.Fatalf("expected 200 on GET /networks/sandbox_net, got %d", code)
 	}
 }
+
+func TestTenantIsolationHardening(t *testing.T) {
+	sockDir, err := os.MkdirTemp("/tmp", "dpp-iso2-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(sockDir)
+
+	upSock := filepath.Join(sockDir, "up.sock")
+	pxSock := filepath.Join(sockDir, "px.sock")
+	const distro = "wsl-agent-sandbox"
+
+	var mu sync.Mutex
+	var lastCreateRaw []byte
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/containers/create", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			b, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			lastCreateRaw = b
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"Id":"sandbox_c"}`))
+			return
+		}
+		t.Errorf("unexpected non-POST /containers/create forwarded upstream: %s", r.Method)
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("/containers/create/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/containers/create/json" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"Id":"host_named_create","Config":{"Labels":{}}}`))
+			return
+		}
+		t.Errorf("unexpected upstream call to host container named 'create': %s %s", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/containers/host_c/json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"Id":"host_c","Config":{"Labels":{}}}`))
+	})
+	mux.HandleFunc("/containers/sandbox_c/json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"Id":"sandbox_c","Config":{"Labels":{"com.wsl-agent-sandbox.distro":"wsl-agent-sandbox"}}}`))
+	})
+	mux.HandleFunc("/containers/json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[]`))
+	})
+	mux.HandleFunc("/networks/bridge", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"Name":"bridge","Labels":{},"Containers":{"host_c":{}}}`))
+	})
+	mux.HandleFunc("/networks/bridge/connect", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/networks/bridge/disconnect", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/exec/preexisting_sandbox_exec/json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ID":"preexisting_sandbox_exec","ContainerID":"sandbox_c"}`))
+	})
+	mux.HandleFunc("/exec/preexisting_sandbox_exec/start", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/exec/preexisting_host_exec/json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ID":"preexisting_host_exec","ContainerID":"host_c"}`))
+	})
+	mux.HandleFunc("/exec/preexisting_host_exec/start", func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected upstream start on host exec")
+		w.WriteHeader(http.StatusOK)
+	})
+
+	upLn, err := net.Listen("unix", upSock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upSrv := &http.Server{Handler: mux}
+	go func() { _ = upSrv.Serve(upLn) }()
+	defer upSrv.Close()
+
+	pol := &Policy{
+		Enabled:       true,
+		DistroName:    distro,
+		DefaultLimits: ResourceLimits{PidsLimit: 64},
+	}
+	pp := NewPolicyProxy(upSock, pol, log.New(io.Discard, "", 0))
+	defer pp.Close()
+
+	pxLn, err := net.Listen("unix", pxSock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pxSrv := &http.Server{Handler: pp}
+	go func() { _ = pxSrv.Serve(pxLn) }()
+	defer pxSrv.Close()
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return net.Dial("unix", pxSock)
+			},
+		},
+	}
+	doReqCT := func(method, path, ct, body string) int {
+		t.Helper()
+		var rdr io.Reader
+		if body != "" {
+			rdr = strings.NewReader(body)
+		}
+		req, err := http.NewRequest(method, "http://docker"+path, rdr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ct != "" {
+			req.Header.Set("Content-Type", ct)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s failed: %v", method, path, err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	// 1. All container:<id> namespace modes enforce tenant ownership.
+	for _, nsField := range []string{"PidMode", "IpcMode", "UTSMode", "UsernsMode", "CgroupnsMode", "NetworkMode"} {
+		badBody := `{"Image":"alpine","HostConfig":{"` + nsField + `":"container:host_c"}}`
+		if code := doReqCT(http.MethodPost, "/containers/create", "application/json", badBody); code != http.StatusForbidden {
+			t.Fatalf("expected 403 for %s=container:host_c, got %d", nsField, code)
+		}
+		okBody := `{"Image":"alpine","HostConfig":{"` + nsField + `":"container:sandbox_c"}}`
+		if code := doReqCT(http.MethodPost, "/containers/create", "application/json", okBody); code != http.StatusCreated {
+			t.Fatalf("expected 201 for %s=container:sandbox_c, got %d", nsField, code)
+		}
+	}
+
+	// 2. Form-encoded Content-Type smuggling is blocked (403).
+	if code := doReqCT(http.MethodPost, "/commit", "application/x-www-form-urlencoded", "container=host_c"); code != http.StatusForbidden {
+		t.Fatalf("expected 403 for form-smuggled /commit, got %d", code)
+	}
+
+	// 3. Lowercase null keys ("labels": null, "hostconfig": null) do not produce duplicate case-colliding keys;
+	//    anonymous volume mounts receive VolumeOptions.Labels[sandboxDistroLabel].
+	caseBody := `{"Image":"alpine","labels":null,"hostconfig":null}`
+	if code := doReqCT(http.MethodPost, "/containers/create", "application/json", caseBody); code != http.StatusCreated {
+		t.Fatalf("expected 201 on lowercase null keys, got %d", code)
+	}
+	mu.Lock()
+	rawCopy := append([]byte(nil), lastCreateRaw...)
+	mu.Unlock()
+	if _, err := decodeStrictObject(rawCopy); err != nil {
+		t.Fatalf("rewritten JSON produced duplicate case-colliding keys: %v (%s)", err, string(rawCopy))
+	}
+
+	anonVolBody := `{"Image":"alpine","HostConfig":{"Mounts":[{"Type":"volume","Target":"/cache"}]}}`
+	if code := doReqCT(http.MethodPost, "/containers/create", "application/json", anonVolBody); code != http.StatusCreated {
+		t.Fatalf("expected 201 on anonymous volume mount, got %d", code)
+	}
+	mu.Lock()
+	anonRaw := string(lastCreateRaw)
+	mu.Unlock()
+	if !strings.Contains(anonRaw, `"com.wsl-agent-sandbox.distro":"`+distro+`"`) || !strings.Contains(anonRaw, `"VolumeOptions"`) {
+		t.Fatalf("expected anonymous volume mount to receive sandbox label in VolumeOptions: %s", anonRaw)
+	}
+
+	// 4. ?filters=null does not panic and returns 200.
+	if code := doReqCT(http.MethodGet, "/containers/json?filters=null", "", ""); code != http.StatusOK {
+		t.Fatalf("expected 200 on ?filters=null, got %d", code)
+	}
+
+	// 5. Host container named "create" cannot be deleted or started via reserved-segment skip.
+	if code := doReqCT(http.MethodDelete, "/containers/create", "", ""); code != http.StatusForbidden {
+		t.Fatalf("expected 403 on DELETE /containers/create (host container named 'create'), got %d", code)
+	}
+	if code := doReqCT(http.MethodPost, "/containers/create/start", "", ""); code != http.StatusForbidden {
+		t.Fatalf("expected 403 on POST /containers/create/start, got %d", code)
+	}
+
+	// 6. GET /system/df and GET /networks/bridge are blocked (403); connect/disconnect on bridge checks container ownership.
+	if code := doReqCT(http.MethodGet, "/system/df", "", ""); code != http.StatusForbidden {
+		t.Fatalf("expected 403 on GET /system/df under DistroName isolation, got %d", code)
+	}
+	if code := doReqCT(http.MethodGet, "/networks/bridge", "", ""); code != http.StatusForbidden {
+		t.Fatalf("expected 403 on GET /networks/bridge, got %d", code)
+	}
+	if code := doReqCT(http.MethodPost, "/networks/bridge/disconnect", "application/json", `{"Container":"host_c"}`); code != http.StatusForbidden {
+		t.Fatalf("expected 403 disconnecting host_c from bridge, got %d", code)
+	}
+	if code := doReqCT(http.MethodPost, "/networks/bridge/disconnect", "application/json", `{"Container":"sandbox_c"}`); code != http.StatusOK {
+		t.Fatalf("expected 200 disconnecting sandbox_c from bridge, got %d", code)
+	}
+
+	// 7. Exec inspection fallback handles proxy restarts cleanly while blocking host execs.
+	if code := doReqCT(http.MethodPost, "/exec/preexisting_sandbox_exec/start", "application/json", `{}`); code != http.StatusOK {
+		t.Fatalf("expected 200 on preexisting sandbox exec via /exec/{id}/json fallback, got %d", code)
+	}
+	if code := doReqCT(http.MethodPost, "/exec/preexisting_host_exec/start", "application/json", `{}`); code != http.StatusForbidden {
+		t.Fatalf("expected 403 on preexisting host exec, got %d", code)
+	}
+}

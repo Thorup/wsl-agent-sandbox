@@ -198,6 +198,10 @@ func (p *Policy) CheckEndpoint(method, rawPath string, query map[string][]string
 		return deny("endpoint %q is not in the allowlist", norm)
 	}
 
+	if p.DistroName != "" && (norm == "/system/df" || strings.HasPrefix(norm, "/system/df/")) {
+		return deny("endpoint %q is disabled when per-distro container isolation is active", norm)
+	}
+
 	// Legacy /build query-parameter checks.
 	if method == http.MethodPost && norm == "/build" {
 		hasNetworkNone := false
@@ -214,6 +218,12 @@ func (p *Policy) CheckEndpoint(method, rawPath string, query map[string][]string
 					} else if p.ForceInternalNetwork {
 						return deny("build networkmode %q is forbidden when docker.forceInternalNetwork is active (must be \"none\")", v)
 					}
+				}
+				if lk == "cgroupparent" && lv != "" {
+					return deny("build cgroupparent %q is forbidden", v)
+				}
+				if lk == "extrahosts" && (strings.Contains(lv, "host-gateway") || strings.Contains(lv, "host.docker.internal")) {
+					return deny("build extrahosts %q is forbidden", v)
 				}
 				if lk == "securityopt" && isDangerousSecurityOpt(v) {
 					return deny("build securityopt %q is forbidden", v)
@@ -294,6 +304,9 @@ func (p *Policy) ProcessJSONBodyWithMounts(method, rawPath string, body []byte) 
 		return b, m, nil, err
 	case strings.HasPrefix(norm, "/networks/") && strings.HasSuffix(norm, "/connect"):
 		b, m, err := p.processNetworkConnect(norm, body)
+		return b, m, nil, err
+	case strings.HasPrefix(norm, "/networks/") && strings.HasSuffix(norm, "/disconnect"):
+		b, m, err := p.processNetworkDisconnect(body)
 		return b, m, nil, err
 	default:
 		return body, false, nil, nil
@@ -393,7 +406,10 @@ func (p *Policy) validateNetworkTarget(target string) error {
 		strings.HasPrefix(lt, "host:") || strings.HasPrefix(lt, "ns:") || strings.HasPrefix(lt, "container:") {
 		return deny("network %q is forbidden when forceInternalNetwork is enabled", target)
 	}
-	if p.DistroName != "" && p.networkOwnerChecker != nil {
+	if p.DistroName != "" {
+		if p.networkOwnerChecker == nil {
+			return deny("cannot verify ownership of network %q", target)
+		}
 		if err := p.networkOwnerChecker(target); err != nil {
 			return err
 		}
@@ -417,6 +433,9 @@ func (p *Policy) injectSandboxLabel(obj map[string]any) (bool, error) {
 	}
 	lKey, lRaw, hasL := getKeyCI(obj, "Labels")
 	if !hasL || lRaw == nil {
+		if hasL {
+			delete(obj, lKey)
+		}
 		obj["Labels"] = map[string]any{sandboxDistroLabel: p.DistroName}
 		return true, nil
 	}
@@ -484,7 +503,10 @@ func (p *Policy) processContainerCreate(body []byte) ([]byte, bool, []string, er
 					if err := p.validateNetworkTarget(netName); err != nil {
 						return nil, false, nil, err
 					}
-				} else if p.DistroName != "" && p.networkOwnerChecker != nil {
+				} else if p.DistroName != "" {
+					if p.networkOwnerChecker == nil {
+						return nil, false, nil, deny("cannot verify ownership of network %q", netName)
+					}
 					if err := p.networkOwnerChecker(netName); err != nil {
 						return nil, false, nil, err
 					}
@@ -509,6 +531,9 @@ func (p *Policy) processContainerCreate(body []byte) ([]byte, bool, []string, er
 			modified = true
 		}
 		if modified {
+			if hasHC {
+				delete(obj, hcKey)
+			}
 			obj["HostConfig"] = hc
 			ncModified = true
 		}
@@ -633,17 +658,20 @@ func (p *Policy) processNetworkConnect(normPath string, body []byte) ([]byte, bo
 	if err != nil {
 		return nil, false, err
 	}
-	if p.DistroName != "" && p.containerOwnerChecker != nil {
-		if _, cidRaw, ok := getKeyCI(obj, "Container"); ok && cidRaw != nil {
-			cid, valid := asString(cidRaw)
-			if !valid {
-				return nil, false, deny("network connect Container must be a string")
-			}
-			if strings.TrimSpace(cid) != "" {
-				if err := p.containerOwnerChecker(cid); err != nil {
-					return nil, false, err
-				}
-			}
+	if p.DistroName != "" {
+		_, cidRaw, ok := getKeyCI(obj, "Container")
+		if !ok || cidRaw == nil {
+			return nil, false, deny("network connect Container is required")
+		}
+		cid, valid := asString(cidRaw)
+		if !valid || strings.TrimSpace(cid) == "" {
+			return nil, false, deny("network connect Container must be a non-empty string")
+		}
+		if p.containerOwnerChecker == nil {
+			return nil, false, deny("cannot verify ownership of container %q", cid)
+		}
+		if err := p.containerOwnerChecker(strings.TrimSpace(cid)); err != nil {
+			return nil, false, err
 		}
 	}
 	if !p.ForceInternalNetwork {
@@ -653,6 +681,30 @@ func (p *Policy) processNetworkConnect(normPath string, body []byte) ([]byte, bo
 	netRef = strings.TrimSuffix(netRef, "/connect")
 	if err := p.validateNetworkTarget(netRef); err != nil {
 		return nil, false, err
+	}
+	return body, false, nil
+}
+
+func (p *Policy) processNetworkDisconnect(body []byte) ([]byte, bool, error) {
+	obj, err := decodeStrictObject(body)
+	if err != nil {
+		return nil, false, err
+	}
+	if p.DistroName != "" {
+		_, cidRaw, ok := getKeyCI(obj, "Container")
+		if !ok || cidRaw == nil {
+			return nil, false, deny("network disconnect Container is required")
+		}
+		cid, valid := asString(cidRaw)
+		if !valid || strings.TrimSpace(cid) == "" {
+			return nil, false, deny("network disconnect Container must be a non-empty string")
+		}
+		if p.containerOwnerChecker == nil {
+			return nil, false, deny("cannot verify ownership of container %q", cid)
+		}
+		if err := p.containerOwnerChecker(strings.TrimSpace(cid)); err != nil {
+			return nil, false, err
+		}
 	}
 	return body, false, nil
 }
@@ -667,7 +719,7 @@ func (p *Policy) processNetworkCreate(body []byte) ([]byte, bool, error) {
 	}
 	modified := false
 	if p.ForceInternalNetwork {
-		_, intRaw, hasInt := getKeyCI(obj, "Internal")
+		intKey, intRaw, hasInt := getKeyCI(obj, "Internal")
 		if hasInt && intRaw != nil {
 			b, valid := asBool(intRaw)
 			if !valid {
@@ -677,6 +729,9 @@ func (p *Policy) processNetworkCreate(body []byte) ([]byte, bool, error) {
 				return nil, false, deny("non-internal Docker networks are forbidden when forceInternalNetwork is enabled")
 			}
 		} else {
+			if hasInt {
+				delete(obj, intKey)
+			}
 			obj["Internal"] = true
 			modified = true
 		}
@@ -1011,16 +1066,34 @@ func (p *Policy) validateAndRewriteHostConfig(hc map[string]any, hasEndpoints bo
 		}
 	}
 
-	// 2. Host namespaces (PID, IPC, UTS, Userns, Cgroupns, Network)
+	// 2. Host & container namespaces (PID, IPC, UTS, Userns, Cgroupns, Network)
 	for _, nsField := range []string{"PidMode", "IpcMode", "UTSMode", "UsernsMode", "CgroupnsMode", "NetworkMode"} {
 		if _, val, ok := getKeyCI(hc, nsField); ok && val != nil {
 			mode, valid := asString(val)
 			if !valid {
 				return false, ephemeralTargets, deny("HostConfig.%s must be a string", nsField)
 			}
-			lm := strings.ToLower(strings.TrimSpace(mode))
+			trimmedMode := strings.TrimSpace(mode)
+			lm := strings.ToLower(trimmedMode)
 			if lm == "host" || strings.HasPrefix(lm, "host:") || strings.HasPrefix(lm, "ns:") {
 				return false, ephemeralTargets, deny("HostConfig.%s=%q is forbidden", nsField, mode)
+			}
+			if strings.HasPrefix(lm, "container:") {
+				targetCID := strings.TrimSpace(trimmedMode[len("container:"):])
+				if targetCID == "" {
+					return false, ephemeralTargets, deny("HostConfig.%s=%q missing target container", nsField, mode)
+				}
+				if nsField == "NetworkMode" && p.ForceInternalNetwork {
+					continue
+				}
+				if p.DistroName != "" {
+					if p.containerOwnerChecker == nil {
+						return false, ephemeralTargets, deny("cannot verify ownership of container %q in HostConfig.%s", targetCID, nsField)
+					}
+					if err := p.containerOwnerChecker(targetCID); err != nil {
+						return false, ephemeralTargets, err
+					}
+				}
 			}
 		}
 	}
@@ -1030,6 +1103,9 @@ func (p *Policy) validateAndRewriteHostConfig(hc map[string]any, hasEndpoints bo
 		nmKey, nmRaw, hasNM := getKeyCI(hc, "NetworkMode")
 		if !hasNM || nmRaw == nil {
 			if !hasEndpoints {
+				if hasNM {
+					delete(hc, nmKey)
+				}
 				hc["NetworkMode"] = "none"
 				modified = true
 			}
@@ -1051,18 +1127,12 @@ func (p *Policy) validateAndRewriteHostConfig(hc map[string]any, hasEndpoints bo
 		if _, nmRaw, hasNM := getKeyCI(hc, "NetworkMode"); hasNM && nmRaw != nil {
 			mode, _ := asString(nmRaw)
 			lm := strings.ToLower(strings.TrimSpace(mode))
-			if strings.HasPrefix(lm, "container:") {
-				targetCID := strings.TrimSpace(mode[len("container:"):])
-				if p.containerOwnerChecker != nil {
-					if err := p.containerOwnerChecker(targetCID); err != nil {
-						return false, ephemeralTargets, err
-					}
+			if !strings.HasPrefix(lm, "container:") && lm != "" && lm != "none" && lm != "default" && lm != "bridge" {
+				if p.networkOwnerChecker == nil {
+					return false, ephemeralTargets, deny("cannot verify ownership of network %q", mode)
 				}
-			} else if lm != "" && lm != "none" && lm != "default" && lm != "bridge" {
-				if p.networkOwnerChecker != nil {
-					if err := p.networkOwnerChecker(mode); err != nil {
-						return false, ephemeralTargets, err
-					}
+				if err := p.networkOwnerChecker(mode); err != nil {
+					return false, ephemeralTargets, err
 				}
 			}
 		}
@@ -1278,7 +1348,10 @@ func (p *Policy) validateAndRewriteBindSpec(spec string) (string, bool, string, 
 
 	// Named Docker volume (no path separators, no dots-only).
 	if !strings.ContainsAny(src, `/\`) && namedVolumeRe.MatchString(src) {
-		if p.DistroName != "" && p.volumeEnsurer != nil {
+		if p.DistroName != "" {
+			if p.volumeEnsurer == nil {
+				return "", false, "", deny("cannot verify ownership of volume %q", src)
+			}
 			if err := p.volumeEnsurer(src); err != nil {
 				return "", false, "", err
 			}
@@ -1350,18 +1423,30 @@ func (p *Policy) validateAndRewriteMountObj(m map[string]any) (bool, string, err
 	case "tmpfs":
 		return false, "", nil
 	case "volume":
+		hasNamedSrc := false
 		if _, srcRaw, hasSrc := getKeyCI(m, "Source"); hasSrc && srcRaw != nil {
 			src, ok := asString(srcRaw)
 			if !ok {
 				return false, "", deny("Mount.Source must be a string")
 			}
-			if strings.TrimSpace(src) != "" && p.DistroName != "" && p.volumeEnsurer != nil {
-				if err := p.volumeEnsurer(src); err != nil {
-					return false, "", err
+			trimmedSrc := strings.TrimSpace(src)
+			if trimmedSrc != "" {
+				if strings.ContainsAny(trimmedSrc, `/\`) || !namedVolumeRe.MatchString(trimmedSrc) {
+					return false, "", deny("invalid volume Mount.Source %q", src)
+				}
+				hasNamedSrc = true
+				if p.DistroName != "" {
+					if p.volumeEnsurer == nil {
+						return false, "", deny("cannot verify ownership of volume %q", trimmedSrc)
+					}
+					if err := p.volumeEnsurer(trimmedSrc); err != nil {
+						return false, "", err
+					}
 				}
 			}
 		}
-		if _, vOptsRaw, ok := getKeyCI(m, "VolumeOptions"); ok && vOptsRaw != nil {
+		vOptsKey, vOptsRaw, hasVOpts := getKeyCI(m, "VolumeOptions")
+		if hasVOpts && vOptsRaw != nil {
 			vOpts, ok := vOptsRaw.(map[string]any)
 			if !ok {
 				return false, "", deny("Mount.VolumeOptions must be an object")
@@ -1387,6 +1472,24 @@ func (p *Policy) validateAndRewriteMountObj(m map[string]any) (bool, string, err
 					}
 				}
 			}
+			if p.DistroName != "" {
+				changed, err := p.injectSandboxLabel(vOpts)
+				if err != nil {
+					return false, "", err
+				}
+				if changed {
+					m[vOptsKey] = vOpts
+					return true, "", nil
+				}
+			}
+		} else if p.DistroName != "" && !hasNamedSrc {
+			if hasVOpts {
+				delete(m, vOptsKey)
+			}
+			m["VolumeOptions"] = map[string]any{
+				"Labels": map[string]any{sandboxDistroLabel: p.DistroName},
+			}
+			return true, "", nil
 		}
 		return false, "", nil
 	case "bind":
