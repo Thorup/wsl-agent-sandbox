@@ -723,6 +723,7 @@ func (pp *PolicyProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		pp.logger.Printf("DENY method=%s path=%s reason=%v", r.Method, r.URL.Path, err)
 		writeDockerJSONError(w, http.StatusForbidden, err.Error())
 		return
+	}
 
 	if r.Method == http.MethodPost && norm == "/build" && len(pol.AllowedRegistries) > 0 {
 		limited := io.LimitReader(r.Body, maxInspectBuildContextBytes+1)

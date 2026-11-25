@@ -1788,6 +1788,8 @@ func TestTenantIsolationHardening(t *testing.T) {
 	}
 	if code := doReqCT(http.MethodPost, "/exec/preexisting_host_exec/start", "application/json", `{}`); code != http.StatusForbidden {
 		t.Fatalf("expected 403 on preexisting host exec, got %d", code)
+	}
+}
 
 func makeBuildTar(t *testing.T, files map[string]string, gzipped bool) []byte {
 	t.Helper()
@@ -1917,5 +1919,102 @@ FROM scratch
 	}
 	if code := postBuild("", []byte("not-a-tar-archive-at-all")); code != http.StatusForbidden {
 		t.Fatalf("expected 403 for non-tar garbage payload, got %d", code)
+	}
+}
+
+func TestLegacyBuildDockerfileParserHardening(t *testing.T) {
+	proxy, sock, _, _, cleanup := setupTestEnv(t)
+	defer cleanup()
+	proxy.UpdatePolicy(&Policy{
+		Enabled:           true,
+		AllowedRegistries: []string{"docker.io", "ghcr.io"},
+	})
+	client := unixHTTPClient(sock)
+
+	postBuild := func(rawQuery, ct string, body []byte) int {
+		t.Helper()
+		u := "http://docker/v1.47/build"
+		if rawQuery != "" {
+			u += "?" + rawQuery
+		}
+		if ct == "" {
+			ct = "application/x-tar"
+		}
+		resp, err := client.Post(u, ct, bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		_, _ = io.ReadAll(resp.Body)
+		return resp.StatusCode
+	}
+
+	// 1. Stage-local ARG after FROM must NOT leak into subsequent FROM headers or clobber global ARG.
+	stageLocalLeak := "FROM alpine:3.20\nARG BASE=quay.io/untrusted/img:1\nFROM ${BASE}\n"
+	if code := postBuild("", "", makeBuildTar(t, map[string]string{"Dockerfile": stageLocalLeak}, false)); code != http.StatusForbidden {
+		t.Fatalf("expected 403 for stage-local ARG referenced in subsequent FROM, got %d", code)
+	}
+	stageLocalMask := "ARG BASE=quay.io/untrusted/img:1\nFROM alpine:3.20\nARG BASE=alpine:3.20\nFROM ${BASE}\n"
+	if code := postBuild("", "", makeBuildTar(t, map[string]string{"Dockerfile": stageLocalMask}, false)); code != http.StatusForbidden {
+		t.Fatalf("expected 403 when stage-local ARG tries to mask denied global ARG, got %d", code)
+	}
+
+	// 2. Global ARG chaining (ARG IMG=${H}/...) expands prior global ARGs accurately.
+	chainedDenied := "ARG H=quay.io\nARG IMG=${H}/untrusted/app:1\nFROM ${IMG}\n"
+	if code := postBuild("", "", makeBuildTar(t, map[string]string{"Dockerfile": chainedDenied}, false)); code != http.StatusForbidden {
+		t.Fatalf("expected 403 for chained global ARG resolving to quay.io, got %d", code)
+	}
+	chainedAllowed := "ARG H=ghcr.io\nARG IMG=${H}/org/app:1\nFROM ${IMG}\n"
+	if code := postBuild("", "", makeBuildTar(t, map[string]string{"Dockerfile": chainedAllowed}, false)); code != http.StatusOK {
+		t.Fatalf("expected 200 for chained global ARG resolving to ghcr.io, got %d", code)
+	}
+
+	// 3. Continuation token-gluing and trailing spaces after escape char.
+	for i, df := range []string{
+		"FR\\\nOM quay.io/untrusted/app:1\n",
+		"FROM docker.io\\\n.evil.com/app:1\n",
+		"FROM docker.io\\   \n.evil.com/app:1\n",
+		"# ordinary comment ends directives\n# escape=`\nFR\\\nOM quay.io/untrusted/app:1\n",
+		"# syntax=evil.io/custom/dockerfile:1\nFROM alpine:3.20\n",
+		"FROM alpine:3.20\nCOPY --from=quay.io/untrusted/tools:1 /bin/tool /bin/tool\n",
+		"FROM alpine:3.20\nONBUILD FROM quay.io/untrusted/base:1\n",
+	} {
+		if code := postBuild("", "", makeBuildTar(t, map[string]string{"Dockerfile": df}, false)); code != http.StatusForbidden {
+			t.Fatalf("parser hardening case %d: expected 403, got %d\nDockerfile:\n%s", i, code, df)
+		}
+	}
+
+	// 4. Allowed multi-stage COPY --from=<alias>, COPY --from=<index>, and COPY --from=<allowed-registry> pass (200).
+	copyAllowed := "FROM ghcr.io/org/tools:1 AS tools\nFROM alpine:3.20\nCOPY --from=tools /a /a\nCOPY --from=0 /b /b\nCOPY --from=ghcr.io/org/extra:1 /c /c\n"
+	if code := postBuild("", "", makeBuildTar(t, map[string]string{"Dockerfile": copyAllowed}, false)); code != http.StatusOK {
+		t.Fatalf("expected 200 for allowed COPY --from variants, got %d", code)
+	}
+
+	// 5. Tar symlink ancestor and duplicate Dockerfile entries fail closed (403).
+	var symBuf bytes.Buffer
+	tw := tar.NewWriter(&symBuf)
+	_ = tw.WriteHeader(&tar.Header{Name: "sub", Typeflag: tar.TypeSymlink, Linkname: "real"})
+	dfContent := "FROM alpine:3.20\n"
+	_ = tw.WriteHeader(&tar.Header{Name: "sub/Dockerfile", Typeflag: tar.TypeReg, Mode: 0o644, Size: int64(len(dfContent))})
+	_, _ = tw.Write([]byte(dfContent))
+	_ = tw.Close()
+	if code := postBuild("dockerfile="+url.QueryEscape("sub/Dockerfile"), "", symBuf.Bytes()); code != http.StatusForbidden {
+		t.Fatalf("expected 403 for symlink ancestor in build context tar, got %d", code)
+	}
+
+	var dupBuf bytes.Buffer
+	twDup := tar.NewWriter(&dupBuf)
+	for _, c := range []string{"FROM alpine:3.20\n", "FROM quay.io/untrusted/app:1\n"} {
+		_ = twDup.WriteHeader(&tar.Header{Name: "Dockerfile", Typeflag: tar.TypeReg, Mode: 0o644, Size: int64(len(c))})
+		_, _ = twDup.Write([]byte(c))
+	}
+	_ = twDup.Close()
+	if code := postBuild("", "", dupBuf.Bytes()); code != http.StatusForbidden {
+		t.Fatalf("expected 403 for duplicate Dockerfile entries in tar, got %d", code)
+	}
+
+	// 6. Form-encoded Content-Type smuggling is blocked (403).
+	if code := postBuild("", "application/x-www-form-urlencoded", []byte("remote=https://evil.com/repo.git")); code != http.StatusForbidden {
+		t.Fatalf("expected 403 for form-encoded POST /build, got %d", code)
 	}
 }
