@@ -796,10 +796,14 @@ function Build-SeedSecretsPayload {
     param(
         [Parameter(Mandatory)][string]$ManifestPath,
         [Parameter(Mandatory)][string]$AgentName,
+        [int]$AgentUid = 26040,
         [string[]]$Services = @(),
         [switch]$Prune,
         [string]$Ttl = ''
     )
+
+    $proxyPorts = Get-DeterministicProxyPorts -Uid $AgentUid
+    $credProxyBase = "http://127.0.0.1:$($proxyPorts.CredentialPort)"
 
     if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
         throw "Secrets manifest not found at '$ManifestPath'. Create it from 'examples\secrets.example.json' (default path: %USERPROFILE%\.wsl-agent-sandbox\secrets.json) or pass -SecretsPath."
@@ -939,7 +943,7 @@ function Build-SeedSecretsPayload {
                         if ($pProxyInject) {
                             $pUpstreamUrl = if ($pHost -eq 'github.com') { 'https://api.github.com' } else { "https://$pHost/api/v3" }
                             $pAgentToken = Get-ProxyPlaceholderToken -ServicePrefix 'github'
-                            $pProxyBaseUrl = 'http://127.0.0.1:3129/github'
+                            $pProxyBaseUrl = "$credProxyBase/github"
                             $expectedPlaceholderTokens.Add($pAgentToken)
                             $tokenProfilesMap[$pAgentToken] = [ordered]@{
                                 profile         = $pName
@@ -968,7 +972,7 @@ function Build-SeedSecretsPayload {
                     if ($topProxyInject) {
                         $upstreamUrl = if ($topHostname -eq 'github.com') { 'https://api.github.com' } else { "https://$topHostname/api/v3" }
                         $agentToken = Get-ProxyPlaceholderToken -ServicePrefix 'github'
-                        $proxyBaseUrl = 'http://127.0.0.1:3129/github'
+                        $proxyBaseUrl = "$credProxyBase/github"
                         $expectedPlaceholderTokens.Add($agentToken)
                         $tokenProfilesMap[$agentToken] = [ordered]@{
                             profile         = 'default'
@@ -1819,7 +1823,7 @@ function Build-SeedSecretsPayload {
                         expectedToken   = $agentJiraToken
                         injectHeaders   = [ordered]@{ Authorization = $authHeader }
                     }
-                    $agentJiraServer = 'http://127.0.0.1:3129/jira'
+                    $agentJiraServer = "$credProxyBase/jira"
                 }
 
                 $jiraOut = [ordered]@{
@@ -1927,7 +1931,7 @@ function Build-SeedSecretsPayload {
                 $proxyBaseUrl = ''
                 if ($proxyInject -and $apiKey) {
                     $agentApiKey = Get-ProxyPlaceholderToken -ServicePrefix 'gemini'
-                    $proxyBaseUrl = 'http://127.0.0.1:3129/gemini'
+                    $proxyBaseUrl = "$credProxyBase/gemini"
                     $proxyRoutes['gemini'] = [ordered]@{
                         upstreamBaseUrl = 'https://generativelanguage.googleapis.com'
                         expectedToken   = $agentApiKey
@@ -1967,7 +1971,7 @@ function Build-SeedSecretsPayload {
                         $injectHeaders['Authorization'] = "Bearer $oauthToken"
                         $expectedTokens.Add($agentOauth)
                     }
-                    $proxyBaseUrl = 'http://127.0.0.1:3129/claude'
+                    $proxyBaseUrl = "$credProxyBase/claude"
                     $proxyRoutes['claude'] = [ordered]@{
                         upstreamBaseUrl = 'https://api.anthropic.com'
                         expectedTokens  = $expectedTokens.ToArray()

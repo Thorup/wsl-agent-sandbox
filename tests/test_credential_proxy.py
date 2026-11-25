@@ -375,6 +375,75 @@ class CredentialProxyTests(unittest.TestCase):
             credential_proxy.MAX_REQUEST_BODY_BYTES = orig_max
             os.unlink(cfg_path)
 
+    def test_load_proxy_config_and_verify_caller_uid(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "listenPort": 13101,
+                    "allowedCallerUid": 26150,
+                    "routes": {"claude": {"upstreamBaseUrl": "https://api.anthropic.com"}},
+                },
+                f,
+            )
+            cfg_path = f.name
+        proc_tcp_content = (
+            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+            "   0: 0100007F:AFC8 0100007F:332D 01 00000000:00000000 00:00000000 00000000 26150        0 1001 1 00000000\n"
+            "   1: 0100007F:AFC9 0100007F:332D 01 00000000:00000000 00:00000000 00000000  1000        0 1002 1 00000000\n"
+        )
+        with tempfile.NamedTemporaryFile("w", suffix=".tcp", delete=False, encoding="utf-8") as tf:
+            tf.write(proc_tcp_content)
+            tcp_path = tf.name
+        try:
+            cfg = credential_proxy.load_proxy_config(cfg_path)
+            self.assertEqual(cfg["listenPort"], 13101)
+            self.assertEqual(cfg["allowedCallerUid"], 26150)
+            self.assertIn("claude", cfg["routes"])
+            self.assertTrue(credential_proxy.verify_caller_uid(("127.0.0.1", 0xAFC8), 0x332D, 26150, (tcp_path,)))
+            self.assertFalse(credential_proxy.verify_caller_uid(("127.0.0.1", 0xAFC9), 0x332D, 26150, (tcp_path,)))
+            self.assertTrue(credential_proxy.verify_caller_uid(("127.0.0.1", 0xAFC9), 0x332D, None, (tcp_path,)))
+        finally:
+            os.unlink(cfg_path)
+            os.unlink(tcp_path)
+
+    def test_live_handler_rejects_mismatched_caller_uid_with_403(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "listenPort": 13101,
+                    "allowedCallerUid": 26150,
+                    "routes": {
+                        "claude": {
+                            "upstreamBaseUrl": "http://127.0.0.1:9/api",
+                            "expectedToken": "ph-tok",
+                            "injectHeaders": {"x-api-key": "real"},
+                        }
+                    },
+                },
+                f,
+            )
+            cfg_path = f.name
+
+        orig_load_cfg = credential_proxy.load_proxy_config
+        orig_verify = credential_proxy.verify_caller_uid
+        credential_proxy.load_proxy_config = lambda p=cfg_path: orig_load_cfg(p)
+        credential_proxy.verify_caller_uid = lambda *args, **kwargs: False
+
+        proxy_srv = credential_proxy.ThreadingHTTPServer(("127.0.0.1", 0), credential_proxy.CredentialProxyHandler)
+        proxy_port = proxy_srv.server_address[1]
+        threading.Thread(target=proxy_srv.serve_forever, daemon=True).start()
+        try:
+            with socket.create_connection(("127.0.0.1", proxy_port), timeout=5) as s:
+                s.sendall(b"GET /claude/v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\nx-api-key: ph-tok\r\n\r\n")
+                resp = s.recv(4096).decode("utf-8", errors="replace")
+            self.assertIn("403", resp.splitlines()[0])
+        finally:
+            proxy_srv.shutdown()
+            proxy_srv.server_close()
+            credential_proxy.load_proxy_config = orig_load_cfg
+            credential_proxy.verify_caller_uid = orig_verify
+            os.unlink(cfg_path)
+
 
 if __name__ == "__main__":
     unittest.main()

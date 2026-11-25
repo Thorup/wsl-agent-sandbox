@@ -572,6 +572,7 @@ $disabledDockerCfg = Copy-Config $baseCfg
 $disabledDockerCfg.docker.enabled = $false
 Assert-True "No Docker advisories when docker.enabled is false" (@(Get-DockerSecurityAdvisories -Config $disabledDockerCfg).Count -eq 0)
 
+<<<<<<< HEAD
 # Strict unknown-property rejection across all config sections
 Assert-Throws "Rejects unknown property at box.json root" {
     $c = Copy-Config $baseCfg
@@ -898,6 +899,34 @@ Assert-Throws "Rejects [hashtable] packages.installDockerCli 1-element array @(`
     $h.packages.installDockerCli = @($true)
     Assert-BoxConfigValid -Config $h
 } 'packages\.installDockerCli must be a boolean'
+
+# Deterministic per-UID proxy port allocation
+$defaultPorts = Get-DeterministicProxyPorts -Uid 26040
+Assert-True "Default UID 26040 resolves proxy ports 3128/3129" ($defaultPorts.EgressPort -eq 3128 -and $defaultPorts.CredentialPort -eq 3129)
+
+$seenProxyPorts = @{}
+$seenProxyPorts[3128] = $true
+$seenProxyPorts[3129] = $true
+$allProfilePortsUnique = $true
+$allProfilePortsBelowEphemeral = $true
+foreach ($u in 26100..26998) {
+    $pp = Get-DeterministicProxyPorts -Uid $u
+    if ($pp.EgressPort -ge 32768 -or $pp.CredentialPort -ge 32768 -or $pp.EgressPort -lt 1024) {
+        $allProfilePortsBelowEphemeral = $false
+        break
+    }
+    if ($seenProxyPorts.ContainsKey($pp.EgressPort) -or $seenProxyPorts.ContainsKey($pp.CredentialPort) -or $pp.EgressPort -eq $pp.CredentialPort) {
+        $allProfilePortsUnique = $false
+        break
+    }
+    $seenProxyPorts[$pp.EgressPort] = $true
+    $seenProxyPorts[$pp.CredentialPort] = $true
+}
+Assert-True "All profile UIDs 26100..26998 resolve unique non-colliding proxy ports" $allProfilePortsUnique
+Assert-True "All profile UIDs 26100..26998 resolve proxy ports < 32768" $allProfilePortsBelowEphemeral
+
+$customPorts = Get-DeterministicProxyPorts -Uid 15001
+Assert-True "Custom UID 15001 resolves valid proxy port pair < 32768" ($customPorts.EgressPort -ge 15000 -and $customPorts.CredentialPort -eq ($customPorts.EgressPort + 1) -and $customPorts.CredentialPort -lt 32768)
 
 Write-Host ""
 Write-Host "=== Config.Tests.ps1 Summary: PASS=$script:Passed FAIL=$script:Failed ==="

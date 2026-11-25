@@ -91,6 +91,8 @@ def load_config(path=ALLOWLIST_FILE):
         "blockedNets": [],
         "allowedPorts": {443},
         "allowedHttpPorts": {80, 443},
+        "listenPort": LISTEN_PORT,
+        "allowedCallerUid": None,
     }
     if not os.path.isfile(path):
         return default_cfg
@@ -144,6 +146,16 @@ def load_config(path=ALLOWLIST_FILE):
                 pass
         return out or set(fallback)
 
+    raw_port = data.get("listenPort")
+    listen_port = LISTEN_PORT
+    if isinstance(raw_port, int) and not isinstance(raw_port, bool) and 1 <= raw_port <= 65535:
+        listen_port = raw_port
+
+    raw_uid = data.get("allowedCallerUid")
+    allowed_uid = None
+    if isinstance(raw_uid, int) and not isinstance(raw_uid, bool) and raw_uid >= 0:
+        allowed_uid = raw_uid
+
     return {
         "egressMode": data.get("egressMode", "open"),
         "patterns": patterns,
@@ -152,7 +164,67 @@ def load_config(path=ALLOWLIST_FILE):
         "blockedNets": blocked_nets,
         "allowedPorts": _port_set("allowedPorts", (443,)),
         "allowedHttpPorts": _port_set("allowedHttpPorts", (80, 443)),
+        "listenPort": listen_port,
+        "allowedCallerUid": allowed_uid,
     }
+
+
+def _format_proc_net_addr(ip_obj, port):
+    """Format an IPv4 or IPv6 address + port as uppercase hex strings for /proc/net/tcp{,6}."""
+    port_hex = f"{int(port):04X}"
+    if isinstance(ip_obj, ipaddress.IPv4Address):
+        ip_hex = f"{int.from_bytes(ip_obj.packed, sys.byteorder):08X}"
+        mapped_hex = f"0000000000000000FFFF0000{ip_hex}"
+        return [(f"{ip_hex}:{port_hex}", f"{mapped_hex}:{port_hex}")]
+    packed = ip_obj.packed
+    ip6_hex = "".join(f"{int.from_bytes(packed[i:i + 4], sys.byteorder):08X}" for i in range(0, 16, 4))
+    return [(f"{ip6_hex}:{port_hex}",)]
+
+
+def verify_caller_uid(client_address, server_port, allowed_uid, proc_net_paths=("/proc/net/tcp", "/proc/net/tcp6")):
+    """Verify via /proc/net/tcp{,6} that the connecting loopback socket belongs to root (0) or allowed_uid."""
+    if allowed_uid is None:
+        return True
+    try:
+        allowed_uid_int = int(allowed_uid)
+        client_ip_raw = str(client_address[0]).split("%")[0].strip()
+        client_port = int(client_address[1])
+        srv_port = int(server_port)
+        client_ip = ipaddress.ip_address(client_ip_raw)
+        if isinstance(client_ip, ipaddress.IPv6Address) and client_ip.ipv4_mapped is not None:
+            client_ip = client_ip.ipv4_mapped
+    except (IndexError, TypeError, ValueError):
+        return False
+
+    local_candidates = set()
+    rem_candidates = set()
+    for tup in _format_proc_net_addr(client_ip, client_port):
+        local_candidates.update(tup)
+    for tup in _format_proc_net_addr(client_ip, srv_port):
+        rem_candidates.update(tup)
+
+    for path in proc_net_paths:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        except OSError:
+            continue
+        for line in lines[1:]:
+            parts = line.split()
+            if len(parts) < 8:
+                continue
+            local_col = parts[1].upper()
+            rem_col = parts[2].upper()
+            state_col = parts[3].upper()
+            if state_col != "01":
+                continue
+            if local_col in local_candidates and rem_col in rem_candidates:
+                try:
+                    sock_uid = int(parts[7])
+                except ValueError:
+                    return False
+                return sock_uid in (0, allowed_uid_int)
+    return False
 
 
 def is_domain_allowed(host, patterns):
@@ -283,14 +355,28 @@ class EgressProxyHandler(http.server.BaseHTTPRequestHandler):
         sys.stdout.write(f"[egress-proxy] {self.address_string()} {fmt % args}\n")
         sys.stdout.flush()
 
+    def _check_caller_uid(self, cfg):
+        allowed_uid = cfg.get("allowedCallerUid")
+        if allowed_uid is None:
+            return True
+        server_port = self.server.server_address[1]
+        if verify_caller_uid(self.client_address, server_port, allowed_uid):
+            return True
+        self.log_message("DENY CALLER_UID client=%s allowed_uid=%s", self.client_address, allowed_uid)
+        self.send_error(403, "egress-proxy: caller UID forbidden")
+        return False
+
     def do_CONNECT(self):
+        cfg = load_config()
+        if not self._check_caller_uid(cfg):
+            return
+
         try:
             host, port = parse_connect_target(self.path)
         except ValueError as exc:
             self.send_error(400, f"bad CONNECT target: {exc}")
             return
 
-        cfg = load_config()
         if port not in cfg["allowedPorts"]:
             self.log_message("DENY CONNECT port %s:%d", host, port)
             self.send_error(403, f"egress-proxy blocked port: {port}")
@@ -316,6 +402,10 @@ class EgressProxyHandler(http.server.BaseHTTPRequestHandler):
         self._tunnel(self.connection, upstream)
 
     def _handle_http(self):
+        cfg = load_config()
+        if not self._check_caller_uid(cfg):
+            return
+
         try:
             parsed = urlsplit(self.path)
         except ValueError as exc:
@@ -334,7 +424,6 @@ class EgressProxyHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(400, "invalid target host or port")
             return
 
-        cfg = load_config()
         if port not in cfg["allowedHttpPorts"]:
             self.log_message("DENY HTTP port %s:%d", host, port)
             self.send_error(403, f"egress-proxy blocked HTTP port: {port}")
@@ -494,6 +583,8 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 if __name__ == "__main__":
-    srv = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), EgressProxyHandler)
-    print(f"[egress-proxy] listening on {LISTEN_HOST}:{LISTEN_PORT} allowlist={ALLOWLIST_FILE}", flush=True)
+    cfg = load_config()
+    listen_port = cfg.get("listenPort") or LISTEN_PORT
+    srv = ThreadingHTTPServer((LISTEN_HOST, listen_port), EgressProxyHandler)
+    print(f"[egress-proxy] listening on {LISTEN_HOST}:{listen_port} allowlist={ALLOWLIST_FILE}", flush=True)
     srv.serve_forever()

@@ -252,6 +252,80 @@ class EgressProxyTests(unittest.TestCase):
             egress_proxy.MAX_REQUEST_BODY_BYTES = orig_max
             os.unlink(cfg_path)
 
+    def test_load_config_reads_listen_port_and_allowed_caller_uid(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "egressMode": "allowlist",
+                    "allowedDomains": ["github"],
+                    "listenPort": 13100,
+                    "allowedCallerUid": 26150,
+                },
+                f,
+            )
+            cfg_path = f.name
+        try:
+            cfg = egress_proxy.load_config(cfg_path)
+            self.assertEqual(cfg["listenPort"], 13100)
+            self.assertEqual(cfg["allowedCallerUid"], 26150)
+        finally:
+            os.unlink(cfg_path)
+
+    def test_verify_caller_uid_against_proc_net_tcp(self):
+        proc_tcp_content = (
+            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+            "   0: 0100007F:AFC8 0100007F:0C38 01 00000000:00000000 00:00000000 00000000 26040        0 1001 1 00000000\n"
+            "   1: 0100007F:AFC9 0100007F:0C38 01 00000000:00000000 00:00000000 00000000     0        0 1002 1 00000000\n"
+            "   2: 0100007F:AFCA 0100007F:0C38 01 00000000:00000000 00:00000000 00000000  1000        0 1003 1 00000000\n"
+        )
+        with tempfile.NamedTemporaryFile("w", suffix=".tcp", delete=False, encoding="utf-8") as f:
+            f.write(proc_tcp_content)
+            tcp_path = f.name
+        try:
+            self.assertTrue(egress_proxy.verify_caller_uid(("127.0.0.1", 0xAFC8), 0x0C38, None, (tcp_path,)))
+            self.assertTrue(egress_proxy.verify_caller_uid(("127.0.0.1", 0xAFC8), 0x0C38, 26040, (tcp_path,)))
+            self.assertTrue(egress_proxy.verify_caller_uid(("127.0.0.1", 0xAFC9), 0x0C38, 26040, (tcp_path,)))
+            self.assertFalse(egress_proxy.verify_caller_uid(("127.0.0.1", 0xAFC8), 0x0C38, 26150, (tcp_path,)))
+            self.assertFalse(egress_proxy.verify_caller_uid(("127.0.0.1", 0xAFCA), 0x0C38, 26040, (tcp_path,)))
+            self.assertFalse(egress_proxy.verify_caller_uid(("127.0.0.1", 0xAFCB), 0x0C38, 26040, (tcp_path,)))
+        finally:
+            os.unlink(tcp_path)
+
+    def test_live_handler_rejects_mismatched_caller_uid_with_403(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "egressMode": "allowlist",
+                    "allowedDomains": ["localhost"],
+                    "allowedCallerUid": 26040,
+                },
+                f,
+            )
+            cfg_path = f.name
+
+        orig_file = egress_proxy.ALLOWLIST_FILE
+        orig_load = egress_proxy.load_config
+        orig_verify = egress_proxy.verify_caller_uid
+        egress_proxy.ALLOWLIST_FILE = cfg_path
+        egress_proxy.load_config = lambda p=cfg_path: orig_load(p)
+        egress_proxy.verify_caller_uid = lambda *args, **kwargs: False
+
+        proxy_srv = egress_proxy.ThreadingHTTPServer(("127.0.0.1", 0), egress_proxy.EgressProxyHandler)
+        proxy_port = proxy_srv.server_address[1]
+        threading.Thread(target=proxy_srv.serve_forever, daemon=True).start()
+        try:
+            with socket.create_connection(("127.0.0.1", proxy_port), timeout=5) as s:
+                s.sendall(b"CONNECT localhost:443 HTTP/1.1\r\nHost: localhost:443\r\n\r\n")
+                resp = s.recv(4096).decode("utf-8", errors="replace")
+            self.assertIn("403", resp.splitlines()[0])
+        finally:
+            proxy_srv.shutdown()
+            proxy_srv.server_close()
+            egress_proxy.ALLOWLIST_FILE = orig_file
+            egress_proxy.load_config = orig_load
+            egress_proxy.verify_caller_uid = orig_verify
+            os.unlink(cfg_path)
+
 
 if __name__ == "__main__":
     unittest.main()

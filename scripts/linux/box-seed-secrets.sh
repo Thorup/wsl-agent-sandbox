@@ -24,10 +24,12 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 policy_file = sys.argv[1]
 argv = sys.argv[2:]
@@ -47,6 +49,18 @@ AGENT_NAME = policy["agentUser"]["name"]
 AGENT_UID = int(policy["agentUser"]["uid"])
 AGENT_GID = int(policy["agentUser"]["gid"])
 AGENT_HOME = f"/home/{AGENT_NAME}"
+
+def deterministic_proxy_ports(uid):
+    uid = int(uid)
+    if uid == 26040:
+        return 3128, 3129
+    if 26100 <= uid <= 26998:
+        egress = 13000 + (uid - 26100) * 2
+    else:
+        egress = 15000 + ((uid * 31) % 8000) * 2
+    return egress, egress + 1
+
+EGRESS_PROXY_PORT, CRED_PROXY_PORT = deterministic_proxy_ports(AGENT_UID)
 
 STATE_DIR = os.path.join(AGENT_HOME, ".config", "wsl-agent-sandbox")
 KEYS_DIR = os.path.join(STATE_DIR, "keys")
@@ -1761,18 +1775,87 @@ def load_credential_proxy_routes():
     except (OSError, ValueError):
         return {}
 
+def _find_listening_sockets(port):
+    hex_port = f"{int(port):04X}"
+    found = []
+    for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        except OSError:
+            continue
+        for line in lines[1:]:
+            parts = line.split()
+            if len(parts) < 10:
+                continue
+            local_addr = parts[1].upper()
+            state = parts[3].upper()
+            if state == "0A" and local_addr.endswith(":" + hex_port):
+                try:
+                    found.append((local_addr, int(parts[7]), parts[9]))
+                except ValueError:
+                    pass
+    return found
+
+def _kill_socket_inodes(inodes):
+    if not inodes:
+        return
+    targets = {f"socket:[{ino}]" for ino in inodes}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        fd_dir = f"/proc/{entry}/fd"
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                if os.readlink(f"{fd_dir}/{fd}") in targets:
+                    os.kill(int(entry), signal.SIGKILL)
+                    break
+            except OSError:
+                pass
+
 def sync_credential_proxy(routes):
     has_systemd = os.path.isdir("/run/systemd/system")
     if routes:
         tmp_path = f"{PROXY_CFG_FILE}.tmp.{os.getpid()}"
         with open(tmp_path, "w", encoding="utf-8") as pf:
-            json.dump({"routes": routes}, pf, indent=2)
+            json.dump({
+                "listenPort": CRED_PROXY_PORT,
+                "allowedCallerUid": AGENT_UID,
+                "routes": routes,
+            }, pf, indent=2)
         os.chmod(tmp_path, 0o600)
         os.replace(tmp_path, PROXY_CFG_FILE)
         if has_systemd:
+            squatters = [x for x in _find_listening_sockets(CRED_PROXY_PORT) if x[1] != 0]
+            if squatters:
+                _kill_socket_inodes([x[2] for x in squatters])
+                time.sleep(0.3)
+                remaining = [x for x in _find_listening_sockets(CRED_PROXY_PORT) if x[1] != 0]
+                if remaining:
+                    raise RuntimeError(
+                        f"SECURITY ERROR: non-root process (uid={remaining[0][1]}) is squatting on 127.0.0.1:{CRED_PROXY_PORT}"
+                    )
             subprocess.run(["systemctl", "daemon-reload"], check=True)
             subprocess.run(["systemctl", "enable", "credential-proxy.service"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             subprocess.run(["systemctl", "restart", "credential-proxy.service"], check=True)
+            hex_port = f"{CRED_PROXY_PORT:04X}"
+            deadline = time.monotonic() + 3.0
+            verified = False
+            while time.monotonic() < deadline:
+                active = subprocess.run(["systemctl", "is-active", "--quiet", "credential-proxy.service"], check=False).returncode == 0
+                root_listen = any(addr == f"0100007F:{hex_port}" and uid == 0 for addr, uid, _ in _find_listening_sockets(CRED_PROXY_PORT))
+                if active and root_listen:
+                    verified = True
+                    break
+                time.sleep(0.1)
+            if not verified:
+                raise RuntimeError(
+                    f"credential-proxy.service failed to bind 127.0.0.1:{CRED_PROXY_PORT} as root within 3s"
+                )
     else:
         remove_file_quiet(PROXY_CFG_FILE)
         if has_systemd:
