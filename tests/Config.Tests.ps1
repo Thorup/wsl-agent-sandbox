@@ -44,7 +44,7 @@ function Copy-Config {
 
 Write-Host "=== Running Config.ps1 Automated Tests ==="
 
-$baseCfg = Read-BoxConfig -ConfigPath (Join-Path $RepoRoot 'box.json')
+$baseCfg = Read-BoxConfig -ConfigPath (Join-Path $RepoRoot 'box.json') -IgnoreLocalOverride
 Assert-True "Default box.json parses and validates cleanly" ($baseCfg.distroName -eq 'wsl-agent-sandbox')
 Assert-True "Default installDir matches distroName" ($baseCfg.installDir -eq '%LOCALAPPDATA%\WSL\wsl-agent-sandbox')
 Assert-True "Default sharedFolders is empty (deny-all)" (@($baseCfg.sharedFolders).Count -eq 0)
@@ -232,6 +232,11 @@ try {
     Assert-True "Get-BoxLocalOverridePath ignores box.local.json for non-box.json ConfigPath" ($null -eq (Get-BoxLocalOverridePath -ConfigPath $customFile))
     $customCfg = Read-BoxConfig -ConfigPath $customFile
     Assert-True "Read-BoxConfig on custom.json does not merge adjacent box.local.json" ($customCfg.distroName -eq 'wsl-agent-sandbox')
+
+    # -IgnoreLocalOverride skips adjacent box.local.json on box.json
+    [System.IO.File]::WriteAllText($localFile, (@{ ide = @{ configureRemoteWsl = $true } } | ConvertTo-Json -Depth 4), (New-Object System.Text.UTF8Encoding($false)))
+    $ignoredOvCfg = Read-BoxConfig -ConfigPath $baseFile -IgnoreLocalOverride
+    Assert-True "Read-BoxConfig -IgnoreLocalOverride ignores adjacent box.local.json" (-not [bool]$ignoredOvCfg.ide.configureRemoteWsl)
 } finally {
     if (Test-Path -LiteralPath $tmpCfgDir) {
         Remove-Item -LiteralPath $tmpCfgDir -Recurse -Force
@@ -374,11 +379,18 @@ Assert-Throws "Rejects out-of-range resources.tasksMax" {
     Assert-BoxConfigValid -Config $c
 } 'must be between 32 and 65536'
 
-# Named profile isolation tests
-$profWork = Resolve-BoxProfileConfig -RepoRoot $RepoRoot -Profile 'work'
-$profOss = Resolve-BoxProfileConfig -RepoRoot $RepoRoot -Profile 'untrusted'
-Assert-True "Profile 'work' derives unique distroName and isolated UID" ($profWork.distroName -eq 'wsl-agent-sandbox-work' -and $profWork.installDir -eq '%LOCALAPPDATA%\WSL\wsl-agent-sandbox-work' -and $profWork.agentUser.uid -ge 26100 -and $profWork.agentUser.uid -ne 26040)
-Assert-True "Distinct profiles allocate non-colliding UIDs" ($profWork.agentUser.uid -ne $profOss.agentUser.uid)
+# Named profile isolation tests (run in clean temp copy of box.json without box.local.json)
+$tmpCleanProfRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("wsl-box-cleanprof-test-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
+try {
+    New-Item -ItemType Directory -Path $tmpCleanProfRoot -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $RepoRoot 'box.json') -Destination (Join-Path $tmpCleanProfRoot 'box.json')
+    $profWork = Resolve-BoxProfileConfig -RepoRoot $tmpCleanProfRoot -Profile 'work'
+    $profOss = Resolve-BoxProfileConfig -RepoRoot $tmpCleanProfRoot -Profile 'untrusted'
+    Assert-True "Profile 'work' derives unique distroName and isolated UID" ($profWork.distroName -eq 'wsl-agent-sandbox-work' -and $profWork.installDir -eq '%LOCALAPPDATA%\WSL\wsl-agent-sandbox-work' -and $profWork.agentUser.uid -ge 26100 -and $profWork.agentUser.uid -ne 26040)
+    Assert-True "Distinct profiles allocate non-colliding UIDs" ($profWork.agentUser.uid -ne $profOss.agentUser.uid)
+} finally {
+    Remove-Item -LiteralPath $tmpCleanProfRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
 
 $tmpProfRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("wsl-box-prof-test-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
 try {
@@ -506,6 +518,333 @@ Assert-True "No Docker host/BuildKit advisories when forceInternalNetwork is tru
 $disabledDockerCfg = Copy-Config $baseCfg
 $disabledDockerCfg.docker.enabled = $false
 Assert-True "No Docker advisories when docker.enabled is false" (@(Get-DockerSecurityAdvisories -Config $disabledDockerCfg).Count -eq 0)
+
+# Strict unknown-property rejection across all config sections
+Assert-Throws "Rejects unknown property at box.json root" {
+    $c = Copy-Config $baseCfg
+    $c | Add-Member -NotePropertyName 'unknownRootProp' -NotePropertyValue $true -Force
+    Assert-BoxConfigValid -Config $c
+} 'Unknown property'
+
+Assert-Throws "Rejects unknown property in agentUser" {
+    $c = Copy-Config $baseCfg
+    $c.agentUser | Add-Member -NotePropertyName 'shell' -NotePropertyValue '/bin/bash' -Force
+    Assert-BoxConfigValid -Config $c
+} 'Unknown property'
+
+Assert-Throws "Rejects unknown property in image" {
+    $c = Copy-Config $baseCfg
+    $c.image | Add-Member -NotePropertyName 'distroTag' -NotePropertyValue 'latest' -Force
+    Assert-BoxConfigValid -Config $c
+} 'Unknown property'
+
+Assert-Throws "Rejects unknown property in sharedFolders[*]" {
+    $c = Copy-Config $baseCfg
+    $c.sharedFolders = @([pscustomobject]@{ name = 'docs'; windowsPath = 'C:\Users\demo\docs'; mode = 'ro'; extraKey = 'x' })
+    Assert-BoxConfigValid -Config $c
+} 'Unknown property'
+
+Assert-Throws "Rejects unknown property in network" {
+    $c = Copy-Config $baseCfg
+    $c.network | Add-Member -NotePropertyName 'allowLan' -NotePropertyValue $false -Force
+    Assert-BoxConfigValid -Config $c
+} 'Unknown property'
+
+Assert-Throws "Rejects unknown property in network.allowedHostPorts[*]" {
+    $c = Copy-Config $baseCfg
+    $c.network.allowedHostPorts = @([pscustomobject]@{ port = 8080; protocol = 'tcp'; note = 'typo' })
+    Assert-BoxConfigValid -Config $c
+} 'Unknown property'
+
+Assert-Throws "Rejects unknown property in docker" {
+    $c = Copy-Config $baseCfg
+    $c.docker | Add-Member -NotePropertyName 'allowPrivileged' -NotePropertyValue $true -Force
+    Assert-BoxConfigValid -Config $c
+} 'Unknown property'
+
+Assert-Throws "Rejects unknown property in packages" {
+    $c = Copy-Config $baseCfg
+    $c.packages | Add-Member -NotePropertyName 'installDocker' -NotePropertyValue $true -Force
+    Assert-BoxConfigValid -Config $c
+} 'Unknown property'
+
+# Package install* boolean type validation & dotnetChannels validation
+Assert-Throws "Rejects non-boolean string packages.installDockerCli = 'false'" {
+    $c = Copy-Config $baseCfg
+    $c.packages.installDockerCli = 'false'
+    Assert-BoxConfigValid -Config $c
+} 'must be a boolean'
+
+Assert-Throws "Rejects 1-element array @(`$true) on packages.installDockerCli" {
+    $c = Copy-Config $baseCfg
+    $c.packages.installDockerCli = @($true)
+    Assert-BoxConfigValid -Config $c
+} 'must be a boolean'
+
+Assert-Throws "Rejects JSON [true] on packages.installDockerCli" {
+    $raw = Get-Content -LiteralPath (Join-Path $RepoRoot 'box.json') -Raw -Encoding UTF8
+    $c = $raw | ConvertFrom-Json
+    $c.packages.installDockerCli = @($true)
+    $c = ($c | ConvertTo-Json -Depth 10 | ConvertFrom-Json)
+    Assert-BoxConfigValid -Config $c
+} 'must be a boolean'
+
+# Case-sensitive property matching (parity with box.schema.json)
+Assert-Throws "Rejects wrong-case root property DistroName" {
+    $c = Copy-Config $baseCfg
+    $c | Add-Member -NotePropertyName 'DistroName' -NotePropertyValue 'dupe' -Force
+    Assert-BoxConfigValid -Config $c
+} 'Unknown property'
+
+Assert-Throws "Rejects wrong-case docker.defaultLimits property MemoryBytes" {
+    $c = Copy-Config $baseCfg
+    $c.docker | Add-Member -NotePropertyName 'defaultLimits' -NotePropertyValue ([pscustomobject]@{ MemoryBytes = 4194304 }) -Force
+    Assert-BoxConfigValid -Config $c
+} 'Unknown property'
+
+Assert-Throws "Rejects wrong-case secrets property ManifestPath" {
+    $c = Copy-Config $baseCfg
+    $c | Add-Member -NotePropertyName 'secrets' -NotePropertyValue ([pscustomobject]@{ ManifestPath = 'C:\secrets.json' }) -Force
+    Assert-BoxConfigValid -Config $c
+} 'only allows non-secret pointer property'
+
+# Non-packages boolean field validation (string 'false' and 1-element array @($true))
+Assert-Throws "Rejects string 'false' on network.blockHostAndLan" {
+    $c = Copy-Config $baseCfg
+    $c.network.blockHostAndLan = 'false'
+    Assert-BoxConfigValid -Config $c
+} 'network\.blockHostAndLan must be a boolean'
+
+Assert-Throws "Rejects 1-element array @(`$true) on network.blockHostAndLan" {
+    $c = Copy-Config $baseCfg
+    $c.network.blockHostAndLan = @($true)
+    Assert-BoxConfigValid -Config $c
+} 'network\.blockHostAndLan must be a boolean'
+
+Assert-Throws "Rejects string 'false' on docker.enabled" {
+    $c = Copy-Config $baseCfg
+    $c.docker.enabled = 'false'
+    Assert-BoxConfigValid -Config $c
+} 'docker\.enabled must be a boolean'
+
+Assert-Throws "Rejects 1-element array @(`$true) on docker.enabled" {
+    $c = Copy-Config $baseCfg
+    $c.docker.enabled = @($true)
+    Assert-BoxConfigValid -Config $c
+} 'docker\.enabled must be a boolean'
+
+Assert-Throws "Rejects string 'false' on sharedFolders[0].allowDockerBind" {
+    $c = Copy-Config $baseCfg
+    $c.sharedFolders = @([pscustomobject]@{ name = 'docs'; windowsPath = 'C:\Users\demo\docs'; mode = 'ro'; allowDockerBind = 'false' })
+    Assert-BoxConfigValid -Config $c
+} 'allowDockerBind must be a boolean'
+
+Assert-Throws "Rejects string 'false' on docker.forceInternalNetwork" {
+    $c = Copy-Config $baseCfg
+    $c.docker | Add-Member -NotePropertyName 'forceInternalNetwork' -NotePropertyValue 'false' -Force
+    Assert-BoxConfigValid -Config $c
+} 'docker\.forceInternalNetwork must be a boolean'
+
+$dotnetOkCfg = Copy-Config $baseCfg
+$dotnetOkCfg.packages | Add-Member -NotePropertyName 'dotnetChannels' -NotePropertyValue @('8.0', '9.0') -Force
+Assert-BoxConfigValid -Config $dotnetOkCfg
+Assert-True "Accepts valid packages.dotnetChannels array ['8.0', '9.0']" $true
+
+$dotnetSingleJsonCfg = Copy-Config $baseCfg
+$dotnetSingleJsonCfg.packages | Add-Member -NotePropertyName 'dotnetChannels' -NotePropertyValue ([string[]]@('8.0')) -Force
+$dotnetSingleJsonCfg = ($dotnetSingleJsonCfg | ConvertTo-Json -Depth 10 | ConvertFrom-Json)
+Assert-BoxConfigValid -Config $dotnetSingleJsonCfg
+Assert-True "Accepts single-element JSON packages.dotnetChannels array ['8.0']" $true
+
+$dotnetEmptyCfg = Copy-Config $baseCfg
+$dotnetEmptyCfg.packages | Add-Member -NotePropertyName 'dotnetChannels' -NotePropertyValue @() -Force
+Assert-BoxConfigValid -Config $dotnetEmptyCfg
+Assert-True "Accepts empty packages.dotnetChannels array []" $true
+
+Assert-Throws "Rejects scalar string packages.dotnetChannels = '8.0'" {
+    $c = Copy-Config $baseCfg
+    $c.packages | Add-Member -NotePropertyName 'dotnetChannels' -NotePropertyValue '8.0' -Force
+    Assert-BoxConfigValid -Config $c
+} 'must be an array'
+
+Assert-Throws "Rejects dictionary packages.dotnetChannels" {
+    $c = Copy-Config $baseCfg
+    $c.packages | Add-Member -NotePropertyName 'dotnetChannels' -NotePropertyValue @{ channel = '8.0' } -Force
+    Assert-BoxConfigValid -Config $c
+} 'must be an array'
+
+Assert-Throws "Rejects invalid major-only packages.dotnetChannels entry '8'" {
+    $c = Copy-Config $baseCfg
+    $c.packages | Add-Member -NotePropertyName 'dotnetChannels' -NotePropertyValue ([string[]]@('8')) -Force
+    Assert-BoxConfigValid -Config $c
+} 'Invalid packages\.dotnetChannels'
+
+Assert-Throws "Rejects non-numeric packages.dotnetChannels entry 'LTS'" {
+    $c = Copy-Config $baseCfg
+    $c.packages | Add-Member -NotePropertyName 'dotnetChannels' -NotePropertyValue ([string[]]@('LTS')) -Force
+    Assert-BoxConfigValid -Config $c
+} 'Invalid packages\.dotnetChannels'
+
+Assert-Throws "Rejects numeric float packages.dotnetChannels entry 8.0" {
+    $c = Copy-Config $baseCfg
+    $c.packages | Add-Member -NotePropertyName 'dotnetChannels' -NotePropertyValue ([double[]]@(8.0)) -Force
+    Assert-BoxConfigValid -Config $c
+} 'Invalid packages\.dotnetChannels'
+
+Assert-Throws "Rejects duplicate packages.dotnetChannels entries" {
+    $c = Copy-Config $baseCfg
+    $c.packages | Add-Member -NotePropertyName 'dotnetChannels' -NotePropertyValue @('8.0', '8.0') -Force
+    Assert-BoxConfigValid -Config $c
+} 'Duplicate packages\.dotnetChannels'
+
+# Validate all examples/presets/*.local.json merged over box.json
+$presetFiles = @(Get-ChildItem -Path (Join-Path $RepoRoot 'examples\presets') -Filter '*.local.json' -File | Sort-Object Name)
+Assert-True "Discovers at least one preset under examples/presets/*.local.json" ($presetFiles.Count -gt 0)
+foreach ($presetFile in $presetFiles) {
+    $mergedPreset = Read-BoxConfig -ConfigPath (Join-Path $RepoRoot 'box.json') -LocalOverridePath $presetFile.FullName -IgnoreLocalOverride
+    Assert-True "Preset $($presetFile.Name) merges over box.json and validates cleanly" ($null -ne $mergedPreset -and $mergedPreset.distroName -eq 'wsl-agent-sandbox')
+}
+
+# Validate direct [hashtable] (IDictionary) inputs to Assert-BoxConfigValid (no PSObject.Properties bypass or 1-element unrolling)
+function Get-ValidHashtableConfig {
+    return @{
+        distroName    = 'wsl-agent-sandbox'
+        installDir    = '%LOCALAPPDATA%\WSL\wsl-agent-sandbox'
+        agentUser     = @{ name = 'agent'; uid = 26040; gid = 26040 }
+        image         = @{ release = '26.04'; arch = 'amd64'; cacheDir = '%LOCALAPPDATA%\WSL\cache' }
+        sharedFolders = @()
+        network       = @{
+            blockHostAndLan  = $true
+            allowedHostPorts = @()
+            blockedCidrs     = @('10.0.0.0/8')
+            logDrops         = $true
+            egressMode       = 'allowlist'
+            allowedDomains   = @('api.github.com')
+        }
+        docker        = @{
+            enabled               = $true
+            allowBindPrefixes     = @('/home/agent')
+            allowBuildKit         = $true
+            allowCapAdd           = @()
+            allowedPublishedPorts = @(8080)
+            forceInternalNetwork  = $false
+            defaultLimits         = @{ memoryBytes = [int64]536870912; nanoCpus = [int64]1000000000; pidsLimit = 128 }
+            maxLimits             = @{ memoryBytes = [int64]1073741824; nanoCpus = [int64]2000000000; pidsLimit = 256 }
+            allowedRegistries     = @('ghcr.io')
+        }
+        packages      = @{
+            apt                      = @('jq')
+            installDockerCli         = $true
+            dotnetChannels           = @('8.0')
+            configureVsCodeRemoteWsl = $false
+        }
+        secrets       = @{ manifestPath = '%USERPROFILE%\.wsl-agent-sandbox\secrets.json' }
+        resources     = @{ memoryMax = '8G'; cpuQuota = '400%'; tasksMax = 512 }
+        ide           = @{ configureRemoteWsl = $true }
+    }
+}
+
+$validHashtableCfg = Get-ValidHashtableConfig
+Assert-BoxConfigValid -Config $validHashtableCfg
+Assert-True "Accepts valid full [hashtable] config with 1-element arrays" $true
+Assert-True "Get-DockerSecurityAdvisories handles [hashtable] config" (@(Get-DockerSecurityAdvisories -Config $validHashtableCfg).Count -eq 1)
+
+Assert-Throws "Rejects [hashtable] network.egressMode = 'bogus'" {
+    $h = Get-ValidHashtableConfig
+    $h.network.egressMode = 'bogus'
+    Assert-BoxConfigValid -Config $h
+} 'egressMode'
+
+Assert-Throws "Rejects [hashtable] network.allowedDomains whitespace entry" {
+    $h = Get-ValidHashtableConfig
+    $h.network.allowedDomains = @('bad domain')
+    Assert-BoxConfigValid -Config $h
+} 'allowedDomains'
+
+Assert-Throws "Rejects [hashtable] docker.allowedPublishedPorts out of range" {
+    $h = Get-ValidHashtableConfig
+    $h.docker.allowedPublishedPorts = @(70000)
+    Assert-BoxConfigValid -Config $h
+} 'allowedPublishedPorts'
+
+Assert-Throws "Rejects [hashtable] docker.defaultLimits.MemoryBytes wrong case" {
+    $h = Get-ValidHashtableConfig
+    $h.docker.defaultLimits = @{ MemoryBytes = [int64]4194304 }
+    Assert-BoxConfigValid -Config $h
+} 'Unknown property'
+
+Assert-Throws "Rejects [hashtable] docker.defaultLimits.memoryBytes below minimum" {
+    $h = Get-ValidHashtableConfig
+    $h.docker.defaultLimits = @{ memoryBytes = 100 }
+    Assert-BoxConfigValid -Config $h
+} 'must be >='
+
+Assert-Throws "Rejects [hashtable] docker.defaultLimits exceeding maxLimits" {
+    $h = Get-ValidHashtableConfig
+    $h.docker.defaultLimits = @{ memoryBytes = [int64]16777216 }
+    $h.docker.maxLimits = @{ memoryBytes = [int64]8388608 }
+    Assert-BoxConfigValid -Config $h
+} 'exceeds docker\.maxLimits'
+
+Assert-Throws "Rejects [hashtable] docker.allowedRegistries URL" {
+    $h = Get-ValidHashtableConfig
+    $h.docker.allowedRegistries = @('https://evil.com/x')
+    Assert-BoxConfigValid -Config $h
+} 'Invalid docker\.allowedRegistries'
+
+Assert-Throws "Rejects [hashtable] secrets.ManifestPath wrong case" {
+    $h = Get-ValidHashtableConfig
+    $h.secrets = @{ ManifestPath = 'C:\secrets.json' }
+    Assert-BoxConfigValid -Config $h
+} 'only allows non-secret pointer property'
+
+Assert-Throws "Rejects [hashtable] secrets.rawToken unknown key" {
+    $h = Get-ValidHashtableConfig
+    $h.secrets = @{ rawToken = 'abc' }
+    Assert-BoxConfigValid -Config $h
+} 'only allows non-secret pointer property'
+
+Assert-Throws "Rejects [hashtable] resources.MemoryMax wrong case" {
+    $h = Get-ValidHashtableConfig
+    $h.resources = @{ MemoryMax = '8G' }
+    Assert-BoxConfigValid -Config $h
+} 'Unknown property'
+
+Assert-Throws "Rejects [hashtable] resources.memoryMax invalid format" {
+    $h = Get-ValidHashtableConfig
+    $h.resources = @{ memoryMax = 'bad' }
+    Assert-BoxConfigValid -Config $h
+} 'Invalid resources\.memoryMax'
+
+Assert-Throws "Rejects [hashtable] resources.cpuQuota invalid format" {
+    $h = Get-ValidHashtableConfig
+    $h.resources = @{ cpuQuota = 'bad' }
+    Assert-BoxConfigValid -Config $h
+} 'Invalid resources\.cpuQuota'
+
+Assert-Throws "Rejects [hashtable] resources.tasksMax out of range" {
+    $h = Get-ValidHashtableConfig
+    $h.resources = @{ tasksMax = 5 }
+    Assert-BoxConfigValid -Config $h
+} 'between 32 and 65536'
+
+Assert-Throws "Rejects [hashtable] ide.ConfigureRemoteWsl wrong case" {
+    $h = Get-ValidHashtableConfig
+    $h.ide = @{ ConfigureRemoteWsl = $true }
+    Assert-BoxConfigValid -Config $h
+} 'Unknown property'
+
+Assert-Throws "Rejects [hashtable] ide.configureRemoteWsl non-boolean" {
+    $h = Get-ValidHashtableConfig
+    $h.ide = @{ configureRemoteWsl = 'false' }
+    Assert-BoxConfigValid -Config $h
+} 'ide\.configureRemoteWsl must be a boolean'
+
+Assert-Throws "Rejects [hashtable] packages.installDockerCli 1-element array @(`$true)" {
+    $h = Get-ValidHashtableConfig
+    $h.packages.installDockerCli = @($true)
+    Assert-BoxConfigValid -Config $h
+} 'packages\.installDockerCli must be a boolean'
 
 Write-Host ""
 Write-Host "=== Config.Tests.ps1 Summary: PASS=$script:Passed FAIL=$script:Failed ==="

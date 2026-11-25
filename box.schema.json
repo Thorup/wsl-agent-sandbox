@@ -2,6 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "wsl-agent-sandbox Configuration (Hardened Ubuntu 26.04 LTS WSL2 Sandbox)",
   "type": "object",
+  "additionalProperties": false,
   "required": [
     "distroName",
     "installDir",
@@ -28,6 +29,7 @@
     },
     "agentUser": {
       "type": "object",
+      "additionalProperties": false,
       "required": ["name", "uid", "gid"],
       "properties": {
         "name": {
@@ -49,6 +51,7 @@
     },
     "image": {
       "type": "object",
+      "additionalProperties": false,
       "required": ["release", "arch", "cacheDir"],
       "properties": {
         "release": {
@@ -77,6 +80,7 @@
       "description": "Explicit allowlist of Windows directories mounted under /shared/<name> inside WSL.",
       "items": {
         "type": "object",
+        "additionalProperties": false,
         "required": ["name", "windowsPath", "mode"],
         "properties": {
           "name": {
@@ -101,6 +105,7 @@
     "network": {
       "type": "object",
       "description": "Per-UID nftables and mirrored-loopback isolation policy for the agent user.",
+      "additionalProperties": false,
       "required": ["blockHostAndLan", "allowedHostPorts", "blockedCidrs"],
       "properties": {
         "blockHostAndLan": {
@@ -112,6 +117,7 @@
           "description": "Explicit Windows host ports (e.g., kubectl port-forward, SSH tunnels, local Ollama) reachable by the agent user. Works directly on localhost in mirrored mode; in NAT mode bind the Windows listener to the vEthernet (WSL) IP or 0.0.0.0.",
           "items": {
             "type": "object",
+            "additionalProperties": false,
             "required": ["port", "protocol"],
             "properties": {
               "port": {
@@ -158,6 +164,7 @@
     },
     "docker": {
       "type": "object",
+      "additionalProperties": false,
       "required": ["enabled", "allowBindPrefixes", "allowBuildKit", "allowCapAdd"],
       "properties": {
         "enabled": {
@@ -213,6 +220,7 @@
         "defaultLimits": {
           "type": "object",
           "description": "Default resource caps injected into HostConfig if unset.",
+          "additionalProperties": false,
           "properties": {
             "memoryBytes": { "type": "integer", "minimum": 4194304 },
             "nanoCpus": { "type": "integer", "minimum": 1000000 },
@@ -222,6 +230,7 @@
         "maxLimits": {
           "type": "object",
           "description": "Maximum allowed resource caps on container create/update.",
+          "additionalProperties": false,
           "properties": {
             "memoryBytes": { "type": "integer", "minimum": 4194304 },
             "nanoCpus": { "type": "integer", "minimum": 1000000 },
@@ -237,6 +246,7 @@
     },
     "packages": {
       "type": "object",
+      "additionalProperties": false,
       "required": ["apt"],
       "properties": {
         "apt": {

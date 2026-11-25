@@ -75,14 +75,26 @@ jobs:
         run: |
           python3 -m pip install --quiet jsonschema
           python3 - <<'PYEOF'
+          import copy
           import glob
           import json
+          import sys
           import jsonschema
+
+          def merge_box_config(base, override):
+              merged = copy.deepcopy(base)
+              for key, val in override.items():
+                  if isinstance(merged.get(key), dict) and isinstance(val, dict):
+                      merged[key] = merge_box_config(merged[key], val)
+                  else:
+                      merged[key] = copy.deepcopy(val)
+              return merged
 
           pairs = [
               ("box.json", "box.schema.json"),
               ("examples/secrets.example.json", "secrets.schema.json"),
           ]
+          loaded = {}
           for data_path, schema_path in pairs:
               with open(schema_path, encoding="utf-8") as f:
                   schema = json.load(f)
@@ -90,7 +102,23 @@ jobs:
                   data = json.load(f)
               jsonschema.Draft7Validator.check_schema(schema)
               jsonschema.validate(instance=data, schema=schema)
+              loaded[data_path] = (data, schema)
               print(f"[PASS] {data_path} validates against {schema_path}")
+
+          base_box, box_schema = loaded["box.json"]
+          preset_paths = sorted(glob.glob("examples/presets/*.local.json"))
+          if not preset_paths:
+              print("ERROR: No preset files found under examples/presets/*.local.json", file=sys.stderr)
+              sys.exit(1)
+          for preset_path in preset_paths:
+              with open(preset_path, encoding="utf-8") as f:
+                  preset_override = json.load(f)
+              if not isinstance(preset_override, dict):
+                  print(f"ERROR: Preset {preset_path} must be a JSON object", file=sys.stderr)
+                  sys.exit(1)
+              merged_preset = merge_box_config(base_box, preset_override)
+              jsonschema.validate(instance=merged_preset, schema=box_schema)
+              print(f"[PASS] {preset_path} (merged with box.json) validates against box.schema.json")
 
           for pkg_json in sorted(glob.glob("packaging/**/*.json", recursive=True)):
               with open(pkg_json, encoding="utf-8") as f:
