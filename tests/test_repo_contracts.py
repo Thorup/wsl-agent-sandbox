@@ -208,7 +208,7 @@ class TestRepoContracts(unittest.TestCase):
 
         # allowlist mode must use drop_action (so log_and_drop is used when logDrops=true)
         allowlist_match = re.search(
-            r'if egress_mode == "allowlist":\s*\n(?:[^\n]*#[^\n]*\n)*\s*lines\.append\(([^)]+)\)',
+            r'if egress_mode == "allowlist"(?:\s+and\s+not\s+maintenance_egress_open)?:\s*\n(?:[^\n]*#[^\n]*\n)*\s*lines\.append\(([^)]+)\)',
             hardening_sh,
         )
         self.assertIsNotNone(allowlist_match, "Could not locate egress_mode == 'allowlist' drop rule in box-hardening.sh")

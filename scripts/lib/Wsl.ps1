@@ -211,6 +211,6 @@ function Sync-HostIpsIfChanged {
     if ($currentNorm -ne $desiredNorm) {
         Write-Host "[sync] Windows host IPs changed; refreshing host_ips.txt and reloading box-hardening.sh..."
         Copy-TextToWsl -DistroName $distro -Content $desired -RemotePath '/etc/wsl-agent-sandbox/host_ips.txt' -Mode '0600'
-        Invoke-WslRootBash -DistroName $distro -Script '/usr/local/sbin/box-hardening.sh'
+        Invoke-WslRootBash -DistroName $distro -Script '/usr/local/sbin/box-hardening.sh && if grep -q -- "--render-env-only" /usr/local/sbin/box-apply-policy.sh 2>/dev/null; then /usr/local/sbin/box-apply-policy.sh --render-env-only; fi'
     }
 }

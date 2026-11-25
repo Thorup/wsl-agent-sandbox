@@ -1285,13 +1285,14 @@ done
 for _ in 1 2 3 4; do
   ip -6 rule del pref 0 to ::1/128 uidrange "${agentUid}-${agentUid}" lookup local 2>/dev/null || break
 done
-BIND_DIR="/run/box-root/mnt-wsl/box-binds/${distro}"
-if [ -d "`$BIND_DIR" ]; then
-  findmnt -rn -o TARGET -R "`$BIND_DIR" 2>/dev/null | sort -r | while IFS= read -r mp; do
-    umount -l "`$mp" 2>/dev/null || true
-  done
-  rm -rf "`$BIND_DIR" 2>/dev/null || true
-fi
+for BIND_DIR in "/run/box-root/mnt-wsl/box-binds/${distro}" "/mnt/wsl/box-binds/${distro}"; do
+  if [ -d "`$BIND_DIR" ]; then
+    findmnt -rn -o TARGET -R "`$BIND_DIR" 2>/dev/null | sort -r | while IFS= read -r mp; do
+      umount -l "`$mp" 2>/dev/null || true
+    done
+    rm -rf "`$BIND_DIR" 2>/dev/null || true
+  fi
+done
 "@
         try {
             Invoke-WslRootBash -DistroName $distro -Script $cleanupScript

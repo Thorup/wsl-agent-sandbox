@@ -343,9 +343,9 @@ def render_nftables_rules(has_loopback0, probe_log_support=True):
             cidrs = ", ".join(sorted(set(blocked_v6)))
             lines.append(f"        ip6 daddr {{ {cidrs} }} {drop_action}")
 
+    drop_action = "jump log_and_drop" if log_drops else "drop"
     if egress_mode == "allowlist" and not maintenance_egress_open:
         # Loopback (127.0.0.1:3128 egress-proxy) is already permitted above via 'oifname "lo" accept'.
-        drop_action = "jump log_and_drop" if log_drops else "drop"
         lines.append(f"        {drop_action}")
 
     lines.extend([
