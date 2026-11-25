@@ -174,8 +174,8 @@ agent_uid = int(policy["agentUser"]["uid"])
 agent_gid = int(policy["agentUser"]["gid"])
 agent_home = f"/home/{agent_name}"
 
-def run(cmd, check=True):
-    return subprocess.run(cmd, check=check, text=True, capture_output=True)
+def run(cmd, check=True, pass_fds=()):
+    return subprocess.run(cmd, check=check, text=True, capture_output=True, pass_fds=pass_fds)
 
 def is_mountpoint(path):
     return subprocess.run(["mountpoint", "-q", path]).returncode == 0
@@ -578,7 +578,7 @@ try:
             if is_mountpoint(mirror_local):
                 run(["mount", "--make-rprivate", mirror_local], check=False)
                 run(["umount", "-l", mirror_local], check=False)
-            run(["mount", "--bind", f"/proc/self/fd/{pinned_fd}", mirror_local])
+            run(["mount", "--bind", f"/proc/self/fd/{pinned_fd}", mirror_local], pass_fds=(pinned_fd,))
             bind_mappings.append({
                 "guestPrefix": p_clean,
                 "daemonPrefix": mirror_daemon,
