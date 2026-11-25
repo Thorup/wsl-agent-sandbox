@@ -39,6 +39,7 @@ group = parser.add_mutually_exclusive_group(required=True)
 group.add_argument("--apply", action="store_true", help="Read resolved JSON payload from stdin and seed credentials")
 group.add_argument("--clear", action="store_true", help="Clear managed seeded credentials")
 group.add_argument("--status", action="store_true", help="Print non-sensitive summary of seeded credentials")
+group.add_argument("--sweep-expired", action="store_true", help="Clear any seeded services whose TTL expiresAt timestamp has passed")
 parser.add_argument("--services", default="", help="Comma-separated list of services (for --clear)")
 args = parser.parse_args(argv)
 
@@ -1864,16 +1865,94 @@ def sync_credential_proxy(routes):
             subprocess.run(["systemctl", "stop", "credential-proxy.service"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             subprocess.run(["systemctl", "disable", "credential-proxy.service"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+SYSTEMD_UNIT_DIR = os.environ.get("WSL_BOX_SYSTEMD_UNIT_DIR", "/etc/systemd/system")
+TTL_SERVICE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def validate_ttl_service_name(svc_name):
+    if not isinstance(svc_name, str) or not TTL_SERVICE_NAME_RE.match(svc_name):
+        raise ValueError(f"Invalid service name for TTL timer: {svc_name!r}")
+
+
+def install_ttl_timer(svc_name, svc_ttl):
+    """Write persistent systemd timer/service units for TTL expiration and enable the timer."""
+    validate_ttl_service_name(svc_name)
+    exp_dt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=svc_ttl)
+    on_calendar_utc = exp_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+    unit = f"wsl-box-ttl-{svc_name}"
+
+    service_content = (
+        "[Unit]\n"
+        f"Description=wsl-agent-sandbox TTL Credential Expiration ({svc_name})\n\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        f"Environment=WSL_BOX_TTL_ACTIVE_UNIT={unit}.service\n"
+        f"ExecStart=/usr/local/sbin/box-seed-secrets.sh --clear --services {svc_name}\n"
+    )
+    timer_content = (
+        "[Unit]\n"
+        f"Description=wsl-agent-sandbox TTL Timer ({svc_name})\n\n"
+        "[Timer]\n"
+        f"OnCalendar={on_calendar_utc}\n"
+        "Persistent=true\n"
+        "AccuracySec=1s\n\n"
+        "[Install]\n"
+        "WantedBy=timers.target\n"
+    )
+
+    os.makedirs(SYSTEMD_UNIT_DIR, mode=0o755, exist_ok=True)
+    service_path = os.path.join(SYSTEMD_UNIT_DIR, f"{unit}.service")
+    timer_path = os.path.join(SYSTEMD_UNIT_DIR, f"{unit}.timer")
+    for unit_path, content in ((service_path, service_content), (timer_path, timer_content)):
+        with open(unit_path, "w", encoding="utf-8", newline="\n") as uf:
+            uf.write(content)
+        os.chmod(unit_path, 0o644)
+
+    if os.path.isdir("/run/systemd/system"):
+        reload_proc = subprocess.run(
+            ["systemctl", "daemon-reload"],
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        if reload_proc.returncode != 0:
+            raise RuntimeError(
+                f"systemctl daemon-reload failed for {svc_name}: {(reload_proc.stderr or reload_proc.stdout).strip()}"
+            )
+        enable_proc = subprocess.run(
+            ["systemctl", "enable", "--now", f"{unit}.timer"],
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        if enable_proc.returncode != 0:
+            raise RuntimeError(
+                f"systemctl enable --now {unit}.timer failed: {(enable_proc.stderr or enable_proc.stdout).strip()}"
+            )
+    return exp_dt
+
+
 def cancel_ttl_timer(svc_name):
-    if not os.path.isdir("/run/systemd/system"):
-        return
+    """Stop, disable, and remove persistent TTL systemd units for a service."""
+    validate_ttl_service_name(svc_name)
     unit = f"wsl-box-ttl-{svc_name}"
     active_unit = os.environ.get("WSL_BOX_TTL_ACTIVE_UNIT", "")
-    suffixes = (".timer",) if active_unit == f"{unit}.service" else (".timer", ".service")
-    for suffix in suffixes:
-        subprocess.run(["systemctl", "stop", f"{unit}{suffix}"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if suffix == ".timer" or active_unit != f"{unit}.service":
-            subprocess.run(["systemctl", "reset-failed", f"{unit}{suffix}"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    is_self_service = active_unit == f"{unit}.service"
+    has_systemd = os.path.isdir("/run/systemd/system")
+
+    if has_systemd:
+        subprocess.run(["systemctl", "disable", "--now", f"{unit}.timer"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["systemctl", "reset-failed", f"{unit}.timer"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if not is_self_service:
+            subprocess.run(["systemctl", "stop", f"{unit}.service"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["systemctl", "reset-failed", f"{unit}.service"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    remove_file_quiet(os.path.join(SYSTEMD_UNIT_DIR, f"{unit}.timer"))
+    remove_file_quiet(os.path.join(SYSTEMD_UNIT_DIR, f"{unit}.service"))
+    remove_file_quiet(os.path.join(SYSTEMD_UNIT_DIR, "timers.target.wants", f"{unit}.timer"))
+
+    if has_systemd:
+        subprocess.run(["systemctl", "daemon-reload"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 SSH_AGENT_DIR = "/run/box-root/ssh-agent"
 SSH_AGENT_UPSTREAM_SOCK = os.path.join(SSH_AGENT_DIR, "upstream.sock")
@@ -1981,9 +2060,100 @@ def sync_root_ssh_agent_state(agent_services_map):
             subprocess.run(["systemctl", "disable", "ssh-agent-proxy.service"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 # ------------------------------------------------------------------
-# Modes: --status, --clear, --apply
+# Shared revocation & TTL sweep helpers
 # ------------------------------------------------------------------
+def revoke_services(targets, explicit_targets=False, clear_all=False, expired_mode=False):
+    """Clear the given services from disk, credential-proxy, ssh-agent, secrets.env, and state."""
+    state = load_state()
+    svcs = state.get("services", {})
+    cleared_any = False
+    proxy_routes_state = load_credential_proxy_routes()
+    proxy_changed = False
+    ssh_agent_state = load_root_ssh_agent_services()
+    ssh_agent_changed = False
+
+    for name in targets:
+        if name not in CLEARERS:
+            print(f"[seed-secrets] [FAIL] Unknown service: {name}", file=sys.stderr)
+            sys.exit(1)
+        prev_meta = svcs.get(name)
+        cancel_ttl_timer(name)
+        CLEARERS[name](prev_meta)
+        if name in proxy_routes_state:
+            proxy_routes_state.pop(name, None)
+            proxy_changed = True
+        if name in ("git", "ssh"):
+            if name in ssh_agent_state:
+                ssh_agent_state.pop(name, None)
+            ssh_agent_changed = True
+        if name in svcs:
+            svcs.pop(name, None)
+            if expired_mode:
+                print(f"[seed-secrets] [EXPIRED] Auto-cleared expired credentials for {name}")
+            else:
+                print(f"[seed-secrets] [CLEARED] {name}")
+            cleared_any = True
+        elif explicit_targets:
+            print(f"[seed-secrets] [CLEARED] {name} (was not recorded in state)")
+            cleared_any = True
+
+    if proxy_changed or (clear_all and os.path.isfile(PROXY_CFG_FILE)):
+        if clear_all:
+            proxy_routes_state = {}
+        sync_credential_proxy(proxy_routes_state)
+
+    if ssh_agent_changed or (clear_all and (os.path.isfile(SSH_AGENT_ALLOWLIST_FILE) or os.path.exists(SSH_AGENT_UPSTREAM_SOCK))):
+        if clear_all:
+            ssh_agent_state = {}
+        sync_root_ssh_agent_state(ssh_agent_state)
+
+    rebuild_secrets_env()
+    if svcs:
+        save_state(state)
+    else:
+        remove_file_quiet(STATE_FILE)
+
+    if os.path.isfile("/usr/local/sbin/box-sync-context.py"):
+        subprocess.run(["python3", "/usr/local/sbin/box-sync-context.py"], check=False)
+
+    return cleared_any
+
+
+def sweep_expired_services():
+    """Clear any seeded services whose TTL expiresAt timestamp has passed."""
+    state = load_state()
+    svcs = state.get("services", {})
+    if not svcs:
+        return []
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    expired = []
+    for name, meta in list(svcs.items()):
+        if name not in CLEARERS:
+            continue
+        exp_raw = (meta or {}).get("expiresAt")
+        if not exp_raw:
+            continue
+        try:
+            exp_dt = datetime.datetime.strptime(exp_raw, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+        except ValueError:
+            continue
+        if exp_dt <= now_utc:
+            expired.append(name)
+    if not expired:
+        return []
+    revoke_services(expired, explicit_targets=False, clear_all=False, expired_mode=True)
+    return expired
+
+
+# ------------------------------------------------------------------
+# Modes: --status, --sweep-expired, --clear, --apply
+# ------------------------------------------------------------------
+if args.sweep_expired:
+    sweep_expired_services()
+    sys.exit(0)
+
 if args.status:
+    sweep_expired_services()
     state = load_state()
     svcs = state.get("services", {})
     if not svcs:
@@ -2043,7 +2213,8 @@ if args.status:
 if args.clear:
     state = load_state()
     svcs = state.get("services", {})
-    if args.services.strip():
+    explicit_targets = bool(args.services.strip())
+    if explicit_targets:
         targets = [s.strip() for s in args.services.split(",") if s.strip()]
     else:
         targets = list(svcs.keys())
@@ -2051,52 +2222,7 @@ if args.clear:
         if not targets:
             targets = list(CLEARERS.keys())
 
-    cleared_any = False
-    proxy_routes_state = load_credential_proxy_routes()
-    proxy_changed = False
-    ssh_agent_state = load_root_ssh_agent_services()
-    ssh_agent_changed = False
-    for name in targets:
-        if name not in CLEARERS:
-            print(f"[seed-secrets] [FAIL] Unknown service: {name}", file=sys.stderr)
-            sys.exit(1)
-        prev_meta = svcs.get(name)
-        cancel_ttl_timer(name)
-        CLEARERS[name](prev_meta)
-        if name in proxy_routes_state:
-            proxy_routes_state.pop(name, None)
-            proxy_changed = True
-        if name in ("git", "ssh"):
-            if name in ssh_agent_state:
-                ssh_agent_state.pop(name, None)
-            ssh_agent_changed = True
-        if name in svcs:
-            svcs.pop(name, None)
-            print(f"[seed-secrets] [CLEARED] {name}")
-            cleared_any = True
-        elif args.services.strip():
-            print(f"[seed-secrets] [CLEARED] {name} (was not recorded in state)")
-            cleared_any = True
-
-    if proxy_changed or (not args.services.strip() and os.path.isfile(PROXY_CFG_FILE)):
-        if not args.services.strip():
-            proxy_routes_state = {}
-        sync_credential_proxy(proxy_routes_state)
-
-    if ssh_agent_changed or (not args.services.strip() and (os.path.isfile(SSH_AGENT_STATE_FILE) or os.path.isfile(SSH_AGENT_ALLOWLIST_FILE) or os.path.exists(SSH_AGENT_UPSTREAM_SOCK))):
-        if not args.services.strip():
-            ssh_agent_state = {}
-        sync_root_ssh_agent_state(ssh_agent_state)
-
-    rebuild_secrets_env()
-    if svcs:
-        save_state(state)
-    else:
-        remove_file_quiet(STATE_FILE)
-
-    if os.path.isfile("/usr/local/sbin/box-sync-context.py"):
-        subprocess.run(["python3", "/usr/local/sbin/box-sync-context.py"], check=False)
-
+    cleared_any = revoke_services(targets, explicit_targets=explicit_targets, clear_all=not explicit_targets)
     if not cleared_any:
         print("[seed-secrets] No managed seeded credentials were present.")
     sys.exit(0)
@@ -2144,31 +2270,8 @@ for svc_name, svc_cfg in services_payload.items():
         svc_ttl = int(service_ttls.get(svc_name, ttl_seconds) or 0)
         cancel_ttl_timer(svc_name)
         if svc_ttl > 0:
-            exp_dt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=svc_ttl)
+            exp_dt = install_ttl_timer(svc_name, svc_ttl)
             meta["expiresAt"] = exp_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-            if os.path.isdir("/run/systemd/system"):
-                unit = f"wsl-box-ttl-{svc_name}"
-                proc = subprocess.run(
-                    [
-                        "systemd-run",
-                        "--collect",
-                        f"--unit={unit}",
-                        f"--on-active={svc_ttl}s",
-                        "--timer-property=AccuracySec=1s",
-                        f"--setenv=WSL_BOX_TTL_ACTIVE_UNIT={unit}.service",
-                        "/usr/local/sbin/box-seed-secrets.sh",
-                        "--clear",
-                        "--services",
-                        svc_name,
-                    ],
-                    check=False,
-                    text=True,
-                    capture_output=True,
-                )
-                if proc.returncode != 0:
-                    raise RuntimeError(
-                        f"systemd-run TTL timer failed for {svc_name}: {(proc.stderr or proc.stdout).strip()}"
-                    )
         else:
             meta.pop("expiresAt", None)
         state_services[svc_name] = meta

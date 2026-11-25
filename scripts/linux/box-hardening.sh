@@ -650,3 +650,7 @@ elif os.path.exists(dropin_path):
             print(f"[box-hardening] WARNING: systemctl daemon-reload failed: {r.stderr.strip()}", file=sys.stderr)
     print(f"[box-hardening] Removed {dropin_path} (no resources quota configured).")
 PYEOF
+
+if [[ -x /usr/local/sbin/box-seed-secrets.sh ]]; then
+  /usr/local/sbin/box-seed-secrets.sh --sweep-expired || log "WARNING: box-seed-secrets.sh --sweep-expired failed (continuing)."
+fi
