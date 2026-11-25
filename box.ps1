@@ -405,7 +405,7 @@ function Invoke-SeedSecrets {
     $explicitPath = if (-not [string]::IsNullOrWhiteSpace($SecretsPath)) { $SecretsPath } else { $Argument }
     $manifestPath = Resolve-SecretsManifestPath -ExplicitPath $explicitPath -Config $Config -RepoRoot $StateRoot
 
-    $built = Build-SeedSecretsPayload -ManifestPath $manifestPath -AgentName $Config.agentUser.name -Services $Service -Prune:$Prune -Ttl $Ttl
+    $built = Build-SeedSecretsPayload -ManifestPath $manifestPath -AgentName $Config.agentUser.name -AgentUid ([int]$Config.agentUser.uid) -Services $Service -Prune:$Prune -Ttl $Ttl
 
     $summaryLines = @($built.Summary)
     $disabledLines = @($built.SkippedDisabled)

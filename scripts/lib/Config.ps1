@@ -47,6 +47,30 @@ function Get-DeterministicProfileUid {
     }
 }
 
+function Get-DeterministicProxyPorts {
+    <#
+    .SYNOPSIS
+    Derives deterministic, non-colliding localhost proxy ports from agentUser.uid.
+    All non-default ports stay strictly below 32768 (Linux default ephemeral range).
+    #>
+    param([Parameter(Mandatory)][int]$Uid)
+    if ($Uid -eq 26040) {
+        return [pscustomobject]@{
+            EgressPort     = 3128
+            CredentialPort = 3129
+        }
+    }
+    if ($Uid -ge 26100 -and $Uid -le 26998) {
+        $egress = 30900 + (($Uid - 26100) * 2)
+    } else {
+        $egress = 29100 + ((($Uid * 31) % 450) * 2)
+    }
+    return [pscustomobject]@{
+        EgressPort     = $egress
+        CredentialPort = $egress + 1
+    }
+}
+
 function Get-ProfileOverridePath {
     param(
         [Parameter(Mandatory)][string]$RepoRoot,

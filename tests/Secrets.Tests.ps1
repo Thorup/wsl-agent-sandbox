@@ -995,6 +995,16 @@ try {
     Assert-Throws "Rejects wrong-case top-level service GitHub without leaking secret" {
         Build-SeedSecretsPayload -ManifestPath $wrongCaseTopManifest -AgentName 'agent' | Out-Null
     } 'Unknown top-level service' 'ghp_top_case_canary_456'
+
+    # Per-UID credential-proxy port allocation in Build-SeedSecretsPayload
+    $profPorts = Get-DeterministicProxyPorts -Uid 26150
+    $profProxyBuilt = Build-SeedSecretsPayload -ManifestPath $proxyManifest -AgentName 'agent' -AgentUid 26150
+    Assert-True "Build-SeedSecretsPayload uses per-UID credential-proxy port for non-default UID" (
+        $profProxyBuilt.Payload.services.jira.server -eq "http://127.0.0.1:$($profPorts.CredentialPort)/jira" -and
+        $profProxyBuilt.Payload.services.claude.proxyBaseUrl -eq "http://127.0.0.1:$($profPorts.CredentialPort)/claude" -and
+        $profProxyBuilt.Payload.services.gemini.proxyBaseUrl -eq "http://127.0.0.1:$($profPorts.CredentialPort)/gemini" -and
+        $profProxyBuilt.Payload.services.github.proxyBaseUrl -eq "http://127.0.0.1:$($profPorts.CredentialPort)/github"
+    )
 } finally {
     [Environment]::SetEnvironmentVariable('WSL_AGENT_SANDBOX_SECRETS_PATH', $prevEnvManifest)
     [Environment]::SetEnvironmentVariable('TEST_SANDBOX_GH_TOKEN', $prevTestToken)

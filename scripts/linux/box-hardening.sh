@@ -98,6 +98,16 @@ policy_file, host_ips_file, docker_policy_file, nft_conf_file, private_wsl_mnt, 
 with open(policy_file, "r", encoding="utf-8") as f:
     policy = json.load(f)
 
+def deterministic_proxy_ports(uid):
+    uid = int(uid)
+    if uid == 26040:
+        return 3128, 3129
+    if 26100 <= uid <= 26998:
+        egress = 30900 + (uid - 26100) * 2
+    else:
+        egress = 29100 + ((uid * 31) % 450) * 2
+    return egress, egress + 1
+
 distro = policy["distroName"]
 agent_name = policy["agentUser"]["name"]
 agent_uid = int(policy["agentUser"]["uid"])
@@ -315,6 +325,8 @@ verify_policy = {
     "expectedTools": expected_tools,
     "checkDockerCompose": bool(pkgs.get("installDockerCli", True)),
     "checkAzureDevopsExt": bool(pkgs.get("installAzureDevopsCli", False)),
+    "egressProxyPort": deterministic_proxy_ports(agent_uid)[0],
+    "credentialProxyPort": deterministic_proxy_ports(agent_uid)[1],
 }
 verify_tmp = f"{verify_policy_file}.tmp.{os.getpid()}"
 with open(verify_tmp, "w", encoding="utf-8") as f:
@@ -379,6 +391,7 @@ for cidr in net_cfg.get("blockedCidrs", []):
     else:
         blocked_v6.append(str(net))
 
+egress_port, cred_port = deterministic_proxy_ports(agent_uid)
 egress_cfg_file = "/etc/wsl-agent-sandbox/egress-allowlist.json"
 egress_cfg_tmp = f"{egress_cfg_file}.tmp.{os.getpid()}"
 with open(egress_cfg_tmp, "w", encoding="utf-8") as f:
@@ -390,6 +403,8 @@ with open(egress_cfg_tmp, "w", encoding="utf-8") as f:
         "blockedCidrs": sorted(set(blocked_v4 + blocked_v6)),
         "allowedPorts": [443],
         "allowedHttpPorts": [80, 443],
+        "listenPort": egress_port,
+        "allowedCallerUid": agent_uid,
     }, f, indent=2)
 os.chmod(egress_cfg_tmp, 0o600)
 os.replace(egress_cfg_tmp, egress_cfg_file)
@@ -526,6 +541,8 @@ lines.extend([
     "        type filter hook output priority 0; policy accept;",
     f"        meta skuid != {agent_uid} accept",
     "        ct state established,related accept",
+    f'        oifname "lo" tcp dport {{ {egress_port}, {cred_port} }} accept',
+    '        oifname "lo" tcp dport { 3128, 3129, 29100-29999, 30900-32697 } drop',
     '        oifname "lo" accept',
 ])
 

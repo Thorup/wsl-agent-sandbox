@@ -39,8 +39,16 @@ else
   pass "Root-owned config files (/etc/wsl.conf, policy.json, docker-policy.json, credential-proxy.json, ssh-agent-keys.json) protected"
 fi
 
-if command -v curl >/dev/null 2>&1 && nc -z -w 1 127.0.0.1 3129 >/dev/null 2>&1; then
-  UNAUTH_PROXY_CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:3129/claude/v1/messages || echo "000")"
+VERIFY_POLICY_FILE="/etc/wsl-agent-sandbox/verify-policy.json"
+EGRESS_PROXY_PORT="3128"
+CRED_PROXY_PORT="3129"
+if [[ -r "${VERIFY_POLICY_FILE}" ]]; then
+  EGRESS_PROXY_PORT="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(int(d.get("egressProxyPort", 3128)))' "${VERIFY_POLICY_FILE}" 2>/dev/null || echo "3128")"
+  CRED_PROXY_PORT="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(int(d.get("credentialProxyPort", 3129)))' "${VERIFY_POLICY_FILE}" 2>/dev/null || echo "3129")"
+fi
+
+if command -v curl >/dev/null 2>&1 && nc -z -w 1 127.0.0.1 "${CRED_PROXY_PORT}" >/dev/null 2>&1; then
+  UNAUTH_PROXY_CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:${CRED_PROXY_PORT}/claude/v1/messages" || echo "000")"
   if [[ "${UNAUTH_PROXY_CODE}" == "401" ]] || [[ "${UNAUTH_PROXY_CODE}" == "403" ]]; then
     pass "L7 credential-proxy rejects unauthenticated caller (HTTP ${UNAUTH_PROXY_CODE})"
   else
@@ -229,7 +237,7 @@ if [[ "${EGRESS_MODE}" == "allowlist" ]]; then
     pass "Direct external DNS blocked in allowlist mode"
   fi
 
-  BLOCK_CODE="$(curl --proxy http://127.0.0.1:3128 -s -o /dev/null -w '%{http_connect}' --max-time 6 https://blocked-verify.example.invalid 2>/dev/null || true)"
+  BLOCK_CODE="$(curl --proxy "http://127.0.0.1:${EGRESS_PROXY_PORT}" -s -o /dev/null -w '%{http_connect}' --max-time 6 https://blocked-verify.example.invalid 2>/dev/null || true)"
   if [[ "${BLOCK_CODE}" == "403" ]]; then
     pass "Egress allowlist proxy blocked non-allowlisted domain (HTTP 403)"
   else
@@ -237,7 +245,7 @@ if [[ "${EGRESS_MODE}" == "allowlist" ]]; then
   fi
 
   if [[ "${ALLOWED_DOMAIN_COUNT}" -gt 0 ]] && [[ -n "${ALLOWLIST_PROBE_URL}" ]]; then
-    if curl --proxy http://127.0.0.1:3128 -fsSI --max-time 8 "${ALLOWLIST_PROBE_URL}" >/dev/null 2>&1 || curl --proxy http://127.0.0.1:3128 -sS -o /dev/null -w '%{http_code}' --max-time 8 "${ALLOWLIST_PROBE_URL}" | grep -qE '^[234][0-9]{2}$'; then
+    if curl --proxy "http://127.0.0.1:${EGRESS_PROXY_PORT}" -fsSI --max-time 8 "${ALLOWLIST_PROBE_URL}" >/dev/null 2>&1 || curl --proxy "http://127.0.0.1:${EGRESS_PROXY_PORT}" -sS -o /dev/null -w '%{http_code}' --max-time 8 "${ALLOWLIST_PROBE_URL}" | grep -qE '^[234][0-9]{2}$'; then
       pass "Allowlisted egress works via proxy (${ALLOWLIST_PROBE_URL})"
     else
       fail "Allowlisted egress failed via proxy (${ALLOWLIST_PROBE_URL})"

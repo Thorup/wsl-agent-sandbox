@@ -899,6 +899,44 @@ Assert-Throws "Rejects [hashtable] packages.installDockerCli 1-element array @(`
     Assert-BoxConfigValid -Config $h
 } 'packages\.installDockerCli must be a boolean'
 
+# Deterministic per-UID proxy port allocation
+$defaultPorts = Get-DeterministicProxyPorts -Uid 26040
+Assert-True "Default UID 26040 resolves proxy ports 3128/3129" ($defaultPorts.EgressPort -eq 3128 -and $defaultPorts.CredentialPort -eq 3129)
+
+$seenProxyPorts = @{}
+$seenProxyPorts[3128] = $true
+$seenProxyPorts[3129] = $true
+$allProfilePortsUnique = $true
+$allProfilePortsBelowEphemeral = $true
+foreach ($u in 26100..26998) {
+    $pp = Get-DeterministicProxyPorts -Uid $u
+    if ($pp.EgressPort -ge 32768 -or $pp.CredentialPort -ge 32768 -or $pp.EgressPort -lt 1024) {
+        $allProfilePortsBelowEphemeral = $false
+        break
+    }
+    if ($seenProxyPorts.ContainsKey($pp.EgressPort) -or $seenProxyPorts.ContainsKey($pp.CredentialPort) -or $pp.EgressPort -eq $pp.CredentialPort) {
+        $allProfilePortsUnique = $false
+        break
+    }
+    $seenProxyPorts[$pp.EgressPort] = $true
+    $seenProxyPorts[$pp.CredentialPort] = $true
+}
+Assert-True "All profile UIDs 26100..26998 resolve unique non-colliding proxy ports" $allProfilePortsUnique
+Assert-True "All profile UIDs 26100..26998 resolve proxy ports < 32768" $allProfilePortsBelowEphemeral
+
+$customPorts = Get-DeterministicProxyPorts -Uid 15001
+Assert-True "Custom UID 15001 resolves valid proxy port pair in 29100..29999 (< 32768)" ($customPorts.EgressPort -ge 29100 -and $customPorts.CredentialPort -eq ($customPorts.EgressPort + 1) -and $customPorts.CredentialPort -le 29999)
+
+$commonDevPorts = @(3000, 3306, 5432, 6379, 8080, 9200, 11434, 15672, 16686, 18080, 19092, 26257, 27017, 28015, 30000)
+$devPortsUnblocked = $true
+foreach ($dp in $commonDevPorts) {
+    if ($dp -in @(3128, 3129) -or ($dp -ge 29100 -and $dp -le 29999) -or ($dp -ge 30900 -and $dp -le 32697)) {
+        $devPortsUnblocked = $false
+        break
+    }
+}
+Assert-True "Reserved proxy port ranges leave common localhost DB/broker/NodePort ports unblocked" $devPortsUnblocked
+
 Write-Host ""
 Write-Host "=== Config.Tests.ps1 Summary: PASS=$script:Passed FAIL=$script:Failed ==="
 if ($script:Failed -gt 0) {
