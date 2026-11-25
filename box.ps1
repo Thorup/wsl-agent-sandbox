@@ -183,10 +183,15 @@ function Sync-AssetsToWsl {
     Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'systemd\ssh-agent-proxy.service') -RemotePath '/etc/systemd/system/ssh-agent-proxy.service' -Mode '0644' -NormalizeLF
 
     if ($IncludeProxySource) {
+        Invoke-WslRootBash -DistroName $distro -Script 'rm -rf /usr/local/src/docker-policy-proxy && mkdir -p /usr/local/src/docker-policy-proxy'
         $proxyDir = Join-Path $AppRoot 'docker-policy-proxy'
-        $proxyFiles = @(Get-ChildItem -LiteralPath $proxyDir -File | Where-Object {
+        $proxyFiles = [System.IO.FileInfo[]]@(Get-ChildItem -LiteralPath $proxyDir -File | Where-Object {
             $_.Name -eq 'go.mod' -or $_.Name -eq 'go.sum' -or $_.Extension -eq '.go'
-        } | Sort-Object -Property Name -CaseSensitive)
+        })
+        [System.Array]::Sort($proxyFiles, [System.Comparison[System.IO.FileInfo]]{
+            param($a, $b)
+            [string]::CompareOrdinal($a.Name, $b.Name)
+        })
         foreach ($pf in $proxyFiles) {
             Copy-FileToWsl -DistroName $distro -LocalPath $pf.FullName -RemotePath "/usr/local/src/docker-policy-proxy/$($pf.Name)" -Mode '0644' -NormalizeLF
         }
@@ -367,13 +372,19 @@ function Build-WslDockerPolicyProxy {
     Write-Host "[apply] Re-testing and rebuilding docker-policy-proxy..."
     $buildScript = @"
 set -euo pipefail
+unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
+export GOPROXY=off GOFLAGS=-mod=readonly
 if ! command -v go >/dev/null 2>&1; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
-  apt-get install -y --no-install-recommends golang-go
+  apt-get install -y --no-install-recommends golang-go gcc libc6-dev
 fi
 cd /usr/local/src/docker-policy-proxy
-go test -v -race ./...
+if command -v gcc >/dev/null 2>&1; then
+  go test -v -race ./...
+else
+  CGO_ENABLED=0 go test -v ./...
+fi
 mkdir -p /usr/local/libexec
 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /usr/local/libexec/docker-policy-proxy.new .
 chown root:root /usr/local/libexec/docker-policy-proxy.new
@@ -1549,7 +1560,9 @@ switch ($Command) {
         Invoke-ClearSecrets -Config $cfg -Service $Service
     }
     'register-terminal' {
-        $explicitCfg = if ($ConfigPath -ne (Join-Path $StateRoot 'box.json')) { $ConfigPath } else { '' }
+        $defaultAppCfg = Join-Path $AppRoot 'box.json'
+        $defaultUserCfg = Join-Path $env:USERPROFILE '.wsl-agent-sandbox\box.json'
+        $explicitCfg = if ($userSpecifiedConfigPath -or ($ConfigPath -ne $defaultAppCfg -and $ConfigPath -ne $defaultUserCfg)) { $ConfigPath } else { '' }
         [void](Register-WindowsTerminalProfile -Config $cfg -Unregister:$Unregister -BoxScriptPath $PSCommandPath -ProfileName $ProfileName -ConfigPath $explicitCfg)
     }
     'shell' {

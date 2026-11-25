@@ -161,6 +161,11 @@ function Register-WindowsTerminalProfile {
     $guid = Get-DeterministicTerminalProfileGuid -DistroName $distro
     $wtProfileName = "$distro (Sandboxed)"
     if (-not [string]::IsNullOrWhiteSpace($BoxScriptPath) -and (Test-Path -LiteralPath $BoxScriptPath -PathType Leaf)) {
+        foreach ($argVal in @($BoxScriptPath, $ProfileName, $ConfigPath)) {
+            if ($argVal -and $argVal.Contains('"')) {
+                throw "Invalid double-quote character in Windows Terminal profile command argument: $argVal"
+            }
+        }
         $cmdLine = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$BoxScriptPath`" shell"
         if (-not [string]::IsNullOrWhiteSpace($ProfileName)) {
             $cmdLine += " -Profile `"$ProfileName`""

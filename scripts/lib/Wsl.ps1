@@ -238,6 +238,8 @@ function Sync-HostIpsIfChanged {
         Write-Host "[sync] Windows host IPs changed; refreshing host_ips.txt and reloading box-hardening.sh..."
         Copy-TextToWsl -DistroName $distro -Content $desired -RemotePath '/etc/wsl-agent-sandbox/host_ips.txt' -Mode '0600'
         Invoke-WslRootBash -DistroName $distro -Script '/usr/local/sbin/box-hardening.sh && if grep -q -- "--render-env-only" /usr/local/sbin/box-apply-policy.sh 2>/dev/null; then /usr/local/sbin/box-apply-policy.sh --render-env-only; fi'
+    }
+}
 
 function Get-DockerPolicyProxySourceHash {
     <#
@@ -252,9 +254,13 @@ function Get-DockerPolicyProxySourceHash {
     if (-not (Test-Path -LiteralPath $proxyDir -PathType Container)) {
         throw "docker-policy-proxy directory not found: '$proxyDir'"
     }
-    $files = @(Get-ChildItem -LiteralPath $proxyDir -File | Where-Object {
+    $files = [System.IO.FileInfo[]]@(Get-ChildItem -LiteralPath $proxyDir -File | Where-Object {
         $_.Name -eq 'go.mod' -or $_.Name -eq 'go.sum' -or $_.Extension -eq '.go'
-    } | Sort-Object -Property Name -CaseSensitive)
+    })
+    [System.Array]::Sort($files, [System.Comparison[System.IO.FileInfo]]{
+        param($a, $b)
+        [string]::CompareOrdinal($a.Name, $b.Name)
+    })
     if ($files.Count -eq 0) {
         throw "No docker-policy-proxy source files found in '$proxyDir'"
     }
