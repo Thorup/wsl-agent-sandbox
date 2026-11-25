@@ -105,6 +105,17 @@ if [[ -d "${PROXY_SRC_DIR}" ]]; then
   chmod 0755 "${PROXY_BIN}"
 fi
 
+# Pre-create user-space npm/pnpm directories so non-root global installs work without prompts
+for dir in \
+  "/home/${AGENT_NAME}/.npm-global" \
+  "/home/${AGENT_NAME}/.npm-global/bin" \
+  "/home/${AGENT_NAME}/.local" \
+  "/home/${AGENT_NAME}/.local/share" \
+  "/home/${AGENT_NAME}/.local/share/pnpm"
+do
+  install -d -o "${AGENT_UID}" -g "${AGENT_GID}" -m 0755 "${dir}"
+done
+
 # Configure agent shell environment & /etc/environment atomically (including allowlist proxy/no_proxy if enabled)
 if [[ -x /usr/local/sbin/box-apply-policy.sh ]]; then
   /usr/local/sbin/box-apply-policy.sh --render-env-only

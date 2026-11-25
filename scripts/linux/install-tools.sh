@@ -26,6 +26,61 @@ flag() {
   python3 -c "import json; d=json.load(open('${POLICY_FILE}')); print('1' if d.get('packages', {}).get('${key}', ${def}) else '0')"
 }
 
+fetch_github_latest_json() {
+  local repo="$1"
+  local api_url="https://api.github.com/repos/${repo}/releases/latest"
+  local -a auth_args=()
+  if [[ -n "${GITHUB_TOKEN:-}" && "${GITHUB_TOKEN}" != sandbox-proxy-* ]]; then
+    auth_args=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+  fi
+
+  local api_json=""
+  if api_json="$(curl -fsSL --retry 3 --retry-delay 2 -H 'Accept: application/vnd.github+json' "${auth_args[@]}" "${api_url}" 2>/dev/null)"; then
+    printf '%s' "${api_json}"
+    return 0
+  fi
+
+  # Fallback: resolve latest tag via github.com HTML redirect + expanded_assets (avoids 60/hr API rate limit)
+  local effective_url tag expanded_html
+  effective_url="$(curl -fsSL --retry 3 --retry-delay 2 -o /dev/null -w '%{url_effective}' "https://github.com/${repo}/releases/latest")"
+  tag="${effective_url##*/}"
+  tag="${tag%%\?*}"
+  if [[ -z "${tag}" || "${tag}" == "latest" ]]; then
+    echo "[install-tools] ERROR: failed to resolve latest release tag for ${repo}" >&2
+    return 1
+  fi
+  expanded_html="$(curl -fsSL --retry 3 --retry-delay 2 "https://github.com/${repo}/releases/expanded_assets/${tag}")"
+  python3 -c '
+import json, re, sys
+repo, tag = sys.argv[1], sys.argv[2]
+html = sys.stdin.read()
+prefix = f"/{repo}/releases/download/{tag}/"
+assets = []
+seen = set()
+for match in re.finditer(r"href=[\"\x27](" + re.escape(prefix) + r"[^\"\x27?#]+)", html):
+    rel = match.group(1)
+    if rel in seen:
+        continue
+    seen.add(rel)
+    assets.append({
+        "name": rel.rsplit("/", 1)[-1],
+        "browser_download_url": "https://github.com" + rel,
+    })
+if not assets:
+    sys.exit(1)
+print(json.dumps({"tag_name": tag, "assets": assets}))
+' "${repo}" "${tag}" <<< "${expanded_html}"
+}
+
+resolve_helm_latest_version() {
+  local ver=""
+  if ver="$(curl -fsSL --retry 3 --retry-delay 2 https://get.helm.sh/helm-latest-version 2>/dev/null | tr -d '[:space:]')" && [[ "${ver}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+    printf '%s' "${ver}"
+    return 0
+  fi
+  fetch_github_latest_json "helm/helm" | python3 -c "import json,sys; print(json.load(sys.stdin)['tag_name'])"
+}
+
 INSTALL_DOCKER_CLI="$(flag installDockerCli True)"
 INSTALL_UV="$(flag installUv True)"
 INSTALL_NODE="$(flag installNodeLts True)"
@@ -85,6 +140,18 @@ fi
 
 # 3. Node.js LTS (22.x) + pnpm + Gemini CLI + optional Claude Code
 if [[ "${INSTALL_NODE}" == "1" ]]; then
+  if id -u "${AGENT_NAME}" >/dev/null 2>&1; then
+    AGENT_GID_VAL="$(id -g "${AGENT_NAME}")"
+    for dir in \
+      "/home/${AGENT_NAME}/.npm-global" \
+      "/home/${AGENT_NAME}/.npm-global/bin" \
+      "/home/${AGENT_NAME}/.local" \
+      "/home/${AGENT_NAME}/.local/share" \
+      "/home/${AGENT_NAME}/.local/share/pnpm"
+    do
+      install -d -o "${AGENT_NAME}" -g "${AGENT_GID_VAL}" -m 0755 "${dir}"
+    done
+  fi
   if ! command -v node >/dev/null 2>&1; then
     log "Installing Node.js LTS..."
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
@@ -245,7 +312,7 @@ if [[ "${INSTALL_UPCTL}" == "1" ]] && ! command -v upctl >/dev/null 2>&1; then
   log "Installing UpCloud CLI (upctl, ${UPCTL_ARCH}) with SHA256 verification..."
   TMP_DIR="$(mktemp -d)"
   trap 'rm -rf "${TMP_DIR}"' EXIT
-  RELEASE_JSON="$(curl -fsSL -H 'Accept: application/vnd.github+json' https://api.github.com/repos/UpCloudLtd/upcloud-cli/releases/latest)"
+  RELEASE_JSON="$(fetch_github_latest_json "UpCloudLtd/upcloud-cli")"
   ASSET_URL="$(printf '%s' "${RELEASE_JSON}" | python3 -c "import json,sys; r=json.load(sys.stdin); print(next(a['browser_download_url'] for a in r['assets'] if a['name'].endswith('_linux_${UPCTL_ARCH}.tar.gz')))")"
   CHECKSUMS_URL="$(printf '%s' "${RELEASE_JSON}" | python3 -c "import json,sys; r=json.load(sys.stdin); print(next(a['browser_download_url'] for a in r['assets'] if a['name'].endswith('checksums.txt')))")"
   ASSET_NAME="$(basename "${ASSET_URL}")"
@@ -317,7 +384,7 @@ if [[ "${INSTALL_JIRA}" == "1" ]] && ! command -v jira >/dev/null 2>&1; then
   log "Installing Jira CLI (jira, ${JIRA_ARCH}) with SHA256 verification..."
   TMP_DIR="$(mktemp -d)"
   trap 'rm -rf "${TMP_DIR}"' EXIT
-  RELEASE_JSON="$(curl -fsSL -H 'Accept: application/vnd.github+json' https://api.github.com/repos/ankitpokhrel/jira-cli/releases/latest)"
+  RELEASE_JSON="$(fetch_github_latest_json "ankitpokhrel/jira-cli")"
   ASSET_URL="$(printf '%s' "${RELEASE_JSON}" | python3 -c "import json,sys; r=json.load(sys.stdin); print(next(a['browser_download_url'] for a in r['assets'] if a['name'].endswith('_linux_${JIRA_ARCH}.tar.gz')))")"
   CHECKSUMS_URL="$(printf '%s' "${RELEASE_JSON}" | python3 -c "import json,sys; r=json.load(sys.stdin); print(next(a['browser_download_url'] for a in r['assets'] if a['name'].endswith('checksums.txt')))")"
   ASSET_NAME="$(basename "${ASSET_URL}")"
@@ -366,7 +433,7 @@ if [[ "${INSTALL_HELM}" == "1" ]] && ! command -v helm >/dev/null 2>&1; then
   log "Installing Helm (${ARCH}) with SHA256 verification..."
   TMP_DIR="$(mktemp -d)"
   trap 'rm -rf "${TMP_DIR}"' EXIT
-  HELM_VER="$(curl -fsSL -H 'Accept: application/vnd.github+json' https://api.github.com/repos/helm/helm/releases/latest | python3 -c "import json,sys; print(json.load(sys.stdin)['tag_name'])")"
+  HELM_VER="$(resolve_helm_latest_version)"
   HELM_TAR="helm-${HELM_VER}-linux-${ARCH}.tar.gz"
   curl -fsSL "https://get.helm.sh/${HELM_TAR}" -o "${TMP_DIR}/${HELM_TAR}"
   curl -fsSL "https://get.helm.sh/${HELM_TAR}.sha256sum" -o "${TMP_DIR}/${HELM_TAR}.sha256sum"
@@ -393,15 +460,32 @@ EOF
   log "Installed $(tofu version 2>&1 | head -n 1)."
 fi
 
+resolve_terraform_suite() {
+  local codename="${1:-}"
+  if [[ -z "${codename}" ]]; then
+    # shellcheck source=/dev/null
+    codename="$(. /etc/os-release && echo "${VERSION_CODENAME:-resolute}")"
+  fi
+  local suite="${codename}"
+  if ! curl -fsI "https://apt.releases.hashicorp.com/dists/${suite}/Release" >/dev/null 2>&1; then
+    log "HashiCorp apt suite '${suite}' not published yet; falling back to 'noble'."
+    suite="noble"
+  fi
+  printf '%s' "${suite}"
+}
+
 # 16b. Terraform (official HashiCorp signed APT repository)
 if [[ "${INSTALL_TERRAFORM}" == "1" ]] && ! command -v terraform >/dev/null 2>&1; then
   log "Installing Terraform via official HashiCorp signed APT repository..."
   install -m 0755 -d /etc/apt/keyrings
   curl -fsSL https://apt.releases.hashicorp.com/gpg | gpg --dearmor --yes -o /etc/apt/keyrings/hashicorp-archive-keyring.gpg
   chmod a+r /etc/apt/keyrings/hashicorp-archive-keyring.gpg
-  ARCH="$(dpkg --print-architecture)"
-  CODENAME="$(awk -F= '/^VERSION_CODENAME=/{gsub(/"/, "", $2); print $2}' /etc/os-release)"
-  echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com ${CODENAME} main" >/etc/apt/sources.list.d/hashicorp.list
+  # shellcheck source=/dev/null
+  CODENAME="$(. /etc/os-release && echo "${VERSION_CODENAME:-resolute}")"
+  TF_SUITE="$(resolve_terraform_suite "${CODENAME}")"
+  cat >/etc/apt/sources.list.d/hashicorp.list <<EOF
+deb [arch=${ARCH} signed-by=/etc/apt/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com ${TF_SUITE} main
+EOF
   apt-get update -y
   apt-get install -y --no-install-recommends terraform
   log "Installed $(terraform version 2>&1 | head -n 1)."

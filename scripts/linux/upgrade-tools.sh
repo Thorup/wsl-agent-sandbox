@@ -23,6 +23,130 @@ has_scope() {
   [[ "${SCOPE}" == "all" ]] || [[ ",${SCOPE}," == *",${target},"* ]]
 }
 
+fetch_github_latest_json() {
+  local repo="$1"
+  local api_url="https://api.github.com/repos/${repo}/releases/latest"
+  local -a auth_args=()
+  if [[ -n "${GITHUB_TOKEN:-}" && "${GITHUB_TOKEN}" != sandbox-proxy-* ]]; then
+    auth_args=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+  fi
+
+  local api_json=""
+  if api_json="$(curl -fsSL --retry 3 --retry-delay 2 -H 'Accept: application/vnd.github+json' "${auth_args[@]}" "${api_url}" 2>/dev/null)"; then
+    printf '%s' "${api_json}"
+    return 0
+  fi
+
+  # Fallback: resolve latest tag via github.com HTML redirect + expanded_assets (avoids 60/hr API rate limit)
+  local effective_url tag expanded_html
+  effective_url="$(curl -fsSL --retry 3 --retry-delay 2 -o /dev/null -w '%{url_effective}' "https://github.com/${repo}/releases/latest")"
+  tag="${effective_url##*/}"
+  tag="${tag%%\?*}"
+  if [[ -z "${tag}" || "${tag}" == "latest" ]]; then
+    echo "[upgrade] ERROR: failed to resolve latest release tag for ${repo}" >&2
+    return 1
+  fi
+  expanded_html="$(curl -fsSL --retry 3 --retry-delay 2 "https://github.com/${repo}/releases/expanded_assets/${tag}")"
+  python3 -c '
+import json, re, sys
+repo, tag = sys.argv[1], sys.argv[2]
+html = sys.stdin.read()
+prefix = f"/{repo}/releases/download/{tag}/"
+assets = []
+seen = set()
+for match in re.finditer(r"href=[\"\x27](" + re.escape(prefix) + r"[^\"\x27?#]+)", html):
+    rel = match.group(1)
+    if rel in seen:
+        continue
+    seen.add(rel)
+    assets.append({
+        "name": rel.rsplit("/", 1)[-1],
+        "browser_download_url": "https://github.com" + rel,
+    })
+if not assets:
+    sys.exit(1)
+print(json.dumps({"tag_name": tag, "assets": assets}))
+' "${repo}" "${tag}" <<< "${expanded_html}"
+}
+
+resolve_helm_latest_version() {
+  local ver=""
+  if ver="$(curl -fsSL --retry 3 --retry-delay 2 https://get.helm.sh/helm-latest-version 2>/dev/null | tr -d '[:space:]')" && [[ "${ver}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+    printf '%s' "${ver}"
+    return 0
+  fi
+  fetch_github_latest_json "helm/helm" | python3 -c "import json,sys; print(json.load(sys.stdin)['tag_name'])"
+}
+
+upgrade_aws_cli() {
+  local install_dir="${1:-/usr/local/aws-cli}"
+  local bin_dir="${2:-/usr/local/bin}"
+  local arch="${3:-${ARCH:-$(dpkg --print-architecture)}}"
+  if ! command -v aws >/dev/null 2>&1 || [[ ! -d "${install_dir}" ]]; then
+    return 0
+  fi
+
+  record_ver "aws" "aws --version" "before"
+  local aws_arch="x86_64"
+  if [[ "${arch}" == "arm64" ]]; then
+    aws_arch="aarch64"
+  fi
+  log "Updating AWS CLI v2 (${aws_arch})..."
+  (
+    tmp_dir="$(mktemp -d)"
+    trap 'rm -rf "${tmp_dir}"' EXIT
+    curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${aws_arch}.zip" -o "${tmp_dir}/awscliv2.zip"
+    unzip -q "${tmp_dir}/awscliv2.zip" -d "${tmp_dir}"
+    "${tmp_dir}/aws/install" --bin-dir "${bin_dir}" --install-dir "${install_dir}" --update
+  )
+  record_ver "aws" "aws --version" "after"
+}
+
+upgrade_dotnet_toolchains() {
+  local policy_file="${1:-${POLICY_FILE}}"
+  local install_dir="${2:-/usr/local/share/dotnet}"
+  local installer_url="${3:-https://dot.net/v1/dotnet-install.sh}"
+  local dotnet_bin="${install_dir}/dotnet"
+  if [[ ! -x "${dotnet_bin}" ]]; then
+    return 0
+  fi
+
+  record_ver "dotnet" "'${dotnet_bin}' --list-sdks | tr '\n' ';'" "before"
+  log "Updating .NET SDK (LTS) in ${install_dir}..."
+  (
+    tmp_dir="$(mktemp -d)"
+    trap 'rm -rf "${tmp_dir}"' EXIT
+    installer_bin="${tmp_dir}/dotnet-install.sh"
+    curl -fsSL "${installer_url}" -o "${installer_bin}"
+    chmod +x "${installer_bin}"
+    "${installer_bin}" --channel LTS --install-dir "${install_dir}" --no-path
+
+    mapfile -t dotnet_channels < <(python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+channels = d.get("packages", {}).get("dotnetChannels")
+if channels is None:
+    sys.exit(0)
+if not isinstance(channels, list):
+    print(f"[upgrade] WARN: packages.dotnetChannels must be an array; ignoring {type(channels).__name__}.", file=sys.stderr)
+    sys.exit(0)
+for ch in channels:
+    if ch is not None:
+        print(str(ch))
+' "${policy_file}")
+
+    for ch in "${dotnet_channels[@]}"; do
+      if [[ ! "${ch}" =~ ^[0-9]+\.[0-9]+$ ]]; then
+        log "WARN: skipping invalid packages.dotnetChannels entry '${ch}' (expected '<major>.<minor>', e.g. '8.0')."
+        continue
+      fi
+      log "Updating .NET SDK channel ${ch} in ${install_dir}..."
+      "${installer_bin}" --channel "${ch}" --install-dir "${install_dir}" --no-path
+    done
+  )
+  record_ver "dotnet" "'${dotnet_bin}' --list-sdks | tr '\n' ';'" "after"
+}
+
 enforce_sudo_hardening() {
   local -A seen=()
   local -a targets=()
@@ -122,7 +246,7 @@ fi
 
 if has_scope "agents"; then
   if command -v npm >/dev/null 2>&1; then
-    for pkg in pnpm @google/gemini-cli @anthropic-ai/claude-code @openai/codex opencode-ai; do
+    for pkg in @google/gemini-cli @anthropic-ai/claude-code @openai/codex opencode-ai; do
       if npm list -g --depth=0 "${pkg}" >/dev/null 2>&1; then
         record_ver "npm:${pkg}" "npm list -g --depth=0 '${pkg}' --json 2>/dev/null | python3 -c \"import json,sys; d=json.load(sys.stdin); print(d.get('dependencies',{}).get('${pkg}',{}).get('version','unknown'))\"" "before"
         log "Updating global npm package ${pkg}..."
@@ -142,6 +266,14 @@ if has_scope "agents"; then
 fi
 
 if has_scope "toolchains"; then
+  if command -v npm >/dev/null 2>&1 && npm list -g --depth=0 pnpm >/dev/null 2>&1; then
+    record_ver "npm:pnpm" "npm list -g --depth=0 'pnpm' --json 2>/dev/null | python3 -c \"import json,sys; d=json.load(sys.stdin); print(d.get('dependencies',{}).get('pnpm',{}).get('version','unknown'))\"" "before"
+    log "Updating global npm package pnpm..."
+    npm install -g pnpm@latest
+    record_ver "npm:pnpm" "npm list -g --depth=0 'pnpm' --json 2>/dev/null | python3 -c \"import json,sys; d=json.load(sys.stdin); print(d.get('dependencies',{}).get('pnpm',{}).get('version','unknown'))\"" "after"
+  fi
+  upgrade_aws_cli "/usr/local/aws-cli" "/usr/local/bin" "${ARCH}"
+  upgrade_dotnet_toolchains "${POLICY_FILE}"
   if command -v uv >/dev/null 2>&1; then
     record_ver "uv" "uv --version" "before"
     log "Updating uv..."
@@ -182,7 +314,7 @@ if has_scope "toolchains"; then
     UPCTL_ARCH="x86_64"
     [[ "${ARCH}" == "arm64" ]] && UPCTL_ARCH="arm64"
     TMP_DIR="$(mktemp -d)"
-    RELEASE_JSON="$(curl -fsSL -H 'Accept: application/vnd.github+json' https://api.github.com/repos/UpCloudLtd/upcloud-cli/releases/latest)"
+    RELEASE_JSON="$(fetch_github_latest_json "UpCloudLtd/upcloud-cli")"
     ASSET_URL="$(printf '%s' "${RELEASE_JSON}" | python3 -c "import json,sys; r=json.load(sys.stdin); print(next(a['browser_download_url'] for a in r['assets'] if a['name'].endswith('_linux_${UPCTL_ARCH}.tar.gz')))")"
     CHECKSUMS_URL="$(printf '%s' "${RELEASE_JSON}" | python3 -c "import json,sys; r=json.load(sys.stdin); print(next(a['browser_download_url'] for a in r['assets'] if a['name'].endswith('checksums.txt')))")"
     ASSET_NAME="$(basename "${ASSET_URL}")"
@@ -201,7 +333,7 @@ if has_scope "toolchains"; then
     JIRA_ARCH="x86_64"
     [[ "${ARCH}" == "arm64" ]] && JIRA_ARCH="arm64"
     TMP_DIR="$(mktemp -d)"
-    RELEASE_JSON="$(curl -fsSL -H 'Accept: application/vnd.github+json' https://api.github.com/repos/ankitpokhrel/jira-cli/releases/latest)"
+    RELEASE_JSON="$(fetch_github_latest_json "ankitpokhrel/jira-cli")"
     ASSET_URL="$(printf '%s' "${RELEASE_JSON}" | python3 -c "import json,sys; r=json.load(sys.stdin); print(next(a['browser_download_url'] for a in r['assets'] if a['name'].endswith('_linux_${JIRA_ARCH}.tar.gz')))")"
     CHECKSUMS_URL="$(printf '%s' "${RELEASE_JSON}" | python3 -c "import json,sys; r=json.load(sys.stdin); print(next(a['browser_download_url'] for a in r['assets'] if a['name'].endswith('checksums.txt')))")"
     ASSET_NAME="$(basename "${ASSET_URL}")"
@@ -218,7 +350,7 @@ if has_scope "toolchains"; then
     record_ver "helm" "helm version --short" "before"
     log "Updating Helm (${ARCH}) with SHA256 verification..."
     TMP_DIR="$(mktemp -d)"
-    HELM_VER="$(curl -fsSL -H 'Accept: application/vnd.github+json' https://api.github.com/repos/helm/helm/releases/latest | python3 -c "import json,sys; print(json.load(sys.stdin)['tag_name'])")"
+    HELM_VER="$(resolve_helm_latest_version)"
     HELM_TAR="helm-${HELM_VER}-linux-${ARCH}.tar.gz"
     curl -fsSL "https://get.helm.sh/${HELM_TAR}" -o "${TMP_DIR}/${HELM_TAR}"
     curl -fsSL "https://get.helm.sh/${HELM_TAR}.sha256sum" -o "${TMP_DIR}/${HELM_TAR}.sha256sum"
