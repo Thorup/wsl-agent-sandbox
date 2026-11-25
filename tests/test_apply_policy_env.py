@@ -181,5 +181,77 @@ class TestBoxHardeningMaintenanceEgress(unittest.TestCase):
         self.assertIn("BOX_MAINTENANCE_EGRESS_OPEN=1 /usr/local/sbin/box-hardening.sh", upgrade_sh)
 
 
+@unittest.skipIf(shutil.which("bash") is None, "bash executable is required")
+class TestApplyPolicyExitTrap(unittest.TestCase):
+    def _run_main_with_stubs(self, fail_install_tools: bool = False):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            policy_path = os.path.join(tmpdir, "policy.json")
+            host_ips_path = os.path.join(tmpdir, "host_ips.txt")
+            profile_path = os.path.join(tmpdir, "99-agent-box.sh")
+            env_path = os.path.join(tmpdir, "environment")
+            hardening_stub = os.path.join(tmpdir, "box-hardening.sh")
+            install_tools_stub = os.path.join(tmpdir, "box-install-tools.sh")
+            hardening_log = os.path.join(tmpdir, "hardening.log")
+            script_copy = os.path.join(tmpdir, "apply-policy.sh")
+            mock_bin = os.path.join(tmpdir, "mock-bin")
+            os.makedirs(mock_bin, exist_ok=True)
+
+            with open(policy_path, "w", encoding="utf-8") as f:
+                json.dump({"packages": {"apt": []}, "docker": {"enabled": False}, "network": {"egressMode": "open"}}, f)
+            with open(host_ips_path, "w", encoding="utf-8") as f:
+                f.write("")
+
+            with open(hardening_stub, "w", encoding="utf-8") as f:
+                f.write(f'#!/usr/bin/env bash\necho "open=${{BOX_MAINTENANCE_EGRESS_OPEN:-0}}" >> "{hardening_log}"\n')
+            os.chmod(hardening_stub, 0o755)
+
+            with open(install_tools_stub, "w", encoding="utf-8") as f:
+                if fail_install_tools:
+                    f.write("#!/usr/bin/env bash\nexit 42\n")
+                else:
+                    f.write("#!/usr/bin/env bash\nexit 0\n")
+            os.chmod(install_tools_stub, 0o755)
+
+            for tool, body in (("id", "echo 0"), ("pidof", "exit 1"), ("ip", "exit 0"), ("dpkg", "exit 0")):
+                tool_path = os.path.join(mock_bin, tool)
+                with open(tool_path, "w", encoding="utf-8") as f:
+                    f.write(f"#!/usr/bin/env bash\n{body}\n")
+                os.chmod(tool_path, 0o755)
+
+            with open(APPLY_POLICY_SH, encoding="utf-8") as f:
+                content = f.read()
+            content = (
+                content.replace("/etc/wsl-agent-sandbox/policy.json", policy_path)
+                .replace("/etc/wsl-agent-sandbox/host-ips.txt", host_ips_path)
+                .replace("/etc/profile.d/99-agent-box.sh", profile_path)
+                .replace("/etc/environment", env_path)
+                .replace("/usr/local/sbin/box-hardening.sh", hardening_stub)
+                .replace("/usr/local/sbin/box-install-tools.sh", install_tools_stub)
+                .replace("/usr/local/sbin/box-sync-context.py", os.path.join(tmpdir, "missing-sync.py"))
+            )
+            with open(script_copy, "w", encoding="utf-8") as f:
+                f.write(content)
+            os.chmod(script_copy, 0o755)
+
+            env = os.environ.copy()
+            env["PATH"] = f"{mock_bin}:{env.get('PATH', '')}"
+            res = subprocess.run(["bash", script_copy], env=env, text=True, capture_output=True)
+            with open(hardening_log, encoding="utf-8") as f:
+                calls = f.read().splitlines()
+            return res, calls
+
+    def test_main_exits_zero_without_unbound_variable_in_exit_trap(self):
+        res, calls = self._run_main_with_stubs(fail_install_tools=False)
+        self.assertEqual(res.returncode, 0, f"stderr: {res.stderr}")
+        self.assertNotIn("unbound variable", res.stderr)
+        self.assertEqual(calls, ["open=1", "open=0"])
+
+    def test_main_restores_strict_egress_via_exit_trap_on_mid_run_failure(self):
+        res, calls = self._run_main_with_stubs(fail_install_tools=True)
+        self.assertEqual(res.returncode, 42, f"stderr: {res.stderr}")
+        self.assertNotIn("unbound variable", res.stderr)
+        self.assertEqual(calls, ["open=1", "open=0"])
+
+
 if __name__ == "__main__":
     unittest.main()
