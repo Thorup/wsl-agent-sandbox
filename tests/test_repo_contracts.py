@@ -82,7 +82,8 @@ class TestRepoContracts(unittest.TestCase):
                 )
             exec_start = parser.get("Service", "ExecStart", fallback="").strip()
             self.assertTrue(exec_start, f"{os.path.basename(unit_path)} missing ExecStart")
-            local_paths = re.findall(r"(/usr/local/[A-Za-z0-9._/-]+)", exec_start)
+            exec_start_pre = parser.get("Service", "ExecStartPre", fallback="").strip()
+            local_paths = re.findall(r"(/usr/local/[A-Za-z0-9._/-]+)", exec_start + "\n" + exec_start_pre)
             self.assertTrue(local_paths, f"{os.path.basename(unit_path)} ExecStart has no /usr/local/* target")
             for p in local_paths:
                 self.assertIn(
@@ -90,6 +91,15 @@ class TestRepoContracts(unittest.TestCase):
                     installer_sources,
                     f"Path {p} referenced in {os.path.basename(unit_path)} is not installed by box.ps1 or provision.sh",
                 )
+            protect_system = parser.get("Service", "ProtectSystem", fallback="").strip().lower()
+            if protect_system == "strict":
+                rw_paths = parser.get("Service", "ReadWritePaths", fallback="").split()
+                runtime_dir = parser.get("Service", "RuntimeDirectory", fallback="").strip()
+                for rw in rw_paths:
+                    if rw.startswith("/run/") and not runtime_dir:
+                        self.fail(
+                            f"{os.path.basename(unit_path)} uses bare ReadWritePaths={rw} under ProtectSystem=strict without RuntimeDirectory= or '-' prefix"
+                        )
 
     def test_docker_policy_compiler_matches_go_struct(self):
         with open(os.path.join(REPO_ROOT, "scripts", "linux", "box-hardening.sh"), encoding="utf-8") as f:
