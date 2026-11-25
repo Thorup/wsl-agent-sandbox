@@ -23,9 +23,39 @@ jobs:
           PKG_NAME="wsl-agent-sandbox-${TAG}"
           mkdir -p "dist/${PKG_NAME}"
           cp -r box.ps1 wsl-sandbox.ps1 box.json box.schema.json secrets.schema.json LICENSE README.md \
-            docs scripts systemd docker-policy-proxy examples packaging "dist/${PKG_NAME}/"
+            assets docs scripts systemd docker-policy-proxy examples packaging "dist/${PKG_NAME}/"
           (cd dist && zip -r "${PKG_NAME}.zip" "${PKG_NAME}")
           (cd dist && sha256sum "${PKG_NAME}.zip" > SHA256SUMS.txt)
+
+      - name: Render Scoop manifest
+        env:
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          SERVER_URL: ${{ github.server_url }}
+        run: |
+          python3 - <<'PYEOF'
+          import json
+          import os
+          from pathlib import Path
+
+          tag = os.environ["TAG"]
+          repo = os.environ["REPO"]
+          server_url = os.environ["SERVER_URL"].rstrip("/")
+          version = tag[1:] if tag.startswith("v") else tag
+          pkg_name = f"wsl-agent-sandbox-{tag}"
+          sha_line = Path("dist/SHA256SUMS.txt").read_text(encoding="utf-8").strip().splitlines()[0]
+          zip_sha256 = sha_line.split()[0]
+
+          manifest = json.loads(Path("packaging/scoop/wsl-agent-sandbox.json").read_text(encoding="utf-8"))
+          manifest["version"] = version
+          manifest["url"] = f"{server_url}/{repo}/releases/download/{tag}/{pkg_name}.zip"
+          manifest["extract_dir"] = pkg_name
+          manifest["hash"] = zip_sha256
+
+          Path("dist/wsl-agent-sandbox.json").write_text(
+              json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+          )
+          PYEOF
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
@@ -33,3 +63,4 @@ jobs:
           files: |
             dist/*.zip
             dist/SHA256SUMS.txt
+            dist/wsl-agent-sandbox.json

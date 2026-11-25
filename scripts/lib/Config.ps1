@@ -12,13 +12,18 @@ function Expand-BoxPath {
 
 function Get-BoxLocalOverridePath {
     param(
-        [Parameter(Mandatory)][string]$ConfigPath
+        [Parameter(Mandatory)][string]$ConfigPath,
+        [string]$SearchDir = ''
     )
     $leaf = Split-Path -Leaf $ConfigPath
     if ($leaf -ne 'box.json') {
         return $null
     }
-    $dir = Split-Path -Parent $ConfigPath
+    $dir = if (-not [string]::IsNullOrWhiteSpace($SearchDir)) {
+        $SearchDir
+    } else {
+        Split-Path -Parent $ConfigPath
+    }
     if ([string]::IsNullOrWhiteSpace($dir)) {
         $dir = '.'
     }
@@ -162,15 +167,16 @@ function Resolve-BoxProfileConfig {
     param(
         [Parameter(Mandatory)][string]$RepoRoot,
         [Alias('Profile')][string]$ProfileName = '',
-        [string]$ExplicitConfigPath = ''
+        [string]$ExplicitConfigPath = '',
+        [string]$LocalOverrideSearchDir = ''
     )
     $basePath = if (-not [string]::IsNullOrWhiteSpace($ExplicitConfigPath)) {
         $ExplicitConfigPath
     } else {
         Join-Path $RepoRoot 'box.json'
     }
-    $baseCfg = Read-BoxConfig -ConfigPath $basePath
-    $cfg = Read-BoxConfig -ConfigPath $basePath
+    $baseCfg = Read-BoxConfig -ConfigPath $basePath -LocalOverrideSearchDir $LocalOverrideSearchDir
+    $cfg = Read-BoxConfig -ConfigPath $basePath -LocalOverrideSearchDir $LocalOverrideSearchDir
 
     if (-not [string]::IsNullOrWhiteSpace($ProfileName)) {
         if ($ProfileName -cnotmatch '^[a-z0-9][a-z0-9_-]{0,24}$') {
@@ -365,6 +371,7 @@ function Read-BoxConfig {
     param(
         [Parameter(Mandatory)][string]$ConfigPath,
         [string]$LocalOverridePath = '',
+        [string]$LocalOverrideSearchDir = '',
         [switch]$IgnoreLocalOverride
     )
     if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
@@ -384,7 +391,11 @@ function Read-BoxConfig {
         }
         $overrideFile = $LocalOverridePath
     } elseif (-not $IgnoreLocalOverride) {
-        $overrideFile = Get-BoxLocalOverridePath -ConfigPath $ConfigPath
+        if (-not [string]::IsNullOrWhiteSpace($LocalOverrideSearchDir)) {
+            $overrideFile = Get-BoxLocalOverridePath -ConfigPath $ConfigPath -SearchDir $LocalOverrideSearchDir
+        } else {
+            $overrideFile = Get-BoxLocalOverridePath -ConfigPath $ConfigPath
+        }
     }
 
     if ($overrideFile) {

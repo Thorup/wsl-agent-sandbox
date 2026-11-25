@@ -21,12 +21,16 @@ cd wsl-agent-sandbox
 ```
 
 ### Global Installation (Scoop)
-A Scoop manifest is provided in [`packaging/scoop/wsl-agent-sandbox.json`](../packaging/scoop/wsl-agent-sandbox.json). Once installed, invoke `wsl-sandbox` from any directory:
+Install directly from the latest GitHub Release Scoop manifest (or use [`packaging/scoop/wsl-agent-sandbox.json`](../packaging/scoop/wsl-agent-sandbox.json) as a template):
+```powershell
+scoop install https://github.com/Thorup/wsl-agent-sandbox/releases/latest/download/wsl-agent-sandbox.json
+```
+Once installed, invoke `wsl-sandbox` from any directory:
 ```powershell
 wsl-sandbox init
 wsl-sandbox shell
 ```
-When invoked globally without a `box.json` in the current directory, `wsl-sandbox` automatically looks for `%USERPROFILE%\.wsl-agent-sandbox\box.json`.
+When invoked globally without a `box.json` in the current directory, `wsl-sandbox` automatically looks for `%USERPROFILE%\.wsl-agent-sandbox\box.json` (and merges `%USERPROFILE%\.wsl-agent-sandbox\box.local.json` over the bundled `box.json`).
 
 ---
 

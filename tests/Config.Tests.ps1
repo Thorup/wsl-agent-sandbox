@@ -474,16 +474,69 @@ $tmpIdeDir = Join-Path ([System.IO.Path]::GetTempPath()) ("wsl-box-ide-test-" + 
 New-Item -ItemType Directory -Path $tmpIdeDir -Force | Out-Null
 try {
     $ideSettings = Join-Path $tmpIdeDir 'settings.json'
-    [System.IO.File]::WriteAllText($ideSettings, "// user settings`n{`n  `"editor.fontSize`": 14,`n}`n", (New-Object System.Text.UTF8Encoding($false)))
+    $jsoncMissing = @"
+// user settings
+{
+  /* block comment */
+  "editor.fontSize": 14,
+  "http.proxy": "https://proxy.example.com:8080", // inline URL comment
+}
+"@
+    [System.IO.File]::WriteAllText($ideSettings, $jsoncMissing, (New-Object System.Text.UTF8Encoding($false)))
     $updated1 = @(Sync-IdeWslScriptlessStartup -SettingsPaths @($ideSettings))
-    $parsedIde = (Get-Content -LiteralPath $ideSettings -Raw -Encoding UTF8) | ConvertFrom-Json
-    Assert-True "Sync-IdeWslScriptlessStartup sets remote.WSL.experimental.scriptLessStartup=true and preserves existing settings" (
+    $written1 = Get-Content -LiteralPath $ideSettings -Raw -Encoding UTF8
+    $parsedIde = ConvertFrom-Jsonc -Text $written1
+    Assert-True "Sync-IdeWslScriptlessStartup sets remote.WSL.experimental.scriptLessStartup=true and preserves existing settings and comments" (
         $updated1.Count -eq 1 -and
         $parsedIde.'remote.WSL.experimental.scriptLessStartup' -eq $true -and
-        $parsedIde.'editor.fontSize' -eq 14
+        $parsedIde.'editor.fontSize' -eq 14 -and
+        $parsedIde.'http.proxy' -eq 'https://proxy.example.com:8080' -and
+        $written1.Contains('// user settings') -and
+        $written1.Contains('/* block comment */') -and
+        $written1.Contains('// inline URL comment')
     )
     $updated2 = @(Sync-IdeWslScriptlessStartup -SettingsPaths @($ideSettings))
     Assert-True "Sync-IdeWslScriptlessStartup is idempotent when already enabled" ($updated2.Count -eq 0)
+
+    # Test updating an existing false value while preserving comments
+    $ideSettingsFalse = Join-Path $tmpIdeDir 'settings-false.json'
+    $jsoncFalse = @"
+// top comment
+{
+  /* keep block */
+  "remote.WSL.experimental.scriptLessStartup": false, // disabled by user
+  "editor.tabSize": 2
+}
+"@
+    [System.IO.File]::WriteAllText($ideSettingsFalse, $jsoncFalse, (New-Object System.Text.UTF8Encoding($false)))
+    $updated3 = @(Sync-IdeWslScriptlessStartup -SettingsPaths @($ideSettingsFalse))
+    $written3 = Get-Content -LiteralPath $ideSettingsFalse -Raw -Encoding UTF8
+    $parsedIde3 = ConvertFrom-Jsonc -Text $written3
+    Assert-True "Sync-IdeWslScriptlessStartup updates existing false value in-place and preserves comments" (
+        $updated3.Count -eq 1 -and
+        $parsedIde3.'remote.WSL.experimental.scriptLessStartup' -eq $true -and
+        $parsedIde3.'editor.tabSize' -eq 2 -and
+        $written3.Contains('// top comment') -and
+        $written3.Contains('/* keep block */') -and
+        $written3.Contains('// disabled by user')
+    )
+
+    # Test global Scoop config resolution (AppRoot without .git + StateRoot with box.local.json only)
+    $tmpScoopApp = Join-Path $tmpIdeDir 'scoop-app'
+    $tmpScoopState = Join-Path $tmpIdeDir 'scoop-state'
+    New-Item -ItemType Directory -Path $tmpScoopApp -Force | Out-Null
+    New-Item -ItemType Directory -Path $tmpScoopState -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $RepoRoot 'box.json') -Destination (Join-Path $tmpScoopApp 'box.json') -Force
+    [System.IO.File]::WriteAllText(
+        (Join-Path $tmpScoopState 'box.local.json'),
+        '{"distroName": "scoop-custom-sandbox", "agentUser": {"uid": 26555, "gid": 26555}}',
+        (New-Object System.Text.UTF8Encoding($false))
+    )
+    $scoopCfg = Resolve-BoxProfileConfig -RepoRoot $tmpScoopState -ExplicitConfigPath (Join-Path $tmpScoopApp 'box.json') -LocalOverrideSearchDir $tmpScoopState
+    Assert-True "Global Scoop resolution merges StateRoot box.local.json over AppRoot box.json" (
+        $scoopCfg.distroName -eq 'scoop-custom-sandbox' -and
+        [int]$scoopCfg.agentUser.uid -eq 26555
+    )
 
     Assert-True "Default box.json leaves ide.configureRemoteWsl disabled (opt-in)" (-not (Test-ShouldConfigureIdeRemoteWsl -Config $baseCfg))
     $ideOptInCfg = Copy-Config $baseCfg
