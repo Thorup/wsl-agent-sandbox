@@ -883,10 +883,15 @@ function Build-SeedSecretsPayload {
                 }
                 $topUser = [string](Get-ObjectProperty -Object $entry -Name 'user' -Default '')
                 $topOwner = [string](Get-ObjectProperty -Object $entry -Name 'owner' -Default '')
-                $topSetupGit = [bool](Get-ObjectProperty -Object $entry -Name 'setupGit' -Default $true)
+                $topProxyInject = [bool](Get-ObjectProperty -Object $entry -Name 'proxyInject' -Default $false)
+                $hasTopSetupGit = Test-ObjectHasProperty -Object $entry -Name 'setupGit'
+                $topSetupGit = if ($hasTopSetupGit) {
+                    [bool](Get-ObjectProperty -Object $entry -Name 'setupGit' -Default $true)
+                } else {
+                    -not $topProxyInject
+                }
                 $topExportEnv = [bool](Get-ObjectProperty -Object $entry -Name 'exportEnv' -Default $true)
                 $topLoginOnline = [bool](Get-ObjectProperty -Object $entry -Name 'loginOnline' -Default $false)
-                $topProxyInject = [bool](Get-ObjectProperty -Object $entry -Name 'proxyInject' -Default $false)
 
                 $rawProfiles = Get-ObjectProperty -Object $entry -Name 'profiles' -Default $null
                 $hasProfiles = ($null -ne $rawProfiles) -and (@($rawProfiles).Count -gt 0)
@@ -932,10 +937,24 @@ function Build-SeedSecretsPayload {
                         if ([string]::IsNullOrWhiteSpace($pOwner)) {
                             $pOwner = if ($pUser -and $pName -eq 'personal') { $pUser } else { $pName }
                         }
-                        $pSetupGit = [bool](Get-ObjectProperty -Object $pObj -Name 'setupGit' -Default $topSetupGit)
+                        $pProxyInject = [bool](Get-ObjectProperty -Object $pObj -Name 'proxyInject' -Default $topProxyInject)
+                        $hasPSetupGit = Test-ObjectHasProperty -Object $pObj -Name 'setupGit'
+                        $pSetupGit = if ($hasPSetupGit) {
+                            [bool](Get-ObjectProperty -Object $pObj -Name 'setupGit' -Default $true)
+                        } elseif ($hasTopSetupGit) {
+                            $topSetupGit
+                        } else {
+                            -not $pProxyInject
+                        }
                         $pExportEnv = [bool](Get-ObjectProperty -Object $pObj -Name 'exportEnv' -Default $topExportEnv)
                         $pLoginOnline = [bool](Get-ObjectProperty -Object $pObj -Name 'loginOnline' -Default $topLoginOnline)
-                        $pProxyInject = [bool](Get-ObjectProperty -Object $pObj -Name 'proxyInject' -Default $topProxyInject)
+
+                        if ($pProxyInject -and $pLoginOnline) {
+                            throw "github: 'loginOnline' cannot be true when 'proxyInject' is enabled (placeholder tokens cannot authenticate directly against GitHub without credential-proxy)."
+                        }
+                        if ($pProxyInject -and $pSetupGit -and ($pProto -eq 'https') -and ($hasPSetupGit -or $hasTopSetupGit)) {
+                            throw "github: 'setupGit: true' with 'gitProtocol: ""https""' is incompatible with 'proxyInject: true' (git cannot authenticate over HTTPS with a placeholder token). Omit 'setupGit' or set 'gitProtocol': 'ssh' and configure the 'git' service with 'mode': 'agent-proxy'."
+                        }
 
                         $pRealToken = Resolve-SecretValue -Object $pObj -BaseName 'token' -BaseDir $baseDir -Context $ctx -Required
                         $pAgentToken = $pRealToken
@@ -966,6 +985,12 @@ function Build-SeedSecretsPayload {
                         })
                     }
                 } else {
+                    if ($topProxyInject -and $topLoginOnline) {
+                        throw "github: 'loginOnline' cannot be true when 'proxyInject' is enabled (placeholder tokens cannot authenticate directly against GitHub without credential-proxy)."
+                    }
+                    if ($topProxyInject -and $topSetupGit -and ($topGitProtocol -eq 'https') -and $hasTopSetupGit) {
+                        throw "github: 'setupGit: true' with 'gitProtocol: ""https""' is incompatible with 'proxyInject: true' (git cannot authenticate over HTTPS with a placeholder token). Omit 'setupGit' or set 'gitProtocol': 'ssh' and configure the 'git' service with 'mode': 'agent-proxy'."
+                    }
                     $realToken = Resolve-SecretValue -Object $entry -BaseName 'token' -BaseDir $baseDir -Context 'github' -Required
                     $agentToken = $realToken
                     $proxyBaseUrl = ''
@@ -1959,23 +1984,45 @@ function Build-SeedSecretsPayload {
                 $agentOauth = $oauthToken
                 $proxyBaseUrl = ''
                 if ($proxyInject) {
-                    $injectHeaders = [ordered]@{}
+                    $tokenProfilesMap = [ordered]@{}
                     $expectedTokens = New-Object System.Collections.Generic.List[string]
+                    $primaryInjectHeaders = $null
+                    $primaryExpectedToken = ''
                     if (-not [string]::IsNullOrWhiteSpace($apiKey)) {
                         $agentClaudeKey = Get-ProxyPlaceholderToken -ServicePrefix 'claude'
-                        $injectHeaders['x-api-key'] = $apiKey
+                        $apiKeyHeaders = [ordered]@{ 'x-api-key' = $apiKey }
                         $expectedTokens.Add($agentClaudeKey)
+                        $tokenProfilesMap[$agentClaudeKey] = [ordered]@{
+                            profile         = 'apiKey'
+                            upstreamBaseUrl = 'https://api.anthropic.com'
+                            injectHeaders   = $apiKeyHeaders
+                        }
+                        if ($null -eq $primaryInjectHeaders) {
+                            $primaryInjectHeaders = $apiKeyHeaders
+                            $primaryExpectedToken = $agentClaudeKey
+                        }
                     }
                     if (-not [string]::IsNullOrWhiteSpace($oauthToken)) {
                         $agentOauth = Get-ProxyPlaceholderToken -ServicePrefix 'claude-oauth'
-                        $injectHeaders['Authorization'] = "Bearer $oauthToken"
+                        $oauthHeaders = [ordered]@{ Authorization = "Bearer $oauthToken" }
                         $expectedTokens.Add($agentOauth)
+                        $tokenProfilesMap[$agentOauth] = [ordered]@{
+                            profile         = 'oauth'
+                            upstreamBaseUrl = 'https://api.anthropic.com'
+                            injectHeaders   = $oauthHeaders
+                        }
+                        if ($null -eq $primaryInjectHeaders) {
+                            $primaryInjectHeaders = $oauthHeaders
+                            $primaryExpectedToken = $agentOauth
+                        }
                     }
                     $proxyBaseUrl = "$credProxyBase/claude"
                     $proxyRoutes['claude'] = [ordered]@{
                         upstreamBaseUrl = 'https://api.anthropic.com'
+                        expectedToken   = $primaryExpectedToken
                         expectedTokens  = $expectedTokens.ToArray()
-                        injectHeaders   = $injectHeaders
+                        injectHeaders   = $primaryInjectHeaders
+                        tokenProfiles   = $tokenProfilesMap
                     }
                 }
                 $resolvedServices['claude'] = [ordered]@{

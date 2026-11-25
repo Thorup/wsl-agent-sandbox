@@ -277,10 +277,45 @@ def update_overrides_section(section_name, lines):
         raise
 
 
+def get_active_aws_profile():
+    if os.path.isfile(OVERRIDES_FILE):
+        try:
+            with open(OVERRIDES_FILE, "r", encoding="utf-8") as f:
+                text = f.read()
+            m = re.search(
+                r"^# >>> aws >>>\\n(.*?)^# <<< aws <<<",
+                text,
+                re.MULTILINE | re.DOTALL,
+            )
+            if m:
+                for line in m.group(1).splitlines():
+                    pm = re.match(r"^export AWS_PROFILE=(.+)$", line.strip())
+                    if pm:
+                        parts = shlex.split(pm.group(1))
+                        if parts and parts[0]:
+                            return parts[0]
+        except Exception:
+            pass
+    env_prof = os.environ.get("AWS_PROFILE", "").strip()
+    if env_prof:
+        return env_prof
+    if os.path.isfile(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                st = json.load(f)
+            aws = (st.get("services") or {}).get("aws") or {}
+            def_prof = str(aws.get("defaultProfile") or "").strip()
+            if def_prof:
+                return def_prof
+        except Exception:
+            pass
+    return "default"
+
+
 def main():
     args = sys.argv[1:]
     profiles = load_aws_profiles()
-    active_prof = os.environ.get("AWS_PROFILE", "default")
+    active_prof = get_active_aws_profile()
 
     if not args or args[0] in ("-l", "--list", "list"):
         if not profiles:
@@ -442,34 +477,50 @@ def main():
         except Exception:
             existing_hosts = ""
     order, blocks = parse_gh_hosts_yml(existing_hosts)
-    if hostname not in order:
-        order.append(hostname)
-    h_lines = [
-        f"    git_protocol: {git_proto}",
-        f"    oauth_token: {json.dumps(str(token))}",
-    ]
-    if user:
-        h_lines.append(f"    user: {json.dumps(str(user))}")
-    blocks[hostname] = h_lines
+    if proxy_url:
+        blocks.pop(hostname, None)
+    else:
+        if hostname not in order:
+            order.append(hostname)
+        h_lines = [
+            f"    git_protocol: {git_proto}",
+            f"    oauth_token: {json.dumps(str(token))}",
+        ]
+        if user:
+            h_lines.append(f"    user: {json.dumps(str(user))}")
+        blocks[hostname] = h_lines
     out_lines = []
     for h in order:
         if h in blocks:
             out_lines.append(f"{h}:")
             out_lines.extend(blocks[h])
-    with open(GH_HOSTS_FILE, "w", encoding="utf-8") as f:
-        f.write("\\n".join(out_lines) + "\\n")
-    os.chmod(GH_HOSTS_FILE, 0o600)
+    if out_lines:
+        with open(GH_HOSTS_FILE, "w", encoding="utf-8") as f:
+            f.write("\\n".join(out_lines) + "\\n")
+        os.chmod(GH_HOSTS_FILE, 0o600)
+    elif os.path.isfile(GH_HOSTS_FILE):
+        try:
+            os.unlink(GH_HOSTS_FILE)
+        except OSError:
+            pass
 
     lines = [f"export WSL_BOX_GITHUB_PROFILE={shlex.quote(prof_name)}"]
-    if matched.get("exportEnv", True):
-        if hostname == "github.com":
-            lines.append(f"export GH_TOKEN={shlex.quote(token)}")
-        else:
-            lines.append(f"export GH_ENTERPRISE_TOKEN={shlex.quote(token)}")
     if proxy_url:
         lines.append(f"export GITHUB_API_URL={shlex.quote(proxy_url)}")
+        if matched.get("exportEnv", True):
+            lines.append(f"export GITHUB_TOKEN={shlex.quote(token)}")
+        else:
+            lines.append("unset GITHUB_TOKEN")
+        lines.append("unset GH_TOKEN GH_ENTERPRISE_TOKEN")
+    elif matched.get("exportEnv", True):
+        if hostname == "github.com":
+            lines.append(f"export GH_TOKEN={shlex.quote(token)}")
+            lines.append("unset GH_ENTERPRISE_TOKEN GITHUB_API_URL GITHUB_TOKEN")
+        else:
+            lines.append(f"export GH_ENTERPRISE_TOKEN={shlex.quote(token)}")
+            lines.append("unset GH_TOKEN GITHUB_API_URL GITHUB_TOKEN")
     else:
-        lines.append("unset GITHUB_API_URL")
+        lines.append("unset GH_TOKEN GH_ENTERPRISE_TOKEN GITHUB_API_URL GITHUB_TOKEN")
 
     update_overrides_section("github", lines)
     owner = matched.get("owner") or prof_name

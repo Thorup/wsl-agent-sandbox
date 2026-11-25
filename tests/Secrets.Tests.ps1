@@ -770,12 +770,33 @@ try {
         $proxyBuilt.Payload.services.claude.proxyBaseUrl -eq 'http://127.0.0.1:3129/claude' -and
         $proxyBuilt.Payload.services.gemini.proxyBaseUrl -eq 'http://127.0.0.1:3129/gemini' -and
         $proxyBuilt.Payload.services.github.proxyBaseUrl -eq 'http://127.0.0.1:3129/github' -and
+        $proxyBuilt.Payload.services.github.setupGit -eq $false -and
         $proxyBuilt.Payload.proxyRoutes.github.upstreamBaseUrl -eq 'https://ghes.example.internal/api/v3' -and
         $proxyBuilt.Payload.proxyRoutes.claude.injectHeaders['x-api-key'] -eq 'sk-ant-real-secret-value' -and
-        $proxyBuilt.Payload.proxyRoutes.claude.injectHeaders['Authorization'] -eq 'Bearer oauth-real-secret-value' -and
+        -not $proxyBuilt.Payload.proxyRoutes.claude.injectHeaders.Contains('Authorization') -and
+        $proxyBuilt.Payload.proxyRoutes.claude.tokenProfiles[$proxyBuilt.Payload.services.claude.apiKey].injectHeaders['x-api-key'] -eq 'sk-ant-real-secret-value' -and
+        -not $proxyBuilt.Payload.proxyRoutes.claude.tokenProfiles[$proxyBuilt.Payload.services.claude.apiKey].injectHeaders.Contains('Authorization') -and
+        $proxyBuilt.Payload.proxyRoutes.claude.tokenProfiles[$proxyBuilt.Payload.services.claude.oauthToken].injectHeaders['Authorization'] -eq 'Bearer oauth-real-secret-value' -and
+        -not $proxyBuilt.Payload.proxyRoutes.claude.tokenProfiles[$proxyBuilt.Payload.services.claude.oauthToken].injectHeaders.Contains('x-api-key') -and
         $proxyBuilt.Payload.proxyRoutes.gemini.injectHeaders['x-goog-api-key'] -eq 'AIza-real-secret-value' -and
         $proxyBuilt.Payload.proxyRoutes.jira.injectHeaders['Authorization'] -match '^Basic '
     )
+
+    $badGhProxyLoginManifest = Join-Path $tmpDir 'bad-gh-proxy-login.json'
+    [System.IO.File]::WriteAllText($badGhProxyLoginManifest, (@{
+        github = @{ token = 'ghp_realsecret123456'; proxyInject = $true; loginOnline = $true }
+    } | ConvertTo-Json -Depth 4), (New-Object System.Text.UTF8Encoding($false)))
+    Assert-Throws "Rejects github.proxyInject with loginOnline=true" {
+        Build-SeedSecretsPayload -ManifestPath $badGhProxyLoginManifest -AgentName 'agent'
+    } 'loginOnline'
+
+    $badGhProxySetupGitManifest = Join-Path $tmpDir 'bad-gh-proxy-setupgit.json'
+    [System.IO.File]::WriteAllText($badGhProxySetupGitManifest, (@{
+        github = @{ token = 'ghp_realsecret123456'; proxyInject = $true; setupGit = $true; gitProtocol = 'https' }
+    } | ConvertTo-Json -Depth 4), (New-Object System.Text.UTF8Encoding($false)))
+    Assert-Throws "Rejects github.proxyInject with explicit setupGit=true and gitProtocol=https" {
+        Build-SeedSecretsPayload -ManifestPath $badGhProxySetupGitManifest -AgentName 'agent'
+    } 'setupGit'
 
     $badJiraMtlsManifest = Join-Path $tmpDir 'bad-jira-mtls.json'
     [System.IO.File]::WriteAllText($badJiraMtlsManifest, (@{

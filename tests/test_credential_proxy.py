@@ -451,6 +451,105 @@ class CredentialProxyTests(unittest.TestCase):
             credential_proxy.verify_caller_uid = orig_verify
             os.unlink(cfg_path)
 
+    def test_claude_token_profiles_and_gemini_query_key_stripping(self):
+        received = {}
+
+        class UpstreamHandler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                received["path"] = self.path
+                received["headers"] = {k.lower(): v for k, v in self.headers.items()}
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"OK")
+
+            def log_message(self, *args):
+                pass
+
+        up_srv = http.server.HTTPServer(("127.0.0.1", 0), UpstreamHandler)
+        up_port = up_srv.server_address[1]
+        threading.Thread(target=up_srv.serve_forever, daemon=True).start()
+
+        cfg_data = {
+            "routes": {
+                "claude": {
+                    "upstreamBaseUrl": f"http://127.0.0.1:{up_port}",
+                    "expectedToken": "ph-claude-key",
+                    "expectedTokens": ["ph-claude-key", "ph-claude-oauth"],
+                    "injectHeaders": {"x-api-key": "real-claude-key"},
+                    "tokenProfiles": {
+                        "ph-claude-key": {
+                            "profile": "apiKey",
+                            "upstreamBaseUrl": f"http://127.0.0.1:{up_port}",
+                            "injectHeaders": {"x-api-key": "real-claude-key"},
+                        },
+                        "ph-claude-oauth": {
+                            "profile": "oauth",
+                            "upstreamBaseUrl": f"http://127.0.0.1:{up_port}",
+                            "injectHeaders": {"Authorization": "Bearer real-claude-oauth"},
+                        },
+                    },
+                },
+                "gemini": {
+                    "upstreamBaseUrl": f"http://127.0.0.1:{up_port}",
+                    "expectedToken": "ph-gemini-123",
+                    "injectHeaders": {"x-goog-api-key": "real-gemini-key"},
+                },
+            }
+        }
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+            json.dump(cfg_data, f)
+            cfg_path = f.name
+
+        orig_load = credential_proxy.load_routes
+        orig_insecure = credential_proxy.ALLOW_INSECURE_HTTP_FOR_TEST
+        credential_proxy.load_routes = lambda p=cfg_path: orig_load(p)
+        credential_proxy.ALLOW_INSECURE_HTTP_FOR_TEST = True
+
+        proxy_srv = credential_proxy.ThreadingHTTPServer(("127.0.0.1", 0), credential_proxy.CredentialProxyHandler)
+        proxy_port = proxy_srv.server_address[1]
+        threading.Thread(target=proxy_srv.serve_forever, daemon=True).start()
+
+        def raw_req(payload):
+            with socket.create_connection(("127.0.0.1", proxy_port), timeout=5) as s:
+                s.sendall(payload)
+                chunks = []
+                while True:
+                    d = s.recv(4096)
+                    if not d:
+                        break
+                    chunks.append(d)
+                return b"".join(chunks).decode("utf-8", errors="replace")
+
+        try:
+            # 1. Claude apiKey placeholder injects ONLY x-api-key
+            r_key = raw_req(b"GET /claude/v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nx-api-key: ph-claude-key\r\n\r\n")
+            self.assertIn("200", r_key.splitlines()[0])
+            self.assertEqual(received["headers"].get("x-api-key"), "real-claude-key")
+            self.assertNotIn("authorization", received["headers"])
+
+            # 2. Claude oauth placeholder injects ONLY Authorization: Bearer
+            r_oauth = raw_req(b"GET /claude/v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer ph-claude-oauth\r\n\r\n")
+            self.assertIn("200", r_oauth.splitlines()[0])
+            self.assertEqual(received["headers"].get("authorization"), "Bearer real-claude-oauth")
+            self.assertNotIn("x-api-key", received["headers"])
+
+            # 3. Gemini ?key= query parameter authenticates and strips key= before forwarding upstream
+            r_gem = raw_req(b"GET /gemini/v1beta/models?key=ph-gemini-123&pageSize=5 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            self.assertIn("200", r_gem.splitlines()[0])
+            self.assertEqual(received["headers"].get("x-goog-api-key"), "real-gemini-key")
+            self.assertEqual(received["path"], "/v1beta/models?pageSize=5")
+        finally:
+            proxy_srv.shutdown()
+            proxy_srv.server_close()
+            up_srv.shutdown()
+            up_srv.server_close()
+            credential_proxy.load_routes = orig_load
+            credential_proxy.ALLOW_INSECURE_HTTP_FOR_TEST = orig_insecure
+            os.unlink(cfg_path)
+
 
 if __name__ == "__main__":
     unittest.main()

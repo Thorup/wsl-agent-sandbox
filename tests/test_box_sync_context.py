@@ -223,6 +223,17 @@ class TestBoxSyncContext(unittest.TestCase):
         self.assertIn("# >>> aws >>>", overrides_both)
         self.assertIn("AWS_PROFILE=", overrides_both)
 
+        # Verify use-aws --list reads active-overrides.env even when AWS_PROFILE is unset in os.environ
+        env_no_aws = {k: v for k, v in env.items() if k != "AWS_PROFILE"}
+        res_aws_list = subprocess.run(
+            [sys.executable, use_aws_bin, "--list"],
+            env=env_no_aws,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertIn("* staging", res_aws_list.stdout)
+
         use_gh_bin = os.path.join(self.bin_dir, "use-github")
         res_gh = subprocess.run(
             [sys.executable, use_gh_bin, "acme-org"],
@@ -237,6 +248,101 @@ class TestBoxSyncContext(unittest.TestCase):
         self.assertIn("# >>> github >>>", overrides_all)
         self.assertIn("WSL_BOX_GITHUB_PROFILE=", overrides_all)
         self.assertIn("sandbox-proxy-github-workorg-placeholder", overrides_all)
+        self.assertIn("GITHUB_API_URL=", overrides_all)
+        self.assertIn("GITHUB_TOKEN=", overrides_all)
+        self.assertIn("unset GH_TOKEN GH_ENTERPRISE_TOKEN", overrides_all)
+
+    def test_use_github_unsets_stale_vars_across_profiles(self):
+        gh_profiles_path = os.path.join(self.state_dir, "github-profiles.json")
+        with open(gh_profiles_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "defaultProfile": "personal",
+                    "profiles": [
+                        {
+                            "name": "personal",
+                            "owner": "Thorup",
+                            "hostname": "github.com",
+                            "token": "ghp_personal_real",
+                            "user": "Thorup",
+                            "gitProtocol": "https",
+                            "exportEnv": True,
+                            "proxyBaseUrl": "",
+                        },
+                        {
+                            "name": "ghes",
+                            "owner": "acme",
+                            "hostname": "ghes.example.internal",
+                            "token": "ghp_ghes_real",
+                            "user": "Thorup",
+                            "gitProtocol": "https",
+                            "exportEnv": True,
+                            "proxyBaseUrl": "",
+                        },
+                        {
+                            "name": "noenv",
+                            "owner": "noenv",
+                            "hostname": "github.com",
+                            "token": "ghp_noenv_real",
+                            "user": "Thorup",
+                            "gitProtocol": "https",
+                            "exportEnv": False,
+                            "proxyBaseUrl": "",
+                        },
+                        {
+                            "name": "proxied",
+                            "owner": "proxied",
+                            "hostname": "github.com",
+                            "token": "sandbox-proxy-github-abc",
+                            "user": "Thorup",
+                            "gitProtocol": "ssh",
+                            "exportEnv": True,
+                            "proxyBaseUrl": "http://127.0.0.1:3129/github",
+                        },
+                    ],
+                },
+                f,
+            )
+
+        box_sync_context.sync_all(self.policy_path, agent_home_override=self.agent_home, bin_dir=self.bin_dir)
+        env = dict(os.environ)
+        env["HOME"] = self.agent_home
+        use_gh_bin = os.path.join(self.bin_dir, "use-github")
+        overrides_file = os.path.join(self.state_dir, "active-overrides.env")
+        hosts_file = os.path.join(self.agent_home, ".config", "gh", "hosts.yml")
+
+        # 1. Switch to github.com direct profile -> exports GH_TOKEN, unsets GH_ENTERPRISE_TOKEN & proxy vars
+        subprocess.run([sys.executable, use_gh_bin, "personal"], env=env, check=True, capture_output=True)
+        with open(overrides_file, "r", encoding="utf-8") as f:
+            txt = f.read()
+        self.assertIn("export GH_TOKEN=ghp_personal_real", txt)
+        self.assertIn("unset GH_ENTERPRISE_TOKEN GITHUB_API_URL GITHUB_TOKEN", txt)
+        self.assertTrue(os.path.isfile(hosts_file))
+
+        # 2. Switch to GHES direct profile -> exports GH_ENTERPRISE_TOKEN, unsets GH_TOKEN & proxy vars
+        subprocess.run([sys.executable, use_gh_bin, "ghes"], env=env, check=True, capture_output=True)
+        with open(overrides_file, "r", encoding="utf-8") as f:
+            txt = f.read()
+        self.assertIn("export GH_ENTERPRISE_TOKEN=ghp_ghes_real", txt)
+        self.assertIn("unset GH_TOKEN GITHUB_API_URL GITHUB_TOKEN", txt)
+
+        # 3. Switch to exportEnv=False -> unsets all token & proxy vars
+        subprocess.run([sys.executable, use_gh_bin, "noenv"], env=env, check=True, capture_output=True)
+        with open(overrides_file, "r", encoding="utf-8") as f:
+            txt = f.read()
+        self.assertIn("unset GH_TOKEN GH_ENTERPRISE_TOKEN GITHUB_API_URL GITHUB_TOKEN", txt)
+
+        # 4. Switch to proxyInject=True -> exports GITHUB_API_URL + GITHUB_TOKEN, unsets GH_TOKEN/GH_ENTERPRISE_TOKEN, removes github.com from hosts.yml
+        subprocess.run([sys.executable, use_gh_bin, "proxied"], env=env, check=True, capture_output=True)
+        with open(overrides_file, "r", encoding="utf-8") as f:
+            txt = f.read()
+        self.assertIn("export GITHUB_API_URL=http://127.0.0.1:3129/github", txt)
+        self.assertIn("export GITHUB_TOKEN=sandbox-proxy-github-abc", txt)
+        self.assertIn("unset GH_TOKEN GH_ENTERPRISE_TOKEN", txt)
+        with open(hosts_file, "r", encoding="utf-8") as f:
+            hosts_txt = f.read()
+        self.assertNotIn("github.com:", hosts_txt)
+        self.assertIn("ghes.example.internal:", hosts_txt)
 
 
 if __name__ == "__main__":
