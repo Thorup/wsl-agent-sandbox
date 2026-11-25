@@ -909,7 +909,6 @@ try {
         Build-SeedSecretsPayload -ManifestPath $badModeManifest -AgentName 'agent' | Out-Null
     } "must be 'files' or 'agent-proxy'"
 
-<<<<<<< HEAD
     # 9. Schema-driven unknown nested property rejection without secret leakage
     $unknownNestedCases = @(
         @{

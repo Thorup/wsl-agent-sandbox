@@ -61,9 +61,9 @@ function Get-DeterministicProxyPorts {
         }
     }
     if ($Uid -ge 26100 -and $Uid -le 26998) {
-        $egress = 13000 + (($Uid - 26100) * 2)
+        $egress = 30900 + (($Uid - 26100) * 2)
     } else {
-        $egress = 15000 + ((($Uid * 31) % 8000) * 2)
+        $egress = 29100 + ((($Uid * 31) % 450) * 2)
     }
     return [pscustomobject]@{
         EgressPort     = $egress

@@ -103,9 +103,9 @@ def deterministic_proxy_ports(uid):
     if uid == 26040:
         return 3128, 3129
     if 26100 <= uid <= 26998:
-        egress = 13000 + (uid - 26100) * 2
+        egress = 30900 + (uid - 26100) * 2
     else:
-        egress = 15000 + ((uid * 31) % 8000) * 2
+        egress = 29100 + ((uid * 31) % 450) * 2
     return egress, egress + 1
 
 distro = policy["distroName"]
@@ -542,7 +542,7 @@ lines.extend([
     f"        meta skuid != {agent_uid} accept",
     "        ct state established,related accept",
     f'        oifname "lo" tcp dport {{ {egress_port}, {cred_port} }} accept',
-    '        oifname "lo" tcp dport { 3128, 3129, 13000-30999 } drop',
+    '        oifname "lo" tcp dport { 3128, 3129, 29100-29999, 30900-32697 } drop',
     '        oifname "lo" accept',
 ])
 

@@ -17,6 +17,13 @@ spec.loader.exec_module(credential_proxy)
 
 
 class CredentialProxyTests(unittest.TestCase):
+    def setUp(self):
+        self._orig_egress_file = credential_proxy.EGRESS_ALLOWLIST_FILE
+        credential_proxy.EGRESS_ALLOWLIST_FILE = "/nonexistent/wsl-box-test-egress-allowlist.json"
+
+    def tearDown(self):
+        credential_proxy.EGRESS_ALLOWLIST_FILE = self._orig_egress_file
+
     def test_corrupt_config_fails_closed(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
             f.write("{corrupt")

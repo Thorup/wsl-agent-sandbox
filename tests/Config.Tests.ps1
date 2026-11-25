@@ -572,7 +572,6 @@ $disabledDockerCfg = Copy-Config $baseCfg
 $disabledDockerCfg.docker.enabled = $false
 Assert-True "No Docker advisories when docker.enabled is false" (@(Get-DockerSecurityAdvisories -Config $disabledDockerCfg).Count -eq 0)
 
-<<<<<<< HEAD
 # Strict unknown-property rejection across all config sections
 Assert-Throws "Rejects unknown property at box.json root" {
     $c = Copy-Config $baseCfg
@@ -926,7 +925,17 @@ Assert-True "All profile UIDs 26100..26998 resolve unique non-colliding proxy po
 Assert-True "All profile UIDs 26100..26998 resolve proxy ports < 32768" $allProfilePortsBelowEphemeral
 
 $customPorts = Get-DeterministicProxyPorts -Uid 15001
-Assert-True "Custom UID 15001 resolves valid proxy port pair < 32768" ($customPorts.EgressPort -ge 15000 -and $customPorts.CredentialPort -eq ($customPorts.EgressPort + 1) -and $customPorts.CredentialPort -lt 32768)
+Assert-True "Custom UID 15001 resolves valid proxy port pair in 29100..29999 (< 32768)" ($customPorts.EgressPort -ge 29100 -and $customPorts.CredentialPort -eq ($customPorts.EgressPort + 1) -and $customPorts.CredentialPort -le 29999)
+
+$commonDevPorts = @(3000, 3306, 5432, 6379, 8080, 9200, 11434, 15672, 16686, 18080, 19092, 26257, 27017, 28015, 30000)
+$devPortsUnblocked = $true
+foreach ($dp in $commonDevPorts) {
+    if ($dp -in @(3128, 3129) -or ($dp -ge 29100 -and $dp -le 29999) -or ($dp -ge 30900 -and $dp -le 32697)) {
+        $devPortsUnblocked = $false
+        break
+    }
+}
+Assert-True "Reserved proxy port ranges leave common localhost DB/broker/NodePort ports unblocked" $devPortsUnblocked
 
 Write-Host ""
 Write-Host "=== Config.Tests.ps1 Summary: PASS=$script:Passed FAIL=$script:Failed ==="

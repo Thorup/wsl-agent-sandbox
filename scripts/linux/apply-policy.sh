@@ -166,10 +166,11 @@ if squatters:
 subprocess.run(["systemctl", "enable", "egress-proxy.service"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 subprocess.run(["systemctl", "restart", "egress-proxy.service"], check=True)
 
+loopback_hex = f"{int.from_bytes(b'\x7f\x00\x00\x01', sys.byteorder):08X}"
 deadline = time.monotonic() + 3.0
 while time.monotonic() < deadline:
     active = subprocess.run(["systemctl", "is-active", "--quiet", "egress-proxy.service"], check=False).returncode == 0
-    root_listen = any(addr == f"0100007F:{hex_port}" and uid == 0 for addr, uid, _ in find_listeners(hex_port))
+    root_listen = any(addr == f"{loopback_hex}:{hex_port}" and uid == 0 for addr, uid, _ in find_listeners(hex_port))
     if active and root_listen:
         sys.exit(0)
     time.sleep(0.1)

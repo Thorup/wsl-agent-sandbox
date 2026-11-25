@@ -55,9 +55,9 @@ def deterministic_proxy_ports(uid):
     if uid == 26040:
         return 3128, 3129
     if 26100 <= uid <= 26998:
-        egress = 13000 + (uid - 26100) * 2
+        egress = 30900 + (uid - 26100) * 2
     else:
-        egress = 15000 + ((uid * 31) % 8000) * 2
+        egress = 29100 + ((uid * 31) % 450) * 2
     return egress, egress + 1
 
 EGRESS_PROXY_PORT, CRED_PROXY_PORT = deterministic_proxy_ports(AGENT_UID)
@@ -1843,11 +1843,12 @@ def sync_credential_proxy(routes):
             subprocess.run(["systemctl", "enable", "credential-proxy.service"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             subprocess.run(["systemctl", "restart", "credential-proxy.service"], check=True)
             hex_port = f"{CRED_PROXY_PORT:04X}"
+            loopback_hex = f"{int.from_bytes(b'\x7f\x00\x00\x01', sys.byteorder):08X}"
             deadline = time.monotonic() + 3.0
             verified = False
             while time.monotonic() < deadline:
                 active = subprocess.run(["systemctl", "is-active", "--quiet", "credential-proxy.service"], check=False).returncode == 0
-                root_listen = any(addr == f"0100007F:{hex_port}" and uid == 0 for addr, uid, _ in _find_listening_sockets(CRED_PROXY_PORT))
+                root_listen = any(addr == f"{loopback_hex}:{hex_port}" and uid == 0 for addr, uid, _ in _find_listening_sockets(CRED_PROXY_PORT))
                 if active and root_listen:
                     verified = True
                     break
