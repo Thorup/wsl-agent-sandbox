@@ -1284,6 +1284,11 @@ def seed_git(cfg, prev_meta):
             )
             expected_basenames.add(cert_basename)
             cert_paths[k_name] = cert_path
+            if is_agent_proxy:
+                cert_blob_hex = extract_pubkey_blob_hex(cert_raw)
+                if not cert_blob_hex:
+                    raise ValueError(f"Invalid certificate material for Git SSH key '{k_name}'.")
+                agent_proxy_keys[-1]["certBlobHex"] = cert_blob_hex
 
     has_known_hosts = False
     cleaned_kh = [line.strip() for line in known_hosts_raw if isinstance(line, str) and line.strip()]
@@ -1537,6 +1542,11 @@ def seed_ssh(cfg, prev_meta):
             )
             expected_basenames.add(cert_basename)
             cert_paths[k_name] = cert_path
+            if is_agent_proxy:
+                cert_blob_hex = extract_pubkey_blob_hex(cert_raw)
+                if not cert_blob_hex:
+                    raise ValueError(f"Invalid certificate material for SSH key '{k_name}'.")
+                agent_proxy_keys[-1]["certBlobHex"] = cert_blob_hex
 
     has_known_hosts = False
     cleaned_kh = [line.strip() for line in known_hosts_raw if isinstance(line, str) and line.strip()]
@@ -1783,9 +1793,11 @@ def cancel_ttl_timer(svc_name):
 
 SSH_AGENT_DIR = "/run/box-root/ssh-agent"
 SSH_AGENT_UPSTREAM_SOCK = os.path.join(SSH_AGENT_DIR, "upstream.sock")
-SSH_AGENT_STATE_FILE = os.path.join(SSH_AGENT_DIR, "root-keys.json")
+SSH_AGENT_STATE_FILE = "/etc/wsl-agent-sandbox/ssh-agent-keys.json"
+SSH_AGENT_LEGACY_STATE_FILE = os.path.join(SSH_AGENT_DIR, "root-keys.json")
 SSH_AGENT_ALLOWLIST_FILE = "/etc/wsl-agent-sandbox/ssh-agent-allowlist.json"
 SSH_AGENT_ENV_FILE = os.path.join(ENV_D_DIR, "90-ssh-agent-proxy.env")
+SSH_AGENT_CTL = "/usr/local/sbin/box-ssh-agent-ctl.sh"
 
 def load_root_ssh_agent_services():
     if not os.path.isfile(SSH_AGENT_STATE_FILE):
@@ -1804,6 +1816,7 @@ def sync_root_ssh_agent_state(agent_services_map):
         for entry in os.listdir(SSH_AGENT_DIR):
             if entry.startswith("keys-"):
                 shutil.rmtree(os.path.join(SSH_AGENT_DIR, entry), ignore_errors=True)
+    remove_file_quiet(SSH_AGENT_LEGACY_STATE_FILE)
 
     all_keys = []
     all_blobs = set()
@@ -1815,42 +1828,53 @@ def sync_root_ssh_agent_state(agent_services_map):
         for item in k_list:
             if isinstance(item, dict) and item.get("privateKey") and item.get("blobHex"):
                 register_ssh_private_key(item["privateKey"])
-                valid_items.append({"name": item.get("name", ""), "privateKey": item["privateKey"], "blobHex": item["blobHex"].lower()})
+                entry = {"name": item.get("name", ""), "privateKey": item["privateKey"], "blobHex": item["blobHex"].lower()}
                 all_keys.append(item["privateKey"])
                 all_blobs.add(item["blobHex"].lower())
+                if item.get("certBlobHex"):
+                    cert_blob = str(item["certBlobHex"]).lower()
+                    entry["certBlobHex"] = cert_blob
+                    all_blobs.add(cert_blob)
+                valid_items.append(entry)
         if valid_items:
             cleaned_map[s_name] = valid_items
 
     env = dict(os.environ, SSH_AUTH_SOCK=SSH_AGENT_UPSTREAM_SOCK)
     if all_keys:
-        os.makedirs("/run/box-root", mode=0o700, exist_ok=True)
-        os.makedirs(SSH_AGENT_DIR, mode=0o700, exist_ok=True)
-        os.chmod(SSH_AGENT_DIR, 0o700)
-
+        os.makedirs(os.path.dirname(SSH_AGENT_STATE_FILE), mode=0o755, exist_ok=True)
         tmp_state = f"{SSH_AGENT_STATE_FILE}.tmp.{os.getpid()}"
         with open(tmp_state, "w", encoding="utf-8") as sf:
             json.dump({"services": cleaned_map}, sf, indent=2)
         os.chmod(tmp_state, 0o600)
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            os.chown(tmp_state, 0, 0)
         os.replace(tmp_state, SSH_AGENT_STATE_FILE)
-
-        probe = subprocess.run(["ssh-add", "-l"], env=env, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if probe.returncode not in (0, 1):
-            remove_file_quiet(SSH_AGENT_UPSTREAM_SOCK)
-            subprocess.run(["ssh-agent", "-a", SSH_AGENT_UPSTREAM_SOCK], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            os.chmod(SSH_AGENT_UPSTREAM_SOCK, 0o600)
-
-        subprocess.run(["ssh-add", "-D"], env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        for priv_key in all_keys:
-            add_proc = subprocess.run(["ssh-add", "-"], input=priv_key, text=True, env=env, check=False, capture_output=True)
-            if add_proc.returncode != 0:
-                raise RuntimeError(f"ssh-add failed loading key into root ssh-agent: {(add_proc.stderr or add_proc.stdout).strip()}")
 
         os.makedirs(os.path.dirname(SSH_AGENT_ALLOWLIST_FILE), mode=0o755, exist_ok=True)
         tmp_al = f"{SSH_AGENT_ALLOWLIST_FILE}.tmp.{os.getpid()}"
         with open(tmp_al, "w", encoding="utf-8") as af:
             json.dump({"allowedKeyBlobsHex": sorted(all_blobs)}, af, indent=2)
         os.chmod(tmp_al, 0o600)
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            os.chown(tmp_al, 0, 0)
         os.replace(tmp_al, SSH_AGENT_ALLOWLIST_FILE)
+
+        if os.path.isfile(SSH_AGENT_CTL):
+            subprocess.run([SSH_AGENT_CTL, "ensure-upstream"], check=True)
+        else:
+            os.makedirs("/run/box-root", mode=0o700, exist_ok=True)
+            os.makedirs(SSH_AGENT_DIR, mode=0o700, exist_ok=True)
+            os.chmod(SSH_AGENT_DIR, 0o700)
+            probe = subprocess.run(["ssh-add", "-l"], env=env, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if probe.returncode not in (0, 1):
+                remove_file_quiet(SSH_AGENT_UPSTREAM_SOCK)
+                subprocess.run(["ssh-agent", "-a", SSH_AGENT_UPSTREAM_SOCK], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                os.chmod(SSH_AGENT_UPSTREAM_SOCK, 0o600)
+            subprocess.run(["ssh-add", "-D"], env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            for priv_key in all_keys:
+                add_proc = subprocess.run(["ssh-add", "-"], input=priv_key, text=True, env=env, check=False, capture_output=True)
+                if add_proc.returncode != 0:
+                    raise RuntimeError(f"ssh-add failed loading key into root ssh-agent: {(add_proc.stderr or add_proc.stdout).strip()}")
 
         write_agent_file(SSH_AGENT_ENV_FILE, 'export SSH_AUTH_SOCK="/run/ssh-agent-proxy/agent.sock"\n', mode=0o600)
         if has_systemd:
@@ -1858,6 +1882,8 @@ def sync_root_ssh_agent_state(agent_services_map):
             subprocess.run(["systemctl", "enable", "ssh-agent-proxy.service"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             subprocess.run(["systemctl", "restart", "ssh-agent-proxy.service"], check=True)
     else:
+        if os.path.isfile(SSH_AGENT_CTL):
+            subprocess.run([SSH_AGENT_CTL, "stop-upstream"], check=False)
         if os.path.exists(SSH_AGENT_UPSTREAM_SOCK):
             subprocess.run(["ssh-add", "-D"], env=env, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             subprocess.run(["pkill", "-f", SSH_AGENT_UPSTREAM_SOCK], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -1973,7 +1999,7 @@ if args.clear:
             proxy_routes_state = {}
         sync_credential_proxy(proxy_routes_state)
 
-    if ssh_agent_changed or (not args.services.strip() and (os.path.isfile(SSH_AGENT_ALLOWLIST_FILE) or os.path.exists(SSH_AGENT_UPSTREAM_SOCK))):
+    if ssh_agent_changed or (not args.services.strip() and (os.path.isfile(SSH_AGENT_STATE_FILE) or os.path.isfile(SSH_AGENT_ALLOWLIST_FILE) or os.path.exists(SSH_AGENT_UPSTREAM_SOCK))):
         if not args.services.strip():
             ssh_agent_state = {}
         sync_root_ssh_agent_state(ssh_agent_state)

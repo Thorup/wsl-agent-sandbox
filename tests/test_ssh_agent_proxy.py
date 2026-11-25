@@ -1,14 +1,18 @@
 import importlib.util
 import json
 import os
+import shutil
 import socket
 import struct
+import subprocess
 import tempfile
 import threading
 import unittest
 from pathlib import Path
 
-MODULE_PATH = Path(__file__).resolve().parent.parent / "scripts" / "linux" / "ssh-agent-proxy.py"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+MODULE_PATH = REPO_ROOT / "scripts" / "linux" / "ssh-agent-proxy.py"
+CTL_SCRIPT_PATH = REPO_ROOT / "scripts" / "linux" / "box-ssh-agent-ctl.sh"
 spec = importlib.util.spec_from_file_location("ssh_agent_proxy", MODULE_PATH)
 ssh_agent_proxy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ssh_agent_proxy)
@@ -155,6 +159,105 @@ class SshAgentProxyTests(unittest.TestCase):
                 if os.path.exists(p):
                     os.unlink(p)
             os.rmdir(tmpdir)
+
+    def test_bind_succeeds_when_runtime_dir_already_exists_0755(self):
+        tmpdir = tempfile.mkdtemp(prefix="ssh-proxy-rt-")
+        sock_dir = os.path.join(tmpdir, "ssh-agent-proxy")
+        os.makedirs(sock_dir, mode=0o755, exist_ok=True)
+        os.chmod(sock_dir, 0o755)
+        listen_sock = os.path.join(sock_dir, "agent.sock")
+        orig_listen = ssh_agent_proxy.LISTEN_SOCK
+        orig_accept = socket.socket.accept
+        try:
+            ssh_agent_proxy.LISTEN_SOCK = listen_sock
+
+            class StopLoop(Exception):
+                pass
+
+            def stop_accept(self_sock):
+                self_sock.close()
+                raise StopLoop()
+
+            socket.socket.accept = stop_accept
+            with self.assertRaises(StopLoop):
+                ssh_agent_proxy.main()
+            self.assertTrue(os.path.exists(listen_sock))
+            self.assertEqual(os.stat(listen_sock).st_mode & 0o777, 0o660)
+        finally:
+            socket.socket.accept = orig_accept
+            ssh_agent_proxy.LISTEN_SOCK = orig_listen
+            if os.path.exists(listen_sock):
+                os.unlink(listen_sock)
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_ctl_script_syntax_and_idempotent_lifecycle(self):
+        self.assertTrue(CTL_SCRIPT_PATH.is_file(), f"Missing {CTL_SCRIPT_PATH}")
+        bash_check = subprocess.run(["bash", "-n", str(CTL_SCRIPT_PATH)], capture_output=True, text=True)
+        self.assertEqual(bash_check.returncode, 0, f"bash -n failed: {bash_check.stderr}")
+
+        if shutil.which("shellcheck"):
+            sc = subprocess.run(["shellcheck", str(CTL_SCRIPT_PATH)], capture_output=True, text=True)
+            self.assertEqual(sc.returncode, 0, f"shellcheck failed: {sc.stdout}\n{sc.stderr}")
+
+        if not shutil.which("ssh-keygen") or not shutil.which("ssh-agent") or not shutil.which("ssh-add"):
+            self.skipTest("OpenSSH tools (ssh-keygen/ssh-agent/ssh-add) not available")
+
+        tmpdir = tempfile.mkdtemp(prefix="ssh-ctl-test-")
+        try:
+            key_path = os.path.join(tmpdir, "id_test")
+            subprocess.run(
+                ["ssh-keygen", "-t", "ed25519", "-N", "", "-f", key_path, "-q"],
+                check=True,
+            )
+            with open(key_path, "r", encoding="utf-8") as kf:
+                priv_pem = kf.read()
+
+            keys_file = os.path.join(tmpdir, "ssh-agent-keys.json")
+            allowlist_file = os.path.join(tmpdir, "ssh-agent-allowlist.json")
+            agent_dir = os.path.join(tmpdir, "box-root", "ssh-agent")
+            upstream_sock = os.path.join(agent_dir, "upstream.sock")
+
+            with open(keys_file, "w", encoding="utf-8") as f:
+                json.dump({"services": {"git": [{"name": "id_test", "privateKey": priv_pem}]}}, f)
+            with open(allowlist_file, "w", encoding="utf-8") as f:
+                json.dump({"allowedKeyBlobsHex": []}, f)
+
+            env = dict(
+                os.environ,
+                SSH_AGENT_KEYS_FILE=keys_file,
+                SSH_AGENT_ALLOWLIST_FILE=allowlist_file,
+                SSH_AGENT_DIR=agent_dir,
+                SSH_AGENT_UPSTREAM_SOCK=upstream_sock,
+            )
+
+            # First ensure-upstream starts ssh-agent and loads key
+            p1 = subprocess.run(["bash", str(CTL_SCRIPT_PATH), "ensure-upstream"], env=env, capture_output=True, text=True)
+            self.assertEqual(p1.returncode, 0, f"ensure-upstream #1 failed: {p1.stderr}")
+            self.assertTrue(os.path.exists(upstream_sock))
+
+            # Second ensure-upstream is idempotent
+            p2 = subprocess.run(["bash", str(CTL_SCRIPT_PATH), "ensure-upstream"], env=env, capture_output=True, text=True)
+            self.assertEqual(p2.returncode, 0, f"ensure-upstream #2 failed: {p2.stderr}")
+
+            # Verify exactly 1 key loaded
+            ls_proc = subprocess.run(
+                ["ssh-add", "-l"],
+                env=dict(env, SSH_AUTH_SOCK=upstream_sock),
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(ls_proc.returncode, 0, f"ssh-add -l failed: {ls_proc.stderr}")
+            self.assertEqual(len([line for line in ls_proc.stdout.splitlines() if line.strip()]), 1)
+
+            # stop-upstream cleans up socket, keys file, allowlist file, and agent
+            p3 = subprocess.run(["bash", str(CTL_SCRIPT_PATH), "stop-upstream"], env=env, capture_output=True, text=True)
+            self.assertEqual(p3.returncode, 0, f"stop-upstream failed: {p3.stderr}")
+            self.assertFalse(os.path.exists(upstream_sock))
+            self.assertFalse(os.path.exists(keys_file))
+            self.assertFalse(os.path.exists(allowlist_file))
+        finally:
+            subprocess.run(["pkill", "-f", os.path.join(tmpdir, "box-root", "ssh-agent", "upstream.sock")], check=False)
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 if __name__ == "__main__":

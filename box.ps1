@@ -173,6 +173,7 @@ function Sync-AssetsToWsl {
     Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'scripts\linux\credential-proxy.py') -RemotePath '/usr/local/sbin/box-credential-proxy.py' -Mode '0755' -NormalizeLF
     Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'systemd\credential-proxy.service') -RemotePath '/etc/systemd/system/credential-proxy.service' -Mode '0644' -NormalizeLF
     Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'scripts\linux\ssh-agent-proxy.py') -RemotePath '/usr/local/sbin/box-ssh-agent-proxy.py' -Mode '0755' -NormalizeLF
+    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'scripts\linux\box-ssh-agent-ctl.sh') -RemotePath '/usr/local/sbin/box-ssh-agent-ctl.sh' -Mode '0755' -NormalizeLF
     Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'systemd\ssh-agent-proxy.service') -RemotePath '/etc/systemd/system/ssh-agent-proxy.service' -Mode '0644' -NormalizeLF
 
     if ($IncludeProxySource) {
@@ -429,6 +430,7 @@ function Invoke-SeedSecrets {
     # Always sync the seeder script & root proxy assets so seed-secrets works independently of init/apply
     Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'scripts\linux\box-seed-secrets.sh') -RemotePath '/usr/local/sbin/box-seed-secrets.sh' -Mode '0755' -NormalizeLF
     Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'scripts\linux\box-sync-context.py') -RemotePath '/usr/local/sbin/box-sync-context.py' -Mode '0755' -NormalizeLF
+    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'scripts\linux\box-ssh-agent-ctl.sh') -RemotePath '/usr/local/sbin/box-ssh-agent-ctl.sh' -Mode '0755' -NormalizeLF
     Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'scripts\linux\credential-proxy.py') -RemotePath '/usr/local/sbin/box-credential-proxy.py' -Mode '0755' -NormalizeLF
     Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'systemd\credential-proxy.service') -RemotePath '/etc/systemd/system/credential-proxy.service' -Mode '0644' -NormalizeLF
     Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'scripts\linux\ssh-agent-proxy.py') -RemotePath '/usr/local/sbin/box-ssh-agent-proxy.py' -Mode '0755' -NormalizeLF
@@ -452,6 +454,7 @@ function Invoke-ClearSecrets {
     $filterServices = @(Resolve-RequestedServiceFilter -Services $Service)
     Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'scripts\linux\box-seed-secrets.sh') -RemotePath '/usr/local/sbin/box-seed-secrets.sh' -Mode '0755' -NormalizeLF
     Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'scripts\linux\box-sync-context.py') -RemotePath '/usr/local/sbin/box-sync-context.py' -Mode '0755' -NormalizeLF
+    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'scripts\linux\box-ssh-agent-ctl.sh') -RemotePath '/usr/local/sbin/box-ssh-agent-ctl.sh' -Mode '0755' -NormalizeLF
 
     if ($filterServices.Count -gt 0) {
         $svcArg = $filterServices -join ','

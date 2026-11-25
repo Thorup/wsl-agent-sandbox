@@ -33,10 +33,10 @@ else
   pass "sudo is unavailable/denied for agent user"
 fi
 
-if [[ -r /etc/wsl-agent-sandbox/policy.json ]] || [[ -r /etc/wsl-agent-sandbox/docker-policy.json ]] || [[ -r /etc/wsl-agent-sandbox/credential-proxy.json ]] || [[ -w /etc/wsl.conf ]]; then
-  fail "Agent can read root-only config/credential-proxy state or write /etc/wsl.conf!"
+if [[ -r /etc/wsl-agent-sandbox/policy.json ]] || [[ -r /etc/wsl-agent-sandbox/docker-policy.json ]] || [[ -r /etc/wsl-agent-sandbox/credential-proxy.json ]] || [[ -r /etc/wsl-agent-sandbox/ssh-agent-keys.json ]] || [[ -w /etc/wsl.conf ]]; then
+  fail "Agent can read root-only config/credential-proxy/ssh-agent state or write /etc/wsl.conf!"
 else
-  pass "Root-owned config files (/etc/wsl.conf, policy.json, docker-policy.json, credential-proxy.json) protected"
+  pass "Root-owned config files (/etc/wsl.conf, policy.json, docker-policy.json, credential-proxy.json, ssh-agent-keys.json) protected"
 fi
 
 if command -v curl >/dev/null 2>&1 && nc -z -w 1 127.0.0.1 3129 >/dev/null 2>&1; then
