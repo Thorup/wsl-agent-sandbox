@@ -547,26 +547,32 @@ function Invoke-Verify {
     Copy-TextToWsl -DistroName $distro -Content ($hostIps + "`n") -RemotePath '/etc/wsl-agent-sandbox/host_ips.txt' -Mode '0600'
 
     $overallFailed = $false
+    $blockHostAndLan = $true
+    if ($Config.network -and $Config.network.PSObject.Properties['blockHostAndLan'] -and $null -ne $Config.network.blockHostAndLan) {
+        $blockHostAndLan = [bool]$Config.network.blockHostAndLan
+    }
 
     # Start an ephemeral TCP listener on Windows host so we can PROVE nftables blocks
-    # an actually-open Windows host port (not just a closed port!).
+    # an actually-open Windows host port (not just a closed port!) when blockHostAndLan=true.
     $winListener = $null
-    $winTestPort = 0
+    $winTestPort = ''
     $winTestIp = ''
-    try {
-        $winListener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Any, 0)
-        $winListener.Start()
-        $winTestPort = $winListener.LocalEndpoint.Port
-        # Prefer an actual Windows host IPv4 (works in both NAT and mirrored modes) so we probe
-        # the genuinely-open Windows TcpListener rather than an external LAN router.
-        $hostV4s = @(Get-WindowsHostIPs | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' -and $_ -notmatch '^169\.254\.' })
-        $winTestIp = $hostV4s | Select-Object -First 1
-        if ([string]::IsNullOrWhiteSpace($winTestIp)) {
-            $winTestIp = (& wsl.exe -d $distro -u root -- sh -c 'ip -4 route show default | awk "{for(i=1;i<=NF;i++) if(\$i==\"via\") {print \$(i+1); exit}}"' | Out-String).Trim()
+    if ($blockHostAndLan) {
+        try {
+            $winListener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Any, 0)
+            $winListener.Start()
+            $winTestPort = $winListener.LocalEndpoint.Port
+            # Prefer an actual Windows host IPv4 (works in both NAT and mirrored modes) so we probe
+            # the genuinely-open Windows TcpListener rather than an external LAN router.
+            $hostV4s = @(Get-WindowsHostIPs | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' -and $_ -notmatch '^169\.254\.' })
+            $winTestIp = $hostV4s | Select-Object -First 1
+            if ([string]::IsNullOrWhiteSpace($winTestIp)) {
+                $winTestIp = (& wsl.exe -d $distro -u root -- sh -c 'ip -4 route show default | awk "{for(i=1;i<=NF;i++) if(\$i==\"via\") {print \$(i+1); exit}}"' | Out-String).Trim()
+            }
+            Write-Host "[verify] Started ephemeral Windows host TCP listener on port $winTestPort (target $winTestIp) to test WSL->Windows blocking..."
+        } catch {
+            Write-Warning "[verify] Could not bind ephemeral Windows listener: $($_.Exception.Message)"
         }
-        Write-Host "[verify] Started ephemeral Windows host TCP listener on port $winTestPort (target $winTestIp) to test WSL->Windows blocking..."
-    } catch {
-        Write-Warning "[verify] Could not bind ephemeral Windows listener: $($_.Exception.Message)"
     }
 
     try {
@@ -581,24 +587,28 @@ function Invoke-Verify {
         }
     }
 
-    # Verify WSL -> Windows 127.0.0.1 (mirrored loopback) is blocked!
+    # Verify WSL -> Windows 127.0.0.1 (mirrored loopback) is blocked when blockHostAndLan=true!
     Write-Host ""
     Write-Host "[Windows <-> WSL Localhost Isolation & Web Server Tests]"
-    $winLoopListener = $null
-    try {
-        $winLoopListener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
-        $winLoopListener.Start()
-        $winLoopPort = $winLoopListener.LocalEndpoint.Port
-        $loopOut = (& wsl.exe -d $distro -u $agent -- bash -c "if nc -z -w 2 127.0.0.1 $winLoopPort >/dev/null 2>&1; then echo REACHABLE; else echo BLOCKED; fi" | Out-String).Trim()
-        if ($loopOut -eq 'BLOCKED') {
-            Write-Host "  [PASS] Outbound connection from WSL agent to Windows 127.0.0.1:$winLoopPort blocked (even in mirrored mode)"
-        } else {
-            Write-Host "  [FAIL] WSL agent reached Windows 127.0.0.1:$winLoopPort!"
-            $overallFailed = $true
-        }
-    } finally {
-        if ($winLoopListener) {
-            try { $winLoopListener.Stop() } catch { Write-Verbose "Ignoring loopback listener stop error: $($_.Exception.Message)" }
+    if (-not $blockHostAndLan) {
+        Write-Host "  [WARN] Host & LAN isolation disabled by policy (network.blockHostAndLan=false)"
+    } else {
+        $winLoopListener = $null
+        try {
+            $winLoopListener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
+            $winLoopListener.Start()
+            $winLoopPort = $winLoopListener.LocalEndpoint.Port
+            $loopOut = (& wsl.exe -d $distro -u $agent -- bash -c "if nc -z -w 2 127.0.0.1 $winLoopPort >/dev/null 2>&1; then echo REACHABLE; else echo BLOCKED; fi" | Out-String).Trim()
+            if ($loopOut -eq 'BLOCKED') {
+                Write-Host "  [PASS] Outbound connection from WSL agent to Windows 127.0.0.1:$winLoopPort blocked (even in mirrored mode)"
+            } else {
+                Write-Host "  [FAIL] WSL agent reached Windows 127.0.0.1:$winLoopPort!"
+                $overallFailed = $true
+            }
+        } finally {
+            if ($winLoopListener) {
+                try { $winLoopListener.Stop() } catch { Write-Verbose "Ignoring loopback listener stop error: $($_.Exception.Message)" }
+            }
         }
     }
 
