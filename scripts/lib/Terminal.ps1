@@ -143,7 +143,10 @@ function Register-WindowsTerminalProfile {
     param(
         [Parameter(Mandatory)]$Config,
         [string[]]$SettingsPaths = @(),
-        [switch]$Unregister
+        [switch]$Unregister,
+        [string]$BoxScriptPath = '',
+        [string]$ProfileName = '',
+        [string]$ConfigPath = ''
     )
     if ($SettingsPaths.Count -eq 0) {
         $SettingsPaths = @(Get-WindowsTerminalSettingsPaths)
@@ -156,8 +159,18 @@ function Register-WindowsTerminalProfile {
     $distro = $Config.distroName
     $agent = $Config.agentUser.name
     $guid = Get-DeterministicTerminalProfileGuid -DistroName $distro
-    $profileName = "$distro (Sandboxed)"
-    $cmdLine = "wsl.exe -d $distro -u $agent --cd ~"
+    $wtProfileName = "$distro (Sandboxed)"
+    if (-not [string]::IsNullOrWhiteSpace($BoxScriptPath) -and (Test-Path -LiteralPath $BoxScriptPath -PathType Leaf)) {
+        $cmdLine = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$BoxScriptPath`" shell"
+        if (-not [string]::IsNullOrWhiteSpace($ProfileName)) {
+            $cmdLine += " -Profile `"$ProfileName`""
+        }
+        if (-not [string]::IsNullOrWhiteSpace($ConfigPath)) {
+            $cmdLine += " -ConfigPath `"$ConfigPath`""
+        }
+    } else {
+        $cmdLine = "wsl.exe -d $distro -u $agent --cd ~"
+    }
     $updated = New-Object System.Collections.Generic.List[string]
 
     foreach ($settingsPath in $SettingsPaths) {
@@ -169,7 +182,7 @@ function Register-WindowsTerminalProfile {
 
         if (-not $json.PSObject.Properties['profiles'] -or $null -eq $json.profiles) {
             if ($Unregister) {
-                Write-Host "[register-terminal] Profile '$profileName' ($guid) not present in '$settingsPath'."
+                Write-Host "[register-terminal] Profile '$wtProfileName' ($guid) not present in '$settingsPath'."
                 continue
             }
             $json | Add-Member -NotePropertyName 'profiles' -NotePropertyValue ([pscustomobject]@{ list = @() }) -Force
@@ -181,7 +194,7 @@ function Register-WindowsTerminalProfile {
         } else {
             if (-not $json.profiles.PSObject.Properties['list'] -or $null -eq $json.profiles.list) {
                 if ($Unregister) {
-                    Write-Host "[register-terminal] Profile '$profileName' ($guid) not present in '$settingsPath'."
+                    Write-Host "[register-terminal] Profile '$wtProfileName' ($guid) not present in '$settingsPath'."
                     continue
                 }
                 $json.profiles | Add-Member -NotePropertyName 'list' -NotePropertyValue @() -Force
@@ -197,7 +210,7 @@ function Register-WindowsTerminalProfile {
             if ($entryGuid.Equals($guid, [System.StringComparison]::OrdinalIgnoreCase)) {
                 $found = $true
                 if (-not $Unregister) {
-                    $list.Add((Merge-TerminalProfileEntry -Entry $entry -Guid $guid -Name $profileName -CommandLine $cmdLine))
+                    $list.Add((Merge-TerminalProfileEntry -Entry $entry -Guid $guid -Name $wtProfileName -CommandLine $cmdLine))
                 }
             } else {
                 $list.Add($entry)
@@ -205,14 +218,14 @@ function Register-WindowsTerminalProfile {
         }
 
         if ($Unregister -and -not $found) {
-            Write-Host "[register-terminal] Profile '$profileName' ($guid) not present in '$settingsPath'."
+            Write-Host "[register-terminal] Profile '$wtProfileName' ($guid) not present in '$settingsPath'."
             continue
         }
 
         if (-not $Unregister -and -not $found) {
             $list.Add([ordered]@{
                 guid        = $guid
-                name        = $profileName
+                name        = $wtProfileName
                 commandline = $cmdLine
                 tabColor    = '#1B4332'
                 hidden      = $false
@@ -234,10 +247,10 @@ function Register-WindowsTerminalProfile {
         $updated.Add($settingsPath)
 
         if ($Unregister) {
-            Write-Host "[register-terminal] Removed '$profileName' ($guid) from '$settingsPath' (backup: $backupPath)."
+            Write-Host "[register-terminal] Removed '$wtProfileName' ($guid) from '$settingsPath' (backup: $backupPath)."
         } else {
             $verb = if ($found) { 'Updated' } else { 'Added' }
-            Write-Host "[register-terminal] $verb '$profileName' ($guid) in '$settingsPath' (backup: $backupPath)."
+            Write-Host "[register-terminal] $verb '$wtProfileName' ($guid) in '$settingsPath' (backup: $backupPath)."
         }
     }
 

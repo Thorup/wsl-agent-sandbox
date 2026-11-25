@@ -38,6 +38,8 @@ func resolveUpstreamSocket(explicit string) string {
 		"/run/box-root/mnt-wsl/docker-desktop/shared-sockets/guest-services/docker.sock",
 		"/run/box-root/mnt-wsl/docker-desktop/shared-sockets/guest-services/docker.proxy.sock",
 		"/run/box-root/mnt-wsl/docker-desktop/shared-sockets/host-services/docker.sock",
+		"/run/box-root/mnt-wsl/docker-desktop/run/docker.sock",
+		"/run/box-root/mnt-wsl/docker-desktop-data/run/docker.sock",
 		"/run/box-root/mnt-wsl/docker-desktop/docker.sock",
 	}
 	for _, c := range candidates {

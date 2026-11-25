@@ -238,5 +238,49 @@ function Sync-HostIpsIfChanged {
         Write-Host "[sync] Windows host IPs changed; refreshing host_ips.txt and reloading box-hardening.sh..."
         Copy-TextToWsl -DistroName $distro -Content $desired -RemotePath '/etc/wsl-agent-sandbox/host_ips.txt' -Mode '0600'
         Invoke-WslRootBash -DistroName $distro -Script '/usr/local/sbin/box-hardening.sh && if grep -q -- "--render-env-only" /usr/local/sbin/box-apply-policy.sh 2>/dev/null; then /usr/local/sbin/box-apply-policy.sh --render-env-only; fi'
+
+function Get-DockerPolicyProxySourceHash {
+    <#
+    .SYNOPSIS
+        Computes a deterministic lowercase SHA-256 hex digest of all docker-policy-proxy
+        source files (go.mod, go.sum, *.go) using sorted filenames and LF-normalized UTF-8 bytes.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$AppRoot
+    )
+    $proxyDir = Join-Path $AppRoot 'docker-policy-proxy'
+    if (-not (Test-Path -LiteralPath $proxyDir -PathType Container)) {
+        throw "docker-policy-proxy directory not found: '$proxyDir'"
+    }
+    $files = @(Get-ChildItem -LiteralPath $proxyDir -File | Where-Object {
+        $_.Name -eq 'go.mod' -or $_.Name -eq 'go.sum' -or $_.Extension -eq '.go'
+    } | Sort-Object -Property Name -CaseSensitive)
+    if ($files.Count -eq 0) {
+        throw "No docker-policy-proxy source files found in '$proxyDir'"
+    }
+
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        $ms = New-Object System.IO.MemoryStream
+        try {
+            foreach ($f in $files) {
+                $header = $utf8.GetBytes("FILE:$($f.Name)`n")
+                $ms.Write($header, 0, $header.Length)
+                $text = [System.IO.File]::ReadAllText($f.FullName, $utf8)
+                $lfText = ($text -replace "`r`n", "`n") -replace "`r", "`n"
+                $contentBytes = $utf8.GetBytes($lfText)
+                $ms.Write($contentBytes, 0, $contentBytes.Length)
+                $sep = $utf8.GetBytes("`n")
+                $ms.Write($sep, 0, $sep.Length)
+            }
+            $ms.Position = 0
+            $hashBytes = $sha.ComputeHash($ms)
+            return ([BitConverter]::ToString($hashBytes) -replace '-', '').ToLowerInvariant()
+        } finally {
+            $ms.Dispose()
+        }
+    } finally {
+        $sha.Dispose()
     }
 }

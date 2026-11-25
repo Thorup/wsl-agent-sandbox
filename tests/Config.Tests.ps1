@@ -5,6 +5,7 @@ $ErrorActionPreference = 'Stop'
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $RepoRoot 'scripts\lib\Config.ps1')
 . (Join-Path $RepoRoot 'scripts\lib\Terminal.ps1')
+. (Join-Path $RepoRoot 'scripts\lib\Wsl.ps1')
 
 $script:Passed = 0
 $script:Failed = 0
@@ -960,6 +961,51 @@ foreach ($dp in $commonDevPorts) {
     }
 }
 Assert-True "Reserved proxy port ranges leave common localhost DB/broker/NodePort ports unblocked" $devPortsUnblocked
+
+# Register-WindowsTerminalProfile with -BoxScriptPath and -ProfileName
+$tmpBoxWtDir = Join-Path ([System.IO.Path]::GetTempPath()) ("wsl-box-wt-box-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Path $tmpBoxWtDir -Force | Out-Null
+try {
+    $boxWtSettings = Join-Path $tmpBoxWtDir 'settings.json'
+    [System.IO.File]::WriteAllText($boxWtSettings, '{"profiles":{"list":[]}}', (New-Object System.Text.UTF8Encoding($false)))
+    $boxPs1Path = Join-Path $RepoRoot 'box.ps1'
+    [void](Register-WindowsTerminalProfile -Config $baseCfg -SettingsPaths @($boxWtSettings) -BoxScriptPath $boxPs1Path -ProfileName 'dev')
+    $parsedBoxWt = Get-Content -LiteralPath $boxWtSettings -Raw | ConvertFrom-Json
+    $expectedBoxCmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$boxPs1Path`" shell -Profile `"dev`""
+    Assert-True "Register-WindowsTerminalProfile with -BoxScriptPath invokes box.ps1 shell" ($parsedBoxWt.profiles.list[0].commandline -eq $expectedBoxCmd)
+} finally {
+    if (Test-Path -LiteralPath $tmpBoxWtDir) {
+        Remove-Item -LiteralPath $tmpBoxWtDir -Recurse -Force
+    }
+}
+
+# Get-DockerPolicyProxySourceHash tests
+$proxyHash1 = Get-DockerPolicyProxySourceHash -AppRoot $RepoRoot
+$proxyHash2 = Get-DockerPolicyProxySourceHash -AppRoot $RepoRoot
+Assert-True "Get-DockerPolicyProxySourceHash returns deterministic 64-char lowercase hex SHA-256" ($proxyHash1 -match '^[0-9a-f]{64}$' -and $proxyHash1 -eq $proxyHash2)
+
+$tmpProxyAppRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("wsl-box-proxy-hash-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
+$tmpProxyDir = Join-Path $tmpProxyAppRoot 'docker-policy-proxy'
+New-Item -ItemType Directory -Path $tmpProxyDir -Force | Out-Null
+try {
+    Copy-Item -Path (Join-Path $RepoRoot 'docker-policy-proxy\*') -Destination $tmpProxyDir -Force
+    $copiedHash = Get-DockerPolicyProxySourceHash -AppRoot $tmpProxyAppRoot
+    Assert-True "Get-DockerPolicyProxySourceHash matches across identical copies" ($copiedHash -eq $proxyHash1)
+
+    $mainGoCopy = Join-Path $tmpProxyDir 'main.go'
+    $mainContent = [System.IO.File]::ReadAllText($mainGoCopy, (New-Object System.Text.UTF8Encoding($false)))
+    [System.IO.File]::WriteAllText($mainGoCopy, ($mainContent -replace "`r?`n", "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
+    $crlfHash = Get-DockerPolicyProxySourceHash -AppRoot $tmpProxyAppRoot
+    Assert-True "Get-DockerPolicyProxySourceHash normalizes CRLF to LF" ($crlfHash -eq $proxyHash1)
+
+    [System.IO.File]::AppendAllText($mainGoCopy, "`n// hash-change-marker`n", (New-Object System.Text.UTF8Encoding($false)))
+    $modifiedHash = Get-DockerPolicyProxySourceHash -AppRoot $tmpProxyAppRoot
+    Assert-True "Get-DockerPolicyProxySourceHash changes when a .go file changes" ($modifiedHash -ne $proxyHash1)
+} finally {
+    if (Test-Path -LiteralPath $tmpProxyAppRoot) {
+        Remove-Item -LiteralPath $tmpProxyAppRoot -Recurse -Force
+    }
+}
 
 Write-Host ""
 Write-Host "=== Config.Tests.ps1 Summary: PASS=$script:Passed FAIL=$script:Failed ==="
