@@ -395,7 +395,8 @@ function Invoke-SeedSecrets {
         [string[]]$Service = @(),
         [switch]$Prune,
         [switch]$DryRun,
-        [string]$Ttl = ''
+        [string]$Ttl = '',
+        [string]$ProfileName = ''
     )
     $distro = $Config.distroName
     if (-not (Test-WslDistroExists -DistroName $distro)) {
@@ -403,9 +404,9 @@ function Invoke-SeedSecrets {
     }
 
     $explicitPath = if (-not [string]::IsNullOrWhiteSpace($SecretsPath)) { $SecretsPath } else { $Argument }
-    $manifestPath = Resolve-SecretsManifestPath -ExplicitPath $explicitPath -Config $Config -RepoRoot $StateRoot
+    $manifestPath = Resolve-SecretsManifestPath -ExplicitPath $explicitPath -Config $Config -RepoRoot $StateRoot -ProfileName $ProfileName
 
-    $built = Build-SeedSecretsPayload -ManifestPath $manifestPath -AgentName $Config.agentUser.name -AgentUid ([int]$Config.agentUser.uid) -Services $Service -Prune:$Prune -Ttl $Ttl
+    $built = Build-SeedSecretsPayload -ManifestPath $manifestPath -AgentName $Config.agentUser.name -AgentUid ([int]$Config.agentUser.uid) -Services $Service -Prune:$Prune -Ttl $Ttl -ProfileName $ProfileName
 
     $summaryLines = @($built.Summary)
     $disabledLines = @($built.SkippedDisabled)
@@ -1314,7 +1315,7 @@ switch ($Command) {
         Invoke-PullBranch -Config $cfg -RepoName $Argument -WindowsRepoPath $RepoPath -Branch $Branch
     }
     'seed-secrets' {
-        Invoke-SeedSecrets -Config $cfg -SecretsPath $SecretsPath -Service $Service -Prune:$Prune -DryRun:$DryRun -Ttl $Ttl
+        Invoke-SeedSecrets -Config $cfg -SecretsPath $SecretsPath -Service $Service -Prune:$Prune -DryRun:$DryRun -Ttl $Ttl -ProfileName $ProfileName
     }
     'clear-secrets' {
         Invoke-ClearSecrets -Config $cfg -Service $Service
