@@ -184,23 +184,77 @@ def read_host_ips(path):
                     pass
     return v4, v6
 
-if dry_run_nft:
+SHARED_MARK_HEX = "0x00002604"
+LEGACY_MARK_HEX = f"0x{agent_uid:08x}"
+NFT_TABLE = f"wsl_agent_sandbox_{agent_uid}"
+SHARED_NFT_TABLE = "wsl_agent_sandbox_shared"
+
+def render_nftables_rules(has_loopback0, probe_log_support=True):
     dns_v4, dns_v6 = read_resolv_nameservers(resolv_conf_path)
     host_v4, host_v6 = read_host_ips(host_ips_file)
     net_cfg = policy.get("network", {})
     block_host_and_lan = bool(net_cfg.get("blockHostAndLan", True))
     egress_mode = net_cfg.get("egressMode", "open")
+    allowed_domains = net_cfg.get("allowedDomains", [])
     blocked_v4 = []
     blocked_v6 = ["fc00::/7", "fe80::/10"]
     for cidr in net_cfg.get("blockedCidrs", []):
         net = ipaddress.ip_network(cidr, strict=False)
-        (blocked_v4 if net.version == 4 else blocked_v6).append(str(net))
+        if net.version == 4:
+            blocked_v4.append(str(net))
+        else:
+            blocked_v6.append(str(net))
+
     allowed_tcp = sorted({int(p["port"]) for p in net_cfg.get("allowedHostPorts", []) if p.get("protocol") == "tcp"})
     allowed_udp = sorted({int(p["port"]) for p in net_cfg.get("allowedHostPorts", []) if p.get("protocol") == "udp"})
-    has_loopback0 = False
-    SHARED_MARK_HEX = "0x00002604"
-    NFT_TABLE = f"wsl_agent_sandbox_{agent_uid}"
-    lines = [f"table inet {NFT_TABLE} {{"]
+
+    lines = [
+        f"table inet {NFT_TABLE} {{",
+    ]
+
+    log_drops = bool(net_cfg.get("logDrops", True)) and probe_log_support
+    if block_host_and_lan and log_drops:
+        probe_rule = (
+            "table inet __box_log_probe {\n"
+            "    chain c {\n"
+            '        limit rate 5/minute burst 10 packets log prefix "[wsl-agent-sandbox-drop] "\n'
+            "        drop\n"
+            "    }\n"
+            "}\n"
+        )
+        probe = subprocess.run(["nft", "-c", "-f", "-"], input=probe_rule, text=True, capture_output=True)
+        if probe.returncode != 0:
+            print(
+                f"[box-hardening] WARNING: kernel/nftables log target unavailable ({probe.stderr.strip()}); falling back to unconditional drop without log.",
+                file=sys.stderr,
+            )
+            log_drops = False
+
+    if block_host_and_lan and log_drops:
+        lines.extend([
+            "    chain log_and_drop {",
+            '        limit rate 5/minute burst 10 packets log prefix "[wsl-agent-sandbox-drop] "',
+            "        drop",
+            "    }",
+        ])
+
+    if has_loopback0 and block_host_and_lan:
+        lines.extend([
+            "    chain mangle_output {",
+            "        type route hook output priority mangle; policy accept;",
+            f"        ct mark {SHARED_MARK_HEX} meta mark set {SHARED_MARK_HEX} accept",
+            f"        meta skuid != {agent_uid} accept",
+        ])
+        if allowed_tcp:
+            ports = ", ".join(str(p) for p in allowed_tcp)
+            lines.append(f"        ip daddr 127.0.0.0/8 tcp dport {{ {ports} }} meta mark set {SHARED_MARK_HEX} accept")
+            lines.append(f"        ip6 daddr ::1 tcp dport {{ {ports} }} meta mark set {SHARED_MARK_HEX} accept")
+        if allowed_udp:
+            ports = ", ".join(str(p) for p in allowed_udp)
+            lines.append(f"        ip daddr 127.0.0.0/8 udp dport {{ {ports} }} meta mark set {SHARED_MARK_HEX} accept")
+            lines.append(f"        ip6 daddr ::1 udp dport {{ {ports} }} meta mark set {SHARED_MARK_HEX} accept")
+        lines.append("    }")
+
     lines.extend([
         "    chain output {",
         "        type filter hook output priority 0; policy accept;",
@@ -208,6 +262,7 @@ if dry_run_nft:
         "        ct state established,related accept",
         '        oifname "lo" accept',
     ])
+
     if egress_mode != "allowlist" or maintenance_egress_open:
         if dns_v4:
             elems = ", ".join(sorted(dns_v4))
@@ -217,6 +272,7 @@ if dry_run_nft:
             elems = ", ".join(sorted(dns_v6))
             lines.append(f"        ip6 daddr {{ {elems} }} udp dport 53 accept")
             lines.append(f"        ip6 daddr {{ {elems} }} tcp dport 53 accept")
+
     if allowed_tcp:
         ports = ", ".join(str(p) for p in allowed_tcp)
         lines.append(f'        oifname "loopback0" tcp dport {{ {ports} }} accept')
@@ -229,8 +285,9 @@ if dry_run_nft:
         if host_v4:
             hosts = ", ".join(sorted(host_v4))
             lines.append(f"        ip daddr {{ {hosts} }} udp dport {{ {ports} }} accept")
+
     if block_host_and_lan:
-        drop_action = "drop"
+        drop_action = "jump log_and_drop" if log_drops else "drop"
         lines.append(f'        oifname "loopback0" {drop_action}')
         if host_v4:
             hosts = ", ".join(sorted(host_v4))
@@ -244,11 +301,33 @@ if dry_run_nft:
         if blocked_v6:
             cidrs = ", ".join(sorted(set(blocked_v6)))
             lines.append(f"        ip6 daddr {{ {cidrs} }} {drop_action}")
+
     if egress_mode == "allowlist" and not maintenance_egress_open:
+        # Loopback (127.0.0.1:3128 egress-proxy) is already permitted above via 'oifname "lo" accept'.
         lines.append("        drop")
-    lines.extend(["    }", "}"])
+
+    lines.extend([
+        "    }",
+        "}",
+    ])
+
+    egress_cfg = {
+        "egressMode": egress_mode,
+        "allowedDomains": allowed_domains,
+        "blockHostAndLan": block_host_and_lan,
+        "hostIps": sorted(host_v4 | host_v6),
+        "blockedCidrs": sorted(set(blocked_v4 + blocked_v6)),
+        "allowedPorts": [443],
+        "allowedHttpPorts": [80, 443],
+        "listenPort": deterministic_proxy_ports(agent_uid)[0],
+        "allowedCallerUid": agent_uid,
+    }
+    return "\n".join(lines) + "\n", block_host_and_lan, egress_cfg
+
+if dry_run_nft:
+    nft_text, _, _ = render_nftables_rules(has_loopback0=False, probe_log_support=False)
     with open(nft_conf_file, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
+        f.write(nft_text)
     sys.exit(0)
 
 # --- A. Allowlisted Windows shared folders under /shared/<name> ---
@@ -466,49 +545,16 @@ os.chmod(verify_tmp, 0o644)
 os.replace(verify_tmp, verify_policy_file)
 
 # --- C. Per-UID nftables firewall (table inet wsl_agent_sandbox) ---
-dns_v4, dns_v6 = read_resolv_nameservers(resolv_conf_path)
-host_v4, host_v6 = read_host_ips(host_ips_file)
-
-net_cfg = policy.get("network", {})
-block_host_and_lan = bool(net_cfg.get("blockHostAndLan", True))
-egress_mode = net_cfg.get("egressMode", "open")
-allowed_domains = net_cfg.get("allowedDomains", [])
-blocked_v4 = []
-blocked_v6 = ["fc00::/7", "fe80::/10"]
-for cidr in net_cfg.get("blockedCidrs", []):
-    net = ipaddress.ip_network(cidr, strict=False)
-    if net.version == 4:
-        blocked_v4.append(str(net))
-    else:
-        blocked_v6.append(str(net))
+has_loopback0 = run(["ip", "link", "show", "loopback0"], check=False).returncode == 0
+nft_text, block_host_and_lan, egress_cfg = render_nftables_rules(has_loopback0=has_loopback0, probe_log_support=True)
 
 egress_port, cred_port = deterministic_proxy_ports(agent_uid)
 egress_cfg_file = "/etc/wsl-agent-sandbox/egress-allowlist.json"
 egress_cfg_tmp = f"{egress_cfg_file}.tmp.{os.getpid()}"
 with open(egress_cfg_tmp, "w", encoding="utf-8") as f:
-    json.dump({
-        "egressMode": egress_mode,
-        "allowedDomains": allowed_domains,
-        "blockHostAndLan": block_host_and_lan,
-        "hostIps": sorted(host_v4 | host_v6),
-        "blockedCidrs": sorted(set(blocked_v4 + blocked_v6)),
-        "allowedPorts": [443],
-        "allowedHttpPorts": [80, 443],
-        "listenPort": egress_port,
-        "allowedCallerUid": agent_uid,
-    }, f, indent=2)
+    json.dump(egress_cfg, f, indent=2)
 os.chmod(egress_cfg_tmp, 0o600)
 os.replace(egress_cfg_tmp, egress_cfg_file)
-
-allowed_tcp = sorted({int(p["port"]) for p in net_cfg.get("allowedHostPorts", []) if p.get("protocol") == "tcp"})
-allowed_udp = sorted({int(p["port"]) for p in net_cfg.get("allowedHostPorts", []) if p.get("protocol") == "udp"})
-
-# Detect WSL2 mirrored networking (presence of 'loopback0' interface)
-has_loopback0 = run(["ip", "link", "show", "loopback0"], check=False).returncode == 0
-SHARED_MARK_HEX = "0x00002604"
-LEGACY_MARK_HEX = f"0x{agent_uid:08x}"
-NFT_TABLE = f"wsl_agent_sandbox_{agent_uid}"
-SHARED_NFT_TABLE = "wsl_agent_sandbox_shared"
 
 def sync_shared_nft_prerouting(enable_shared):
     if enable_shared:
@@ -542,11 +588,8 @@ def any_sandbox_mangle_tables_active():
                     return True
     return False
 
-# Manage per-UID mirrored-loopback policy routing rules cleanly (only affects agent_uid!),
-# while keeping one shared fwmark 0x00002604 rule across concurrent profiles.
 def sync_mirrored_ip_rules(enable_uid, enable_shared):
     for fam, target, wsl_table in [("-4", "127.0.0.0/8", "127"), ("-6", "::1/128", "127")]:
-        # Remove legacy per-UID fwmark rules and this UID's uidrange rule
         legacy_and_uid_specs = [
             ["pref", "0", "to", target, "fwmark", LEGACY_MARK_HEX, "lookup", wsl_table],
             ["pref", "0", "to", target, "uidrange", f"{agent_uid}-{agent_uid}", "lookup", "local"],
@@ -559,7 +602,6 @@ def sync_mirrored_ip_rules(enable_uid, enable_shared):
                 if r.returncode != 0:
                     break
         if enable_uid:
-            # Shared rule (checked first): marked Windows->WSL replies & allowlisted host ports -> WSL loopback0 table
             existing = run(["ip", fam, "rule", "show"], check=False).stdout
             target_prefix = target.split("/")[0]
             has_shared = any(
@@ -570,7 +612,6 @@ def sync_mirrored_ip_rules(enable_uid, enable_shared):
             )
             if not has_shared:
                 run(["ip", fam, "rule", "add", "pref", "0", "to", target, "fwmark", SHARED_MARK_HEX, "lookup", wsl_table], check=False)
-            # Per-UID rule (checked second): all other agent UID loopback traffic -> Linux local lo only
             run(["ip", fam, "rule", "add", "pref", "0", "to", target, "uidrange", f"{agent_uid}-{agent_uid}", "lookup", "local"], check=False)
         elif not enable_shared:
             for _ in range(4):
@@ -578,119 +619,6 @@ def sync_mirrored_ip_rules(enable_uid, enable_shared):
                 if r.returncode != 0:
                     break
 
-lines = [
-    f"table inet {NFT_TABLE} {{",
-]
-
-log_drops = bool(net_cfg.get("logDrops", True))
-if block_host_and_lan and log_drops:
-    probe_rule = (
-        "table inet __box_log_probe {\n"
-        "    chain c {\n"
-        '        limit rate 5/minute burst 10 packets log prefix "[wsl-agent-sandbox-drop] "\n'
-        "        drop\n"
-        "    }\n"
-        "}\n"
-    )
-    probe = subprocess.run(["nft", "-c", "-f", "-"], input=probe_rule, text=True, capture_output=True)
-    if probe.returncode != 0:
-        print(
-            f"[box-hardening] WARNING: kernel/nftables log target unavailable ({probe.stderr.strip()}); falling back to unconditional drop without log.",
-            file=sys.stderr,
-        )
-        log_drops = False
-
-if block_host_and_lan and log_drops:
-    lines.extend([
-        "    chain log_and_drop {",
-        '        limit rate 5/minute burst 10 packets log prefix "[wsl-agent-sandbox-drop] "',
-        "        drop",
-        "    }",
-    ])
-
-if has_loopback0 and block_host_and_lan:
-    # Per-UID mangle_output uses the shared 0x00002604 reply mark from wsl_agent_sandbox_shared,
-    # while scoping allowedHostPorts strictly to this UID so concurrent profiles never interfere.
-    lines.extend([
-        "    chain mangle_output {",
-        "        type route hook output priority mangle; policy accept;",
-        f"        ct mark {SHARED_MARK_HEX} meta mark set {SHARED_MARK_HEX} accept",
-        f"        meta skuid != {agent_uid} accept",
-    ])
-    if allowed_tcp:
-        ports = ", ".join(str(p) for p in allowed_tcp)
-        lines.append(f"        ip daddr 127.0.0.0/8 tcp dport {{ {ports} }} meta mark set {SHARED_MARK_HEX} accept")
-        lines.append(f"        ip6 daddr ::1 tcp dport {{ {ports} }} meta mark set {SHARED_MARK_HEX} accept")
-    if allowed_udp:
-        ports = ", ".join(str(p) for p in allowed_udp)
-        lines.append(f"        ip daddr 127.0.0.0/8 udp dport {{ {ports} }} meta mark set {SHARED_MARK_HEX} accept")
-        lines.append(f"        ip6 daddr ::1 udp dport {{ {ports} }} meta mark set {SHARED_MARK_HEX} accept")
-    lines.append("    }")
-
-lines.extend([
-    "    chain output {",
-    "        type filter hook output priority 0; policy accept;",
-    f"        meta skuid != {agent_uid} accept",
-    "        ct state established,related accept",
-    f'        oifname "lo" tcp dport {{ {egress_port}, {cred_port} }} accept',
-    '        oifname "lo" tcp dport { 3128, 3129, 29100-29999, 30900-32697 } drop',
-    '        oifname "lo" accept',
-])
-
-# Only permit direct agent UDP/TCP DNS queries in 'open' egress mode (or during root maintenance);
-# in 'allowlist' mode egress-proxy.py performs root-side DNS resolution, preventing direct DNS tunneling exfiltration.
-if egress_mode != "allowlist" or maintenance_egress_open:
-    if dns_v4:
-        elems = ", ".join(sorted(dns_v4))
-        lines.append(f"        ip daddr {{ {elems} }} udp dport 53 accept")
-        lines.append(f"        ip daddr {{ {elems} }} tcp dport 53 accept")
-    if dns_v6:
-        elems = ", ".join(sorted(dns_v6))
-        lines.append(f"        ip6 daddr {{ {elems} }} udp dport 53 accept")
-        lines.append(f"        ip6 daddr {{ {elems} }} tcp dport 53 accept")
-
-if allowed_tcp:
-    ports = ", ".join(str(p) for p in allowed_tcp)
-    lines.append(f'        oifname "loopback0" tcp dport {{ {ports} }} accept')
-    if host_v4:
-        hosts = ", ".join(sorted(host_v4))
-        lines.append(f"        ip daddr {{ {hosts} }} tcp dport {{ {ports} }} accept")
-if allowed_udp:
-    ports = ", ".join(str(p) for p in allowed_udp)
-    lines.append(f'        oifname "loopback0" udp dport {{ {ports} }} accept')
-    if host_v4:
-        hosts = ", ".join(sorted(host_v4))
-        lines.append(f"        ip daddr {{ {hosts} }} udp dport {{ {ports} }} accept")
-
-if block_host_and_lan:
-    # Block WSL2 mirrored-mode outbound connections to Windows 127.0.0.1/::1 ports
-    # (Windows -> WSL localhost replies still pass via 'ct state established,related accept',
-    # and WSL-internal localhost still passes via 'oifname "lo" accept').
-    drop_action = "jump log_and_drop" if log_drops else "drop"
-    lines.append(f'        oifname "loopback0" {drop_action}')
-    if host_v4:
-        hosts = ", ".join(sorted(host_v4))
-        lines.append(f"        ip daddr {{ {hosts} }} {drop_action}")
-    if host_v6:
-        hosts = ", ".join(sorted(host_v6))
-        lines.append(f"        ip6 daddr {{ {hosts} }} {drop_action}")
-    if blocked_v4:
-        cidrs = ", ".join(sorted(set(blocked_v4)))
-        lines.append(f"        ip daddr {{ {cidrs} }} {drop_action}")
-    if blocked_v6:
-        cidrs = ", ".join(sorted(set(blocked_v6)))
-        lines.append(f"        ip6 daddr {{ {cidrs} }} {drop_action}")
-
-if egress_mode == "allowlist" and not maintenance_egress_open:
-    # Loopback (127.0.0.1:3128 egress-proxy) is already permitted above via 'oifname "lo" accept'.
-    lines.append("        drop")
-
-lines.extend([
-    "    }",
-    "}",
-])
-
-nft_text = "\n".join(lines) + "\n"
 with open(nft_conf_file, "w", encoding="utf-8") as f:
     f.write(nft_text)
 os.chmod(nft_conf_file, 0o600)

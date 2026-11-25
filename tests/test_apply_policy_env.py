@@ -87,6 +87,18 @@ class TestApplyPolicyEnv(unittest.TestCase):
         self.assertIn(f'NO_PROXY="{expected}"', env_file)
         self.assertIn(f'no_proxy="{expected}"', env_file)
 
+    def test_allowlist_uses_deterministic_per_uid_egress_proxy_port(self):
+        for uid, expected_port in ((26040, 3128), (26100, 30900), (27005, 29410)):
+            policy = {
+                "agentUser": {"name": "agent", "uid": uid, "gid": uid},
+                "network": {"egressMode": "allowlist", "allowedHostPorts": []},
+            }
+            profile, env_file = self._run_render_env(policy, "")
+            self.assertIn(f'export HTTP_PROXY="http://127.0.0.1:{expected_port}"', profile)
+            self.assertIn(f'export https_proxy="http://127.0.0.1:{expected_port}"', profile)
+            self.assertIn(f'HTTP_PROXY="http://127.0.0.1:{expected_port}"', env_file)
+            self.assertIn(f'https_proxy="http://127.0.0.1:{expected_port}"', env_file)
+
 
 @unittest.skipIf(shutil.which("bash") is None, "bash executable is required")
 class TestBoxHardeningMaintenanceEgress(unittest.TestCase):
