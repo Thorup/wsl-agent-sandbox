@@ -13,6 +13,12 @@ if [[ "$(id -u)" -ne 0 ]]; then
 fi
 
 export DEBIAN_FRONTEND=noninteractive
+unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
+
+run_as_agent_no_proxy() {
+  local cmd="$1"
+  su -s /bin/bash - "${AGENT_NAME}" -c "unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy; ${cmd}"
+}
 
 flag() {
   local key="$1"
@@ -225,7 +231,7 @@ fi
 # 8. Rust toolchain (rustup, rustc, cargo, clippy, rustfmt) owned by agent user in $HOME
 if [[ "${INSTALL_RUST}" == "1" ]] && [[ ! -x "/home/${AGENT_NAME}/.cargo/bin/rustc" ]]; then
   log "Installing Rust (rustup + stable + clippy + rustfmt) for user '${AGENT_NAME}'..."
-  su -s /bin/bash - "${AGENT_NAME}" -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile default -c clippy -c rustfmt'
+  run_as_agent_no_proxy 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile default -c clippy -c rustfmt'
   # shellcheck disable=SC2016 # $HOME expands inside the target user's shell
   log "Installed $(su -s /bin/bash - "${AGENT_NAME}" -c '"$HOME/.cargo/bin/rustc" --version && "$HOME/.cargo/bin/cargo" --version' | tr '\n' ' ')."
 fi
@@ -297,7 +303,7 @@ fi
 if [[ "${INSTALL_AZURE_DEVOPS}" == "1" ]] && command -v az >/dev/null 2>&1; then
   if ! su -s /bin/bash - "${AGENT_NAME}" -c 'az extension show --name azure-devops >/dev/null 2>&1'; then
     log "Installing Azure DevOps CLI extension (azure-devops) for user '${AGENT_NAME}'..."
-    su -s /bin/bash - "${AGENT_NAME}" -c 'az extension add --name azure-devops --yes'
+    run_as_agent_no_proxy 'az extension add --name azure-devops --yes'
     log "Installed Azure DevOps CLI extension ($(su -s /bin/bash - "${AGENT_NAME}" -c 'az extension show --name azure-devops --query version -o tsv' 2>/dev/null || echo 'azure-devops'))."
   fi
 fi
@@ -351,8 +357,7 @@ if [[ "${INSTALL_AIDER}" == "1" ]]; then
   elif [[ ! -x "/home/${AGENT_NAME}/.local/bin/aider" ]]; then
     log "Installing aider-chat via uv (Python 3.12) for '${AGENT_NAME}'..."
     # aider-chat requires Python <3.13; use uv-managed Python 3.12 on Ubuntu 26.04.
-    # shellcheck disable=SC2016 # $HOME expands inside the target user's shell
-    su -s /bin/bash - "${AGENT_NAME}" -c 'uv tool install --python 3.12 aider-chat'
+    run_as_agent_no_proxy 'uv tool install --python 3.12 aider-chat'
   fi
 fi
 
@@ -415,12 +420,12 @@ if [[ "${INSTALL_PLAYWRIGHT_CHROMIUM}" == "1" || "${INSTALL_PLAYWRIGHT_FIREFOX}"
     if [[ "${INSTALL_PLAYWRIGHT_CHROMIUM}" == "1" ]] && ! compgen -G "${PW_CACHE}/chromium-*" >/dev/null; then
       log "Installing Playwright Chromium + system dependencies..."
       playwright install-deps chromium
-      su -s /bin/bash - "${AGENT_NAME}" -c 'playwright install chromium'
+      run_as_agent_no_proxy 'playwright install chromium'
     fi
     if [[ "${INSTALL_PLAYWRIGHT_FIREFOX}" == "1" ]] && ! compgen -G "${PW_CACHE}/firefox-*" >/dev/null; then
       log "Installing Playwright Firefox + system dependencies..."
       playwright install-deps firefox
-      su -s /bin/bash - "${AGENT_NAME}" -c 'playwright install firefox'
+      run_as_agent_no_proxy 'playwright install firefox'
     fi
   fi
 fi

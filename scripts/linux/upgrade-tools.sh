@@ -65,6 +65,26 @@ enforce_sudo_hardening() {
 AGENT_NAME="$(python3 -c 'import json, sys; d=json.load(open(sys.argv[1])); print(d["agentUser"]["name"])' "${POLICY_FILE}")"
 ARCH="$(dpkg --print-architecture)"
 export DEBIAN_FRONTEND=noninteractive
+unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
+
+run_as_agent_no_proxy() {
+  local cmd="$1"
+  su -s /bin/bash - "${AGENT_NAME}" -c "unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy; ${cmd}"
+}
+
+MAINTENANCE_EGRESS_ACTIVE=0
+restore_maintenance_egress() {
+  if [[ "${MAINTENANCE_EGRESS_ACTIVE}" -eq 1 ]] && [[ -x /usr/local/sbin/box-hardening.sh ]]; then
+    /usr/local/sbin/box-hardening.sh >/dev/null 2>&1 || true
+  fi
+}
+trap restore_maintenance_egress EXIT
+
+if [[ -x /usr/local/sbin/box-hardening.sh ]]; then
+  log "Opening maintenance egress for upgrade while keeping host/LAN blocked..."
+  MAINTENANCE_EGRESS_ACTIVE=1
+  BOX_MAINTENANCE_EGRESS_OPEN=1 /usr/local/sbin/box-hardening.sh
+fi
 
 declare -A BEFORE_VERSIONS=()
 declare -A AFTER_VERSIONS=()
@@ -94,8 +114,8 @@ if has_scope "apt"; then
     -o Dpkg::Options::="--force-confold"
   enforce_sudo_hardening
   if [[ -x /usr/local/sbin/box-hardening.sh ]]; then
-    log "Re-applying sandbox hardening after apt upgrade..."
-    /usr/local/sbin/box-hardening.sh
+    log "Re-applying sandbox hardening after apt upgrade (maintenance egress open)..."
+    BOX_MAINTENANCE_EGRESS_OPEN=1 /usr/local/sbin/box-hardening.sh
   fi
   record_ver "apt-upgradable" "apt list --upgradable 2>/dev/null | tail -n +2 | wc -l" "after"
 fi
@@ -115,7 +135,7 @@ if has_scope "agents"; then
     # shellcheck disable=SC2016 # $HOME expands inside the target user's shell
     record_ver "uv:aider-chat" "su -s /bin/bash - '${AGENT_NAME}' -c '\"\$HOME/.local/bin/aider\" --version'" "before"
     log "Updating aider-chat via uv for '${AGENT_NAME}'..."
-    su -s /bin/bash - "${AGENT_NAME}" -c 'uv tool upgrade aider-chat'
+    run_as_agent_no_proxy 'uv tool upgrade aider-chat'
     # shellcheck disable=SC2016 # $HOME expands inside the target user's shell
     record_ver "uv:aider-chat" "su -s /bin/bash - '${AGENT_NAME}' -c '\"\$HOME/.local/bin/aider\" --version'" "after"
   fi
@@ -133,7 +153,7 @@ if has_scope "toolchains"; then
     record_ver "rust" "su -s /bin/bash - '${AGENT_NAME}' -c '\"\$HOME/.cargo/bin/rustc\" --version'" "before"
     log "Updating Rust toolchain for '${AGENT_NAME}'..."
     # shellcheck disable=SC2016 # $HOME expands inside the target user's shell
-    su -s /bin/bash - "${AGENT_NAME}" -c '"$HOME/.cargo/bin/rustup" update'
+    run_as_agent_no_proxy '"$HOME/.cargo/bin/rustup" update'
     # shellcheck disable=SC2016 # $HOME expands inside the target user's shell
     record_ver "rust" "su -s /bin/bash - '${AGENT_NAME}' -c '\"\$HOME/.cargo/bin/rustc\" --version'" "after"
   fi
@@ -141,7 +161,7 @@ if has_scope "toolchains"; then
     if su -s /bin/bash - "${AGENT_NAME}" -c 'az extension show --name azure-devops >/dev/null 2>&1'; then
       record_ver "azure-devops" "su -s /bin/bash - '${AGENT_NAME}' -c 'az extension show --name azure-devops --query version -o tsv'" "before"
       log "Updating azure-devops extension for '${AGENT_NAME}'..."
-      su -s /bin/bash - "${AGENT_NAME}" -c 'az extension update --name azure-devops' || true
+      run_as_agent_no_proxy 'az extension update --name azure-devops' || true
       record_ver "azure-devops" "su -s /bin/bash - '${AGENT_NAME}' -c 'az extension show --name azure-devops --query version -o tsv'" "after"
     fi
   fi
@@ -216,15 +236,21 @@ if has_scope "toolchains"; then
     if compgen -G "${PW_CACHE}/chromium-*" >/dev/null; then
       log "Updating Playwright Chromium + system dependencies..."
       playwright install-deps chromium
-      su -s /bin/bash - "${AGENT_NAME}" -c 'playwright install chromium'
+      run_as_agent_no_proxy 'playwright install chromium'
     fi
     if compgen -G "${PW_CACHE}/firefox-*" >/dev/null; then
       log "Updating Playwright Firefox + system dependencies..."
       playwright install-deps firefox
-      su -s /bin/bash - "${AGENT_NAME}" -c 'playwright install firefox'
+      run_as_agent_no_proxy 'playwright install firefox'
     fi
     record_ver "npm:playwright" "playwright --version" "after"
   fi
+fi
+
+if [[ "${MAINTENANCE_EGRESS_ACTIVE}" -eq 1 ]] && [[ -x /usr/local/sbin/box-hardening.sh ]]; then
+  log "Restoring strict nftables egress rules..."
+  MAINTENANCE_EGRESS_ACTIVE=0
+  /usr/local/sbin/box-hardening.sh
 fi
 
 if [[ "${#BEFORE_VERSIONS[@]}" -gt 0 ]]; then

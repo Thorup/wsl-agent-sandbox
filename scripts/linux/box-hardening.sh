@@ -9,6 +9,18 @@ NFT_CONF_FILE="/etc/wsl-agent-sandbox/nftables.conf"
 BOX_ROOT="/run/box-root"
 PRIVATE_WSL_MNT="${BOX_ROOT}/mnt-wsl"
 
+DRY_RUN_NFT=0
+if [[ "${1:-}" == "--dry-run-nft" ]]; then
+  if [[ "$#" -ne 4 ]]; then
+    echo "[box-hardening] ERROR: --dry-run-nft requires <policy_file> <host_ips_file> <nft_conf_file>" >&2
+    exit 2
+  fi
+  DRY_RUN_NFT=1
+  POLICY_FILE="$2"
+  HOST_IPS_FILE="$3"
+  NFT_CONF_FILE="$4"
+fi
+
 log() {
   echo "[box-hardening] $*"
 }
@@ -18,6 +30,7 @@ if [[ ! -f "${POLICY_FILE}" ]]; then
   exit 1
 fi
 
+if [[ "${DRY_RUN_NFT}" -eq 0 ]]; then
 # 1. Isolate /mnt/wsl and /mnt/wslg per-distro without propagating unmounts to other distros.
 mkdir -p "${BOX_ROOT}"
 chmod 0700 "${BOX_ROOT}"
@@ -82,10 +95,11 @@ for d in /mnt/[a-z]; do
     umount -l "$d" || true
   fi
 done
+fi
 
 # 2. Parse policy.json with Python 3 to apply shared folders, Docker bind mirrors,
 #    docker-policy.json, and per-UID nftables rules atomically.
-python3 - "${POLICY_FILE}" "${HOST_IPS_FILE}" "${DOCKER_POLICY_FILE}" "${NFT_CONF_FILE}" "${PRIVATE_WSL_MNT}" "${VERIFY_POLICY_FILE}" <<'PYEOF'
+BOX_DRY_RUN_NFT="${DRY_RUN_NFT}" python3 - "${POLICY_FILE}" "${HOST_IPS_FILE}" "${DOCKER_POLICY_FILE}" "${NFT_CONF_FILE}" "${PRIVATE_WSL_MNT}" "${VERIFY_POLICY_FILE}" <<'PYEOF'
 import ipaddress
 import json
 import os
@@ -94,6 +108,9 @@ import subprocess
 import sys
 
 policy_file, host_ips_file, docker_policy_file, nft_conf_file, private_wsl_mnt, verify_policy_file = sys.argv[1:7]
+dry_run_nft = os.environ.get("BOX_DRY_RUN_NFT") == "1"
+maintenance_egress_open = os.environ.get("BOX_MAINTENANCE_EGRESS_OPEN") == "1"
+resolv_conf_path = os.environ.get("BOX_RESOLV_CONF", "/etc/resolv.conf")
 
 with open(policy_file, "r", encoding="utf-8") as f:
     policy = json.load(f)
@@ -119,6 +136,120 @@ def run(cmd, check=True):
 
 def is_mountpoint(path):
     return subprocess.run(["mountpoint", "-q", path]).returncode == 0
+
+bind_mappings = []
+docker_cfg = policy.get("docker", {})
+
+def read_resolv_nameservers(path):
+    v4, v6 = set(), set()
+    if os.path.isfile(path):
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("nameserver "):
+                    addr = line.split()[1].split("%")[0]
+                    try:
+                        ip = ipaddress.ip_address(addr)
+                        (v4 if ip.version == 4 else v6).add(str(ip))
+                    except ValueError:
+                        pass
+    return v4, v6
+
+def read_host_ips(path):
+    v4, v6 = set(), set()
+    for fam, dest in [("-4", v4), ("-6", v6)]:
+        r = run(["ip", fam, "route", "show", "default"], check=False)
+        for line in r.stdout.splitlines():
+            parts = line.split()
+            if "via" in parts:
+                idx = parts.index("via")
+                if idx + 1 < len(parts):
+                    addr = parts[idx + 1].split("%")[0]
+                    try:
+                        ip = ipaddress.ip_address(addr)
+                        dest.add(str(ip))
+                    except ValueError:
+                        pass
+    if os.path.isfile(path):
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                addr = line.strip().split("%")[0]
+                if not addr or addr.startswith("#"):
+                    continue
+                try:
+                    ip = ipaddress.ip_address(addr)
+                    if not ip.is_loopback:
+                        (v4 if ip.version == 4 else v6).add(str(ip))
+                except ValueError:
+                    pass
+    return v4, v6
+
+if dry_run_nft:
+    dns_v4, dns_v6 = read_resolv_nameservers(resolv_conf_path)
+    host_v4, host_v6 = read_host_ips(host_ips_file)
+    net_cfg = policy.get("network", {})
+    block_host_and_lan = bool(net_cfg.get("blockHostAndLan", True))
+    egress_mode = net_cfg.get("egressMode", "open")
+    blocked_v4 = []
+    blocked_v6 = ["fc00::/7", "fe80::/10"]
+    for cidr in net_cfg.get("blockedCidrs", []):
+        net = ipaddress.ip_network(cidr, strict=False)
+        (blocked_v4 if net.version == 4 else blocked_v6).append(str(net))
+    allowed_tcp = sorted({int(p["port"]) for p in net_cfg.get("allowedHostPorts", []) if p.get("protocol") == "tcp"})
+    allowed_udp = sorted({int(p["port"]) for p in net_cfg.get("allowedHostPorts", []) if p.get("protocol") == "udp"})
+    has_loopback0 = False
+    SHARED_MARK_HEX = "0x00002604"
+    NFT_TABLE = f"wsl_agent_sandbox_{agent_uid}"
+    lines = [f"table inet {NFT_TABLE} {{"]
+    lines.extend([
+        "    chain output {",
+        "        type filter hook output priority 0; policy accept;",
+        f"        meta skuid != {agent_uid} accept",
+        "        ct state established,related accept",
+        '        oifname "lo" accept',
+    ])
+    if egress_mode != "allowlist" or maintenance_egress_open:
+        if dns_v4:
+            elems = ", ".join(sorted(dns_v4))
+            lines.append(f"        ip daddr {{ {elems} }} udp dport 53 accept")
+            lines.append(f"        ip daddr {{ {elems} }} tcp dport 53 accept")
+        if dns_v6:
+            elems = ", ".join(sorted(dns_v6))
+            lines.append(f"        ip6 daddr {{ {elems} }} udp dport 53 accept")
+            lines.append(f"        ip6 daddr {{ {elems} }} tcp dport 53 accept")
+    if allowed_tcp:
+        ports = ", ".join(str(p) for p in allowed_tcp)
+        lines.append(f'        oifname "loopback0" tcp dport {{ {ports} }} accept')
+        if host_v4:
+            hosts = ", ".join(sorted(host_v4))
+            lines.append(f"        ip daddr {{ {hosts} }} tcp dport {{ {ports} }} accept")
+    if allowed_udp:
+        ports = ", ".join(str(p) for p in allowed_udp)
+        lines.append(f'        oifname "loopback0" udp dport {{ {ports} }} accept')
+        if host_v4:
+            hosts = ", ".join(sorted(host_v4))
+            lines.append(f"        ip daddr {{ {hosts} }} udp dport {{ {ports} }} accept")
+    if block_host_and_lan:
+        drop_action = "drop"
+        lines.append(f'        oifname "loopback0" {drop_action}')
+        if host_v4:
+            hosts = ", ".join(sorted(host_v4))
+            lines.append(f"        ip daddr {{ {hosts} }} {drop_action}")
+        if host_v6:
+            hosts = ", ".join(sorted(host_v6))
+            lines.append(f"        ip6 daddr {{ {hosts} }} {drop_action}")
+        if blocked_v4:
+            cidrs = ", ".join(sorted(set(blocked_v4)))
+            lines.append(f"        ip daddr {{ {cidrs} }} {drop_action}")
+        if blocked_v6:
+            cidrs = ", ".join(sorted(set(blocked_v6)))
+            lines.append(f"        ip6 daddr {{ {cidrs} }} {drop_action}")
+    if egress_mode == "allowlist" and not maintenance_egress_open:
+        lines.append("        drop")
+    lines.extend(["    }", "}"])
+    with open(nft_conf_file, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    sys.exit(0)
 
 # --- A. Allowlisted Windows shared folders under /shared/<name> ---
 shared_root = "/shared"
@@ -335,48 +466,8 @@ os.chmod(verify_tmp, 0o644)
 os.replace(verify_tmp, verify_policy_file)
 
 # --- C. Per-UID nftables firewall (table inet wsl_agent_sandbox) ---
-dns_v4, dns_v6 = set(), set()
-if os.path.isfile("/etc/resolv.conf"):
-    with open("/etc/resolv.conf", "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line.startswith("nameserver "):
-                addr = line.split()[1].split("%")[0]
-                try:
-                    ip = ipaddress.ip_address(addr)
-                    (dns_v4 if ip.version == 4 else dns_v6).add(str(ip))
-                except ValueError:
-                    pass
-
-host_v4, host_v6 = set(), set()
-# Default gateway IP (Windows Hyper-V vSwitch IP in NAT mode)
-for fam, dest in [("-4", host_v4), ("-6", host_v6)]:
-    r = run(["ip", fam, "route", "show", "default"], check=False)
-    for line in r.stdout.splitlines():
-        parts = line.split()
-        if "via" in parts:
-            idx = parts.index("via")
-            if idx + 1 < len(parts):
-                addr = parts[idx + 1].split("%")[0]
-                try:
-                    ip = ipaddress.ip_address(addr)
-                    dest.add(str(ip))
-                except ValueError:
-                    pass
-
-# Additional Windows host IPs provided by box.ps1
-if os.path.isfile(host_ips_file):
-    with open(host_ips_file, "r", encoding="utf-8") as f:
-        for line in f:
-            addr = line.strip().split("%")[0]
-            if not addr or addr.startswith("#"):
-                continue
-            try:
-                ip = ipaddress.ip_address(addr)
-                if not ip.is_loopback:
-                    (host_v4 if ip.version == 4 else host_v6).add(str(ip))
-            except ValueError:
-                pass
+dns_v4, dns_v6 = read_resolv_nameservers(resolv_conf_path)
+host_v4, host_v6 = read_host_ips(host_ips_file)
 
 net_cfg = policy.get("network", {})
 block_host_and_lan = bool(net_cfg.get("blockHostAndLan", True))
@@ -546,9 +637,9 @@ lines.extend([
     '        oifname "lo" accept',
 ])
 
-# Only permit direct agent UDP/TCP DNS queries in 'open' egress mode; in 'allowlist' mode
-# egress-proxy.py performs root-side DNS resolution, preventing direct DNS tunneling exfiltration.
-if egress_mode != "allowlist":
+# Only permit direct agent UDP/TCP DNS queries in 'open' egress mode (or during root maintenance);
+# in 'allowlist' mode egress-proxy.py performs root-side DNS resolution, preventing direct DNS tunneling exfiltration.
+if egress_mode != "allowlist" or maintenance_egress_open:
     if dns_v4:
         elems = ", ".join(sorted(dns_v4))
         lines.append(f"        ip daddr {{ {elems} }} udp dport 53 accept")
@@ -590,7 +681,7 @@ if block_host_and_lan:
         cidrs = ", ".join(sorted(set(blocked_v6)))
         lines.append(f"        ip6 daddr {{ {cidrs} }} {drop_action}")
 
-if egress_mode == "allowlist":
+if egress_mode == "allowlist" and not maintenance_egress_open:
     # Loopback (127.0.0.1:3128 egress-proxy) is already permitted above via 'oifname "lo" accept'.
     lines.append("        drop")
 
@@ -618,7 +709,7 @@ enable_shared_mirrored = bool(has_loopback0 and (enable_uid_mirrored or any_sand
 sync_shared_nft_prerouting(enable_shared_mirrored)
 sync_mirrored_ip_rules(enable_uid_mirrored, enable_shared_mirrored)
 
-print(f"[box-hardening] Loaded nftables table inet {NFT_TABLE} for UID {agent_uid} (blockHostAndLan={block_host_and_lan}).")
+print(f"[box-hardening] Loaded nftables table inet {NFT_TABLE} for UID {agent_uid} (blockHostAndLan={block_host_and_lan}, maintenanceEgressOpen={maintenance_egress_open}).")
 
 # --- D. Optional per-UID systemd resource quotas (user-<uid>.slice) ---
 slice_dir = f"/etc/systemd/system/user-{agent_uid}.slice.d"
