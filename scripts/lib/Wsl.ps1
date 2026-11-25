@@ -49,6 +49,19 @@ function Invoke-WslRootBash {
     }
 }
 
+function ConvertTo-WindowsCliArg {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
+    if ($Value.Length -eq 0) {
+        return '""'
+    }
+    if ($Value -notmatch '[\s"]') {
+        return $Value
+    }
+    $escaped = [regex]::Replace($Value, '(\\*)"', '$1$1\"')
+    $escaped = [regex]::Replace($escaped, '(\\+)$', '$1$1')
+    return '"' + $escaped + '"'
+}
+
 function Copy-BytesToWsl {
     param(
         [Parameter(Mandatory)][string]$DistroName,
@@ -60,14 +73,15 @@ function Copy-BytesToWsl {
     if ([string]::IsNullOrEmpty($remoteDir)) { $remoteDir = '/' }
 
     $shCmd = 'set -e; mkdir -p "$1"; tmp="$2.tmp.$$"; trap ''rm -f "$tmp"'' EXIT; cat > "$tmp" && chown root:root "$tmp" && chmod "$3" "$tmp" && mv -f "$tmp" "$2"'
-    $escapedShCmd = '"' + ($shCmd -replace '"', '\"') + '"'
-    $escapedDir = '"' + ($remoteDir -replace '"', '\"') + '"'
-    $escapedRemote = '"' + ($RemotePath -replace '"', '\"') + '"'
-    $escapedMode = '"' + ($Mode -replace '"', '\"') + '"'
+    $argDistro = ConvertTo-WindowsCliArg -Value $DistroName
+    $argShCmd = ConvertTo-WindowsCliArg -Value $shCmd
+    $argDir = ConvertTo-WindowsCliArg -Value $remoteDir
+    $argRemote = ConvertTo-WindowsCliArg -Value $RemotePath
+    $argMode = ConvertTo-WindowsCliArg -Value $Mode
 
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = 'wsl.exe'
-    $psi.Arguments = "-d $DistroName -u root -- sh -c $escapedShCmd _ $escapedDir $escapedRemote $escapedMode"
+    $psi.Arguments = "-d $argDistro -u root --exec sh -c $argShCmd _ $argDir $argRemote $argMode"
     $psi.UseShellExecute = $false
     $psi.RedirectStandardInput = $true
     $psi.RedirectStandardError = $true

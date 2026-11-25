@@ -1063,8 +1063,7 @@ function Resolve-PullTargetBranchName {
     if ([string]::IsNullOrWhiteSpace($SafeBranch) -or $SafeBranch -eq 'HEAD') {
         return "sandbox/$safeName"
     }
-    $sanitizedBranch = ($SafeBranch -replace '^refs/heads/', '') -replace '[^A-Za-z0-9._/-]', '-'
-    $sanitizedBranch = $sanitizedBranch.Trim('/')
+    $sanitizedBranch = ($SafeBranch -replace '^refs/heads/', '').Trim('/') -replace '[^A-Za-z0-9._-]', '-'
     if ([string]::IsNullOrWhiteSpace($sanitizedBranch)) {
         return "sandbox/$safeName"
     }
@@ -1170,12 +1169,23 @@ fi
 echo "[push-repo] Synced branch $checkout_branch to $target"
 '@
         $lfScript = ($remoteScript -replace "`r`n", "`n").TrimEnd("`n") + "`n"
-        $escapedScript = '"' + ($lfScript -replace '"', '\"') + '"'
         $forceArg = if ($Force) { '1' } else { '0' }
+        $cliArgs = @(
+            '-d', (ConvertTo-WindowsCliArg -Value $distro),
+            '-u', (ConvertTo-WindowsCliArg -Value $agent),
+            '--exec', 'bash', '-c',
+            (ConvertTo-WindowsCliArg -Value $lfScript),
+            '_',
+            (ConvertTo-WindowsCliArg -Value $targetRel),
+            (ConvertTo-WindowsCliArg -Value $checkoutBranch),
+            (ConvertTo-WindowsCliArg -Value $forceArg),
+            (ConvertTo-WindowsCliArg -Value $targetOid),
+            (ConvertTo-WindowsCliArg -Value $mainOid)
+        ) -join ' '
 
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = 'wsl.exe'
-        $psi.Arguments = "-d $distro -u $agent -- bash -c $escapedScript _ `"$targetRel`" `"$checkoutBranch`" `"$forceArg`" `"$targetOid`" `"$mainOid`""
+        $psi.Arguments = $cliArgs
         $psi.UseShellExecute = $false
         $psi.RedirectStandardInput = $true
         $psi.RedirectStandardOutput = $true
@@ -1218,10 +1228,8 @@ function Invoke-WslAgentBashStdin {
     $lfScript = ($ScriptText -replace "`r`n", "`n").TrimEnd("`n") + "`n"
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = 'wsl.exe'
-    $escapedArgs = ($BashArgs | ForEach-Object {
-        if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
-    }) -join ' '
-    $psi.Arguments = "-d $DistroName -u $AgentName -- bash -s -- $escapedArgs"
+    $escapedArgs = ($BashArgs | ForEach-Object { ConvertTo-WindowsCliArg -Value $_ }) -join ' '
+    $psi.Arguments = "-d $(ConvertTo-WindowsCliArg -Value $DistroName) -u $(ConvertTo-WindowsCliArg -Value $AgentName) --exec bash -s -- $escapedArgs"
     $psi.UseShellExecute = $false
     $psi.RedirectStandardInput = $true
     $psi.RedirectStandardOutput = $true
@@ -1338,11 +1346,19 @@ git -C "$target" bundle create "$tmp" "$ref" >/dev/null
 cat "$tmp"
 '@
         $lfScript = ($remoteScript -replace "`r`n", "`n").TrimEnd("`n") + "`n"
-        $escapedScript = '"' + ($lfScript -replace '"', '\"') + '"'
+        $cliArgs = @(
+            '-d', (ConvertTo-WindowsCliArg -Value $distro),
+            '-u', (ConvertTo-WindowsCliArg -Value $agent),
+            '--exec', 'bash', '-c',
+            (ConvertTo-WindowsCliArg -Value $lfScript),
+            '_',
+            (ConvertTo-WindowsCliArg -Value $rel),
+            (ConvertTo-WindowsCliArg -Value $safeBranch)
+        ) -join ' '
 
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = 'wsl.exe'
-        $psi.Arguments = "-d $distro -u $agent -- bash -c $escapedScript _ `"$rel`" `"$safeBranch`""
+        $psi.Arguments = $cliArgs
         $psi.UseShellExecute = $false
         $psi.RedirectStandardOutput = $true
         $psi.RedirectStandardError = $true

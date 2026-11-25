@@ -60,10 +60,12 @@ function Assert-Throws {
 
 Write-Host "=== Running CodeBridge Automated Tests ==="
 
-# 1. Wsl.ps1 streaming helpers
+# 1. Wsl.ps1 streaming & CLI quoting helpers
 Assert-True "Copy-BytesToWsl function is defined" ($null -ne (Get-Command Copy-BytesToWsl -ErrorAction SilentlyContinue))
 Assert-True "Copy-FileToWsl function is defined" ($null -ne (Get-Command Copy-FileToWsl -ErrorAction SilentlyContinue))
 Assert-True "Copy-TextToWsl function is defined" ($null -ne (Get-Command Copy-TextToWsl -ErrorAction SilentlyContinue))
+Assert-True "ConvertTo-WindowsCliArg quotes shell dollars and backslashes safely" ((ConvertTo-WindowsCliArg -Value 'mkdir -p "$1"') -eq '"mkdir -p \"$1\""')
+Assert-True "ConvertTo-WindowsCliArg doubles trailing backslashes before closing quote" ((ConvertTo-WindowsCliArg -Value 'C:\path with space\') -eq '"C:\path with space\\"')
 
 # 2. Resolve-WslWorkRelPath
 Assert-True "Resolve-WslWorkRelPath applies DefaultPrefix for bare name" ((Resolve-WslWorkRelPath -RawPath 'my-repo' -DefaultPrefix 'work') -eq 'work/my-repo')
@@ -92,8 +94,12 @@ Assert-True "Resolve-SandboxCheckoutBranch strips refs/heads/ prefix" ((Resolve-
 
 # 5. Resolve-PullTargetBranchName
 Assert-True "Resolve-PullTargetBranchName defaults to sandbox/<name> for HEAD" ((Resolve-PullTargetBranchName -RepoLeafName 'my-repo' -SafeBranch 'HEAD') -eq 'sandbox/my-repo')
-Assert-True "Resolve-PullTargetBranchName includes branch suffix when specified" ((Resolve-PullTargetBranchName -RepoLeafName 'my-repo' -SafeBranch 'feat/42_fix') -eq 'sandbox/my-repo-feat/42_fix')
-Assert-True "Resolve-PullTargetBranchName strips refs/heads/ in branch suffix" ((Resolve-PullTargetBranchName -RepoLeafName 'my-repo' -SafeBranch 'refs/heads/feat/42_fix') -eq 'sandbox/my-repo-feat/42_fix')
+Assert-True "Resolve-PullTargetBranchName includes flattened branch suffix when specified" ((Resolve-PullTargetBranchName -RepoLeafName 'my-repo' -SafeBranch 'feat/42_fix') -eq 'sandbox/my-repo-feat-42_fix')
+Assert-True "Resolve-PullTargetBranchName strips refs/heads/ in branch suffix" ((Resolve-PullTargetBranchName -RepoLeafName 'my-repo' -SafeBranch 'refs/heads/feat/42_fix') -eq 'sandbox/my-repo-feat-42_fix')
+Assert-True "Resolve-PullTargetBranchName avoids hierarchical ref collision between feat and feat/sub" (
+    (Resolve-PullTargetBranchName -RepoLeafName 'my-repo' -SafeBranch 'feat') -eq 'sandbox/my-repo-feat' -and
+    (Resolve-PullTargetBranchName -RepoLeafName 'my-repo' -SafeBranch 'feat/sub') -eq 'sandbox/my-repo-feat-sub'
+)
 
 # 6. End-to-end local git bundle + refs/sandbox/base + origin/main + worktree test
 $tmpRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("cb-test-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
