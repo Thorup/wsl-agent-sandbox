@@ -167,9 +167,11 @@ main() {
     exit 0
   fi
 
-  local maintenance_egress_active=0
+  # Global (not `local`): the EXIT trap fires after main() returns, when locals are gone and
+  # `set -u` would abort with "unbound variable" (turning a successful apply into exit 1).
+  maintenance_egress_active=0
   restore_maintenance_egress() {
-    if [[ "${maintenance_egress_active}" -eq 1 ]] && [[ -x /usr/local/sbin/box-hardening.sh ]]; then
+    if [[ "${maintenance_egress_active:-0}" -eq 1 ]] && [[ -x /usr/local/sbin/box-hardening.sh ]]; then
       /usr/local/sbin/box-hardening.sh >/dev/null 2>&1 || true
     fi
   }
