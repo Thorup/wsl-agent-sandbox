@@ -182,6 +182,15 @@ class TestRepoContracts(unittest.TestCase):
             "Expected release.yml to render and upload dist/wsl-agent-sandbox.json",
         )
 
+    def test_npm_and_pnpm_user_env_configured_for_non_root(self):
+        for rel in ("scripts/linux/provision.sh", "scripts/linux/apply-policy.sh"):
+            with open(os.path.join(REPO_ROOT, rel), encoding="utf-8") as f:
+                content = f.read()
+            self.assertIn("$HOME/.local/share/pnpm", content, f"{rel} missing $HOME/.local/share/pnpm in PATH")
+            self.assertIn('export NPM_CONFIG_PREFIX="$HOME/.npm-global"', content, f"{rel} missing NPM_CONFIG_PREFIX")
+            self.assertIn('export PNPM_HOME="$HOME/.local/share/pnpm"', content, f"{rel} missing PNPM_HOME")
+            self.assertIn('if [ "$(id -u)" -ne 0 ]; then', content, f"{rel} must scope NPM_CONFIG_PREFIX/PNPM_HOME to non-root")
+
 
 if __name__ == "__main__":
     unittest.main()

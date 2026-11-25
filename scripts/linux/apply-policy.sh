@@ -91,7 +91,11 @@ PYEOF
 unset DISPLAY WAYLAND_DISPLAY PULSE_SERVER WSL_INTEROP
 export DOCKER_HOST="unix:///run/docker-policy/docker.sock"
 export DOTNET_ROOT="/usr/local/share/dotnet"
-export PATH="$HOME/.cargo/bin:$HOME/.dotnet/tools:$HOME/.local/bin:$HOME/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH="$HOME/.cargo/bin:$HOME/.dotnet/tools:$HOME/.local/bin:$HOME/.local/share/pnpm:$HOME/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+if [ "$(id -u)" -ne 0 ]; then
+  export NPM_CONFIG_PREFIX="$HOME/.npm-global"
+  export PNPM_HOME="$HOME/.local/share/pnpm"
+fi
 export BASH_ENV="/etc/profile.d/99-agent-box.sh"
 # Load seeded CLI service credentials (managed by box.ps1 seed-secrets)
 if [ -r "$HOME/.config/wsl-agent-sandbox/secrets.env" ]; then
