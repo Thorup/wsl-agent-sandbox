@@ -50,7 +50,7 @@ PYEOF
   SSH_AUTH_SOCK="${SSH_AGENT_UPSTREAM_SOCK}" ssh-add -l >/dev/null 2>&1 || probe_rc=$?
   if [[ "${probe_rc}" -ne 0 ]] && [[ "${probe_rc}" -ne 1 ]]; then
     rm -f "${SSH_AGENT_UPSTREAM_SOCK}"
-    ssh-agent -a "${SSH_AGENT_UPSTREAM_SOCK}" >/dev/null
+    (umask 0077 && ssh-agent -a "${SSH_AGENT_UPSTREAM_SOCK}" >/dev/null)
     chmod 0600 "${SSH_AGENT_UPSTREAM_SOCK}"
   fi
 

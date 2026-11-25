@@ -434,7 +434,6 @@ function Invoke-SeedSecrets {
     Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'scripts\linux\credential-proxy.py') -RemotePath '/usr/local/sbin/box-credential-proxy.py' -Mode '0755' -NormalizeLF
     Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'systemd\credential-proxy.service') -RemotePath '/etc/systemd/system/credential-proxy.service' -Mode '0644' -NormalizeLF
     Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'scripts\linux\ssh-agent-proxy.py') -RemotePath '/usr/local/sbin/box-ssh-agent-proxy.py' -Mode '0755' -NormalizeLF
-    Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'scripts\linux\box-ssh-agent-ctl.sh') -RemotePath '/usr/local/sbin/box-ssh-agent-ctl.sh' -Mode '0755' -NormalizeLF
     Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'systemd\ssh-agent-proxy.service') -RemotePath '/etc/systemd/system/ssh-agent-proxy.service' -Mode '0644' -NormalizeLF
 
     $payloadJson = $built.Payload | ConvertTo-Json -Depth 10 -Compress
