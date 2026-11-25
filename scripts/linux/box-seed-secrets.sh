@@ -383,6 +383,8 @@ def seed_github(cfg, prev_meta):
     hosts_file = os.path.join(AGENT_HOME, ".config", "gh", "hosts.yml")
 
     if login_online:
+        if proxy_url:
+            raise RuntimeError("github: loginOnline cannot be used when proxyInject is enabled.")
         if not shutil.which("gh"):
             raise RuntimeError("gh CLI is not installed inside WSL.")
         run_as_agent(
@@ -398,9 +400,12 @@ def seed_github(cfg, prev_meta):
         # Write each distinct hostname (with active_prof winning for its hostname)
         for p in profiles:
             h = p.get("hostname", "github.com")
+            win_p = active_prof if h == hostname else p
+            if win_p.get("proxyBaseUrl"):
+                blocks.pop(h, None)
+                continue
             if h not in order:
                 order.append(h)
-            win_p = active_prof if h == hostname else p
             h_lines = [
                 f"    git_protocol: {win_p.get('gitProtocol', 'https')}",
                 f"    oauth_token: {yaml_scalar(win_p['token'])}",
@@ -408,19 +413,26 @@ def seed_github(cfg, prev_meta):
             if win_p.get("user"):
                 h_lines.append(f"    user: {yaml_scalar(win_p['user'])}")
             blocks[h] = h_lines
-        write_agent_file(hosts_file, render_gh_hosts_yml(order, blocks), mode=0o600, dir_mode=0o700)
+        remaining_order = [h for h in order if h in blocks]
+        rendered = render_gh_hosts_yml(remaining_order, blocks)
+        if rendered.strip():
+            write_agent_file(hosts_file, rendered, mode=0o600, dir_mode=0o700)
+        elif os.path.isfile(hosts_file):
+            remove_file_quiet(hosts_file)
 
-    if setup_git and shutil.which("gh"):
+    if setup_git and not proxy_url and shutil.which("gh"):
         run_as_agent(["gh", "auth", "setup-git", "--hostname", hostname])
 
     env_vars = {}
     if len(profiles) > 1 or active_prof.get("name", "default") != "default":
         env_vars["WSL_BOX_GITHUB_PROFILE"] = active_prof.get("name", "default")
-    if export_env:
-        env_key = "GH_TOKEN" if hostname == "github.com" else "GH_ENTERPRISE_TOKEN"
-        env_vars[env_key] = token
     if proxy_url:
         env_vars["GITHUB_API_URL"] = proxy_url
+        if export_env:
+            env_vars["GITHUB_TOKEN"] = token
+    elif export_env:
+        env_key = "GH_TOKEN" if hostname == "github.com" else "GH_ENTERPRISE_TOKEN"
+        env_vars[env_key] = token
     written_keys = write_service_env("github", env_vars)
     clear_overrides_section("github")
 

@@ -19,7 +19,7 @@ import socket
 import socketserver
 import ssl
 import sys
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse
 
 CONFIG_FILE = sys.argv[1] if len(sys.argv) > 1 else "/etc/wsl-agent-sandbox/credential-proxy.json"
 EGRESS_ALLOWLIST_FILE = sys.argv[2] if len(sys.argv) > 2 else "/etc/wsl-agent-sandbox/egress-allowlist.json"
@@ -325,7 +325,7 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
             raise
 
 
-def extract_client_tokens(headers):
+def extract_client_tokens(headers, query_string=""):
     """Extract candidate bearer/basic/api-key credentials supplied by the client."""
     tokens = []
     auth = headers.get("Authorization", "")
@@ -349,12 +349,16 @@ def extract_client_tokens(headers):
         hv = headers.get(hdr, "")
         if hv and hv.strip():
             tokens.append(hv.strip())
+    if query_string:
+        for qk, qv in parse_qsl(query_string, keep_blank_values=True):
+            if qk.lower() in ("key", "api_key") and qv and qv.strip():
+                tokens.append(qv.strip())
     return tokens
 
 
-def resolve_matched_token_profile(headers, route):
+def resolve_matched_token_profile(headers, route, query_string=""):
     """Verify the client presented a valid per-seed placeholder token and return any matched profile override."""
-    presented = extract_client_tokens(headers)
+    presented = extract_client_tokens(headers, query_string=query_string)
     token_profiles = route.get("tokenProfiles")
     if isinstance(token_profiles, dict) and token_profiles:
         for exp_tok, prof_cfg in token_profiles.items():
@@ -447,7 +451,8 @@ class CredentialProxyHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(403, f"credential-proxy: unknown or unconfigured service route '{svc}'")
             return
 
-        ok, matched_profile = resolve_matched_token_profile(self.headers, route)
+        rest_path, _, rest_query = rest.partition("?")
+        ok, matched_profile = resolve_matched_token_profile(self.headers, route, query_string=rest_query)
         if not ok:
             self.send_error(401, f"credential-proxy: missing or invalid placeholder token for '{svc}'")
             return
@@ -537,7 +542,29 @@ class CredentialProxyHandler(http.server.BaseHTTPRequestHandler):
                     context=ssl_ctx,
                 )
         try:
-            target_path = upstream.path.rstrip("/") + rest
+            clean_query = rest_query
+            if rest_query:
+                inject_header_keys = {hk.lower() for hk in effective_inject_headers}
+                expected_tokens = []
+                if isinstance(route.get("tokenProfiles"), dict):
+                    expected_tokens.extend(str(t) for t in route["tokenProfiles"] if t)
+                if route.get("expectedToken"):
+                    expected_tokens.append(str(route["expectedToken"]))
+                for t in route.get("expectedTokens", []) or []:
+                    if t:
+                        expected_tokens.append(str(t))
+                kept_params = []
+                for qk, qv in parse_qsl(rest_query, keep_blank_values=True):
+                    qv_s = qv.strip()
+                    if qk.lower() in ("key", "api_key") and (
+                        ("x-goog-api-key" in inject_header_keys or "x-api-key" in inject_header_keys)
+                        or any(hmac.compare_digest(qv_s, exp) for exp in expected_tokens)
+                    ):
+                        continue
+                    kept_params.append((qk, qv))
+                clean_query = urlencode(kept_params, doseq=True)
+            clean_rest = f"{rest_path}?{clean_query}" if clean_query else rest_path
+            target_path = upstream.path.rstrip("/") + clean_rest
             conn.request(self.command, target_path, body=body, headers=headers)
             resp = conn.getresponse()
             # Refuse redirects so credentials/tokens are never forwarded to another domain.
