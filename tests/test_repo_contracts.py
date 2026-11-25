@@ -163,6 +163,25 @@ class TestRepoContracts(unittest.TestCase):
                 f"Scoop manifest bin target does not exist: {target}",
             )
 
+        # Release workflow includes assets, docs, and rendered Scoop manifest
+        release_yml_path = os.path.join(REPO_ROOT, ".github", "workflows", "release.yml")
+        with open(release_yml_path, encoding="utf-8") as f:
+            release_yml = f.read()
+        cp_match = re.search(r"cp -r\s+(.*?)\"dist/\$\{PKG_NAME\}/\"", release_yml, re.DOTALL)
+        self.assertIsNotNone(cp_match, "Could not locate cp -r archive step in .github/workflows/release.yml")
+        cp_items = set(re.findall(r"[A-Za-z0-9_.-]+", cp_match.group(1).replace("\\\n", " ")))
+        for required_dir in ("assets", "docs", "scripts", "systemd", "packaging"):
+            self.assertIn(
+                required_dir,
+                cp_items,
+                f"Expected '{required_dir}' in release.yml cp -r archive list",
+            )
+        self.assertIn(
+            "dist/wsl-agent-sandbox.json",
+            release_yml,
+            "Expected release.yml to render and upload dist/wsl-agent-sandbox.json",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

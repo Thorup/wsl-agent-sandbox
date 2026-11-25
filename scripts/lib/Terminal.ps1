@@ -272,6 +272,262 @@ function Test-ShouldConfigureIdeRemoteWsl {
     return $false
 }
 
+function Edit-JsoncRootBooleanProperty {
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
+        [Parameter(Mandatory)][string]$PropertyName,
+        [Parameter(Mandatory)][bool]$Value
+    )
+
+    $valLiteral = if ($Value) { 'true' } else { 'false' }
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return "{`n  `"$PropertyName`": $valLiteral`n}`n"
+    }
+
+    $len = $Text.Length
+    $i = 0
+    $depth = 0
+    $rootOpenIdx = -1
+    $rootCloseIdx = -1
+    $lastRootTokenChar = [char]0
+    $lastRootTokenEndIdx = -1
+    $firstPropIndent = ''
+
+    while ($i -lt $len) {
+        $ch = $Text[$i]
+        if ([char]::IsWhiteSpace($ch)) {
+            $i++
+            continue
+        }
+        if ($ch -eq '/' -and ($i + 1) -lt $len) {
+            $next = $Text[$i + 1]
+            if ($next -eq '/') {
+                $i += 2
+                while ($i -lt $len -and $Text[$i] -ne "`n" -and $Text[$i] -ne "`r") {
+                    $i++
+                }
+                continue
+            }
+            if ($next -eq '*') {
+                $i += 2
+                while (($i + 1) -lt $len -and -not ($Text[$i] -eq '*' -and $Text[$i + 1] -eq '/')) {
+                    $i++
+                }
+                $i = if (($i + 1) -lt $len) { $i + 2 } else { $len }
+                continue
+            }
+        }
+
+        if ($ch -eq '"') {
+            $strStart = $i
+            $i++
+            $escaped = $false
+            while ($i -lt $len) {
+                $sc = $Text[$i]
+                if ($escaped) {
+                    $escaped = $false
+                } elseif ($sc -eq '\') {
+                    $escaped = $true
+                } elseif ($sc -eq '"') {
+                    $i++
+                    break
+                }
+                $i++
+            }
+            $strEnd = $i
+
+            if ($depth -eq 1) {
+                $k = $strEnd
+                while ($k -lt $len) {
+                    $kc = $Text[$k]
+                    if ([char]::IsWhiteSpace($kc)) {
+                        $k++
+                        continue
+                    }
+                    if ($kc -eq '/' -and ($k + 1) -lt $len) {
+                        if ($Text[$k + 1] -eq '/') {
+                            $k += 2
+                            while ($k -lt $len -and $Text[$k] -ne "`n" -and $Text[$k] -ne "`r") { $k++ }
+                            continue
+                        }
+                        if ($Text[$k + 1] -eq '*') {
+                            $k += 2
+                            while (($k + 1) -lt $len -and -not ($Text[$k] -eq '*' -and $Text[$k + 1] -eq '/')) { $k++ }
+                            $k = if (($k + 1) -lt $len) { $k + 2 } else { $len }
+                            continue
+                        }
+                    }
+                    break
+                }
+
+                if ($k -lt $len -and $Text[$k] -eq ':') {
+                    if ($firstPropIndent -eq '') {
+                        $lineStart = $Text.LastIndexOf("`n", [Math]::Max(0, $strStart - 1))
+                        $lineStart = if ($lineStart -lt 0) { 0 } else { $lineStart + 1 }
+                        $prefix = $Text.Substring($lineStart, $strStart - $lineStart)
+                        if ($prefix -match '^[ \t]+$') {
+                            $firstPropIndent = $prefix
+                        }
+                    }
+
+                    $keyRaw = $Text.Substring($strStart, $strEnd - $strStart)
+                    $keyName = $null
+                    try {
+                        $keyName = ($keyRaw | ConvertFrom-Json)
+                    } catch {
+                        $keyName = $null
+                    }
+                    if ($keyName -eq $PropertyName) {
+                        $v = $k + 1
+                        while ($v -lt $len) {
+                            $vc = $Text[$v]
+                            if ([char]::IsWhiteSpace($vc)) {
+                                $v++
+                                continue
+                            }
+                            if ($vc -eq '/' -and ($v + 1) -lt $len) {
+                                if ($Text[$v + 1] -eq '/') {
+                                    $v += 2
+                                    while ($v -lt $len -and $Text[$v] -ne "`n" -and $Text[$v] -ne "`r") { $v++ }
+                                    continue
+                                }
+                                if ($Text[$v + 1] -eq '*') {
+                                    $v += 2
+                                    while (($v + 1) -lt $len -and -not ($Text[$v] -eq '*' -and $Text[$v + 1] -eq '/')) { $v++ }
+                                    $v = if (($v + 1) -lt $len) { $v + 2 } else { $len }
+                                    continue
+                                }
+                            }
+                            break
+                        }
+                        if ($v -lt $len) {
+                            $valStart = $v
+                            $valEnd = $v
+                            $vFirst = $Text[$v]
+                            if ($vFirst -eq '"') {
+                                $valEnd++
+                                $vEsc = $false
+                                while ($valEnd -lt $len) {
+                                    $vc2 = $Text[$valEnd]
+                                    if ($vEsc) {
+                                        $vEsc = $false
+                                    } elseif ($vc2 -eq '\') {
+                                        $vEsc = $true
+                                    } elseif ($vc2 -eq '"') {
+                                        $valEnd++
+                                        break
+                                    }
+                                    $valEnd++
+                                }
+                            } elseif ($vFirst -eq '{' -or $vFirst -eq '[') {
+                                $vDepth = 0
+                                $vInStr = $false
+                                $vEsc = $false
+                                while ($valEnd -lt $len) {
+                                    $vc2 = $Text[$valEnd]
+                                    if ($vInStr) {
+                                        if ($vEsc) { $vEsc = $false }
+                                        elseif ($vc2 -eq '\') { $vEsc = $true }
+                                        elseif ($vc2 -eq '"') { $vInStr = $false }
+                                    } else {
+                                        if ($vc2 -eq '"') { $vInStr = $true }
+                                        elseif ($vc2 -eq '{' -or $vc2 -eq '[') { $vDepth++ }
+                                        elseif ($vc2 -eq '}' -or $vc2 -eq ']') {
+                                            $vDepth--
+                                            if ($vDepth -eq 0) {
+                                                $valEnd++
+                                                break
+                                            }
+                                        }
+                                    }
+                                    $valEnd++
+                                }
+                            } else {
+                                while ($valEnd -lt $len) {
+                                    $vc2 = $Text[$valEnd]
+                                    if ([char]::IsWhiteSpace($vc2) -or $vc2 -eq ',' -or $vc2 -eq '}' -or $vc2 -eq '/') {
+                                        break
+                                    }
+                                    $valEnd++
+                                }
+                            }
+                            if ($valEnd -gt $valStart) {
+                                return $Text.Substring(0, $valStart) + $valLiteral + $Text.Substring($valEnd)
+                            }
+                        }
+                    }
+                }
+                $lastRootTokenChar = '"'
+                $lastRootTokenEndIdx = $strEnd
+            }
+            continue
+        }
+
+        if ($ch -eq '{' -or $ch -eq '[') {
+            if ($depth -eq 0 -and $ch -eq '{' -and $rootOpenIdx -lt 0) {
+                $rootOpenIdx = $i
+                $lastRootTokenChar = '{'
+                $lastRootTokenEndIdx = $i + 1
+            }
+            $depth++
+            $i++
+            continue
+        }
+
+        if ($ch -eq '}' -or $ch -eq ']') {
+            $depth--
+            if ($depth -eq 0 -and $ch -eq '}' -and $rootOpenIdx -ge 0) {
+                $rootCloseIdx = $i
+                break
+            }
+            if ($depth -eq 1) {
+                $lastRootTokenChar = $ch
+                $lastRootTokenEndIdx = $i + 1
+            }
+            $i++
+            continue
+        }
+
+        if ($depth -eq 1) {
+            $lastRootTokenChar = $ch
+            $lastRootTokenEndIdx = $i + 1
+        }
+        $i++
+    }
+
+    if ($rootOpenIdx -lt 0 -or $rootCloseIdx -lt 0) {
+        return $null
+    }
+
+    $nl = if ($Text.Contains("`r`n")) { "`r`n" } else { "`n" }
+    $indent = if ($firstPropIndent -ne '') { $firstPropIndent } else { '  ' }
+    $needsComma = ($lastRootTokenChar -ne '{' -and $lastRootTokenChar -ne ',' -and $lastRootTokenEndIdx -gt 0)
+
+    $closeLineStart = $Text.LastIndexOf("`n", [Math]::Max(0, $rootCloseIdx - 1))
+    $closeLineStart = if ($closeLineStart -lt 0) { 0 } else { $closeLineStart + 1 }
+    $closeLinePrefix = $Text.Substring($closeLineStart, $rootCloseIdx - $closeLineStart)
+    $closeOnOwnLine = ($closeLineStart -gt 0 -and $closeLinePrefix -match '^[ \t]*$')
+
+    $insertPos = if ($closeOnOwnLine) { $closeLineStart } else { $rootCloseIdx }
+    $entryText = if ($closeOnOwnLine) {
+        "$indent`"$PropertyName`": $valLiteral$nl"
+    } else {
+        "$nl$indent`"$PropertyName`": $valLiteral$nl"
+    }
+
+    $sb = New-Object System.Text.StringBuilder($Text.Length + $PropertyName.Length + 32)
+    if ($needsComma -and $lastRootTokenEndIdx -le $insertPos) {
+        [void]$sb.Append($Text.Substring(0, $lastRootTokenEndIdx))
+        [void]$sb.Append(',')
+        [void]$sb.Append($Text.Substring($lastRootTokenEndIdx, $insertPos - $lastRootTokenEndIdx))
+    } else {
+        [void]$sb.Append($Text.Substring(0, $insertPos))
+    }
+    [void]$sb.Append($entryText)
+    [void]$sb.Append($Text.Substring($insertPos))
+    return $sb.ToString()
+}
+
 function Sync-IdeWslScriptlessStartup {
     param(
         [string[]]$SettingsPaths = @()
@@ -303,9 +559,24 @@ function Sync-IdeWslScriptlessStartup {
         $backupPath = "${settingsPath}.bak-${stamp}"
         Copy-Item -LiteralPath $settingsPath -Destination $backupPath -Force
 
-        $json | Add-Member -NotePropertyName $settingKey -NotePropertyValue $true -Force
-        $outJson = $json | ConvertTo-Json -Depth 20
-        [System.IO.File]::WriteAllText($settingsPath, $outJson + "`n", (New-Object System.Text.UTF8Encoding($false)))
+        $outText = Edit-JsoncRootBooleanProperty -Text $raw -PropertyName $settingKey -Value $true
+        $validSurgical = $false
+        if ($null -ne $outText) {
+            try {
+                $reparsed = ConvertFrom-Jsonc -Text $outText
+                if ($null -ne $reparsed -and $reparsed.PSObject.Properties[$settingKey] -and ($reparsed.$settingKey -eq $true)) {
+                    $validSurgical = $true
+                }
+            } catch {
+                $validSurgical = $false
+            }
+        }
+        if (-not $validSurgical) {
+            $json | Add-Member -NotePropertyName $settingKey -NotePropertyValue $true -Force
+            $outText = ($json | ConvertTo-Json -Depth 20) + "`n"
+        }
+
+        [System.IO.File]::WriteAllText($settingsPath, $outText, (New-Object System.Text.UTF8Encoding($false)))
         $updated.Add($settingsPath)
         Write-Host "[ide-wsl] Enabled '$settingKey'=true in '$settingsPath' (backup: $backupPath)."
     }

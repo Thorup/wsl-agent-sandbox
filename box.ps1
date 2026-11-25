@@ -72,7 +72,8 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $AppRoot = $PSScriptRoot
-if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
+$userSpecifiedConfigPath = -not [string]::IsNullOrWhiteSpace($ConfigPath)
+if (-not $userSpecifiedConfigPath) {
     $cwdConfig = Join-Path (Get-Location).Path 'box.json'
     $userConfig = Join-Path $env:USERPROFILE '.wsl-agent-sandbox\box.json'
     if (Test-Path -LiteralPath $cwdConfig -PathType Leaf) {
@@ -90,7 +91,12 @@ if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
         }
     }
 } else {
-    $fullConfigPath = [System.IO.Path]::GetFullPath($ConfigPath)
+    $fullConfigPath = if ([System.IO.Path]::IsPathRooted($ConfigPath)) {
+        [System.IO.Path]::GetFullPath($ConfigPath)
+    } else {
+        [System.IO.Path]::GetFullPath((Join-Path (Get-Location).Path $ConfigPath))
+    }
+    $ConfigPath = $fullConfigPath
     $StateRoot = Split-Path -Parent $fullConfigPath
 }
 . (Join-Path $AppRoot 'scripts\lib\Config.ps1')
@@ -339,8 +345,8 @@ function Invoke-Init {
     Write-Host "[init] '$distro' is provisioned and hardened! Running verification..."
     Invoke-Verify -Config $Config
 
-    $goldenPath = Get-GoldenSnapshotPath -Config $Config
-    if ($SaveGolden -or -not (Test-Path -LiteralPath $goldenPath -PathType Leaf)) {
+    if ($SaveGolden) {
+        $goldenPath = Get-GoldenSnapshotPath -Config $Config
         Write-Host "[init] Saving golden base snapshot for fast resets -> '$goldenPath'..."
         Invoke-Snapshot -Config $Config -Golden
     }
@@ -469,17 +475,28 @@ function Invoke-ClearSecrets {
 function Invoke-Status {
     param($Config)
     $distro = $Config.distroName
-    $localOverride = Get-BoxLocalOverridePath -ConfigPath $ConfigPath
+    $localOverride = Get-BoxLocalOverridePath -ConfigPath $ConfigPath -SearchDir $StateRoot
+    $profileOverride = if (-not [string]::IsNullOrWhiteSpace($ProfileName)) {
+        Get-ProfileOverridePath -RepoRoot $StateRoot -ProfileName $ProfileName
+    } else {
+        $null
+    }
     if (-not (Test-WslDistroExists -DistroName $distro)) {
         Write-Host "Distro '$distro': NOT INSTALLED"
         if ($localOverride) {
             Write-Host "Local override: $localOverride (active)"
+        }
+        if ($profileOverride) {
+            Write-Host "Profile override ($ProfileName): $profileOverride (active)"
         }
         return
     }
     Write-Host "=== Status: $distro ==="
     if ($localOverride) {
         Write-Host "Local override: $localOverride (active)"
+    }
+    if ($profileOverride) {
+        Write-Host "Profile override ($ProfileName): $profileOverride (active)"
     }
     $agentUid = [int]$Config.agentUser.uid
     $statusScript = "AGENT_UID=$agentUid`n" + @'
@@ -1242,7 +1259,7 @@ if ($Command -eq 'list') {
     $listExplicitCfg = if ($ConfigPath -ne (Join-Path $StateRoot 'box.json')) { $ConfigPath } else { '' }
     Write-Host "=== Managed Sandbox Profiles ==="
     foreach ($pName in $profileNames) {
-        $c = Resolve-BoxProfileConfig -RepoRoot $StateRoot -ProfileName $pName -ExplicitConfigPath $listExplicitCfg
+        $c = Resolve-BoxProfileConfig -RepoRoot $StateRoot -ProfileName $pName -ExplicitConfigPath $listExplicitCfg -LocalOverrideSearchDir $StateRoot
         $state = if ($registered -contains $c.distroName) { 'Installed' } else { 'Not Installed' }
         $label = if ($pName) { $pName } else { 'default' }
         Write-Host ("  - {0,-15} distro={1,-28} uid={2} state={3}" -f $label, $c.distroName, $c.agentUser.uid, $state)
@@ -1250,7 +1267,7 @@ if ($Command -eq 'list') {
     exit 0
 }
 
-$cfg = Resolve-BoxProfileConfig -RepoRoot $StateRoot -ProfileName $ProfileName -ExplicitConfigPath $(if ($ConfigPath -ne (Join-Path $StateRoot 'box.json')) { $ConfigPath } else { '' })
+$cfg = Resolve-BoxProfileConfig -RepoRoot $StateRoot -ProfileName $ProfileName -ExplicitConfigPath $(if ($ConfigPath -ne (Join-Path $StateRoot 'box.json')) { $ConfigPath } else { '' }) -LocalOverrideSearchDir $StateRoot
 
 switch ($Command) {
     'init' {
@@ -1332,7 +1349,12 @@ switch ($Command) {
             Write-Host "[reset] Fast-restoring from golden snapshot '$goldenPath' (use -Full for clean Ubuntu rebuild)..."
             Invoke-Restore -Config $cfg -SnapshotPath $goldenPath -Force:$Force
         } else {
-            Invoke-Destroy -Config $cfg -Force:$Force
+            if (Test-WslDistroExists -DistroName $cfg.distroName) {
+                Invoke-Destroy -Config $cfg -Force:$Force
+                if (Test-WslDistroExists -DistroName $cfg.distroName) {
+                    return
+                }
+            }
             Invoke-Init -Config $cfg -SaveGolden:($Full -or $SaveGolden)
         }
     }
