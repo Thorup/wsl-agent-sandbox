@@ -618,10 +618,36 @@ function Assert-BoxConfigValid {
     }
     $allowBindPrefixesVal = $null
     [void](Read-BoxObjectProperty -Object $dockerObj -Name 'allowBindPrefixes' -Value ([ref]$allowBindPrefixesVal))
-    foreach ($bp in @($allowBindPrefixesVal)) {
-        if (-not $bp) { continue }
-        if ($bp -isnot [string] -or -not $bp.StartsWith('/') -or $bp -eq '/' -or $bp -match '^/mnt(/|$)' -or $bp -match '^/run/desktop') {
-            throw "Unsafe docker.allowBindPrefixes entry '$bp'."
+    $disallowedBindPrefixes = @(
+        '/etc', '/root', '/proc', '/sys', '/dev', '/boot',
+        '/usr', '/bin', '/sbin', '/lib', '/lib32', '/lib64', '/libx32',
+        '/var/run', '/var/lib', '/var/spool', '/var/log', '/var/cache',
+        '/var/backups', '/var/mail', '/var/opt',
+        '/run', '/mnt', '/shared'
+    )
+    if ($null -ne $Config.docker.allowBindPrefixes) {
+        foreach ($bp in @($Config.docker.allowBindPrefixes)) {
+            if ($null -eq $bp -or $bp -isnot [string]) {
+                throw "Unsafe docker.allowBindPrefixes entry '$bp'."
+            }
+            $bpStr = $bp
+            if ([string]::IsNullOrWhiteSpace($bpStr) -or -not $bpStr.StartsWith('/') -or $bpStr.Contains('\')) {
+                throw "Unsafe docker.allowBindPrefixes entry '$bp'."
+            }
+            $rawSegments = $bpStr -split '/'
+            if ($rawSegments -contains '..') {
+                throw "Unsafe docker.allowBindPrefixes entry '$bp'."
+            }
+            $cleanSegments = @($rawSegments | Where-Object { $_ -ne '' -and $_ -ne '.' })
+            $normBp = '/' + ($cleanSegments -join '/')
+            if ($normBp -eq '/') {
+                throw "Unsafe docker.allowBindPrefixes entry '$bp'."
+            }
+            foreach ($disallowed in $disallowedBindPrefixes) {
+                if ($normBp -eq $disallowed -or $normBp.StartsWith("$disallowed/") -or $disallowed.StartsWith("$normBp/")) {
+                    throw "Unsafe docker.allowBindPrefixes entry '$bp'."
+                }
+            }
         }
     }
     $allowedPublishedPortsVal = $null
