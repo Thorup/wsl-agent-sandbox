@@ -4,6 +4,7 @@ set -euo pipefail
 POLICY_FILE="/etc/wsl-agent-sandbox/policy.json"
 PROXY_SRC_DIR="/usr/local/src/docker-policy-proxy"
 PROXY_BIN="/usr/local/libexec/docker-policy-proxy"
+PROXY_HASH_FILE="/usr/local/libexec/docker-policy-proxy.sha256"
 
 log() {
   echo "[provision] $*"
@@ -103,6 +104,19 @@ if [[ -d "${PROXY_SRC_DIR}" ]]; then
   (cd "${PROXY_SRC_DIR}" && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "${PROXY_BIN}" .)
   chown root:root "${PROXY_BIN}"
   chmod 0755 "${PROXY_BIN}"
+  python3 -c '
+import hashlib, pathlib, sys
+src = pathlib.Path(sys.argv[1])
+h = hashlib.sha256()
+for p in sorted((f for f in src.iterdir() if f.is_file() and (f.name in ("go.mod", "go.sum") or f.suffix == ".go")), key=lambda x: x.name):
+    data = p.read_text(encoding="utf-8-sig").replace("\r\n", "\n").replace("\r", "\n")
+    h.update(f"FILE:{p.name}\n".encode("utf-8"))
+    h.update(data.encode("utf-8"))
+    h.update(b"\n")
+pathlib.Path(sys.argv[2]).write_text(h.hexdigest() + "\n", encoding="utf-8")
+' "${PROXY_SRC_DIR}" "${PROXY_HASH_FILE}"
+  chown root:root "${PROXY_HASH_FILE}"
+  chmod 0644 "${PROXY_HASH_FILE}"
 fi
 
 # Pre-create user-space npm/pnpm directories so non-root global installs work without prompts

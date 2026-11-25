@@ -183,9 +183,17 @@ function Sync-AssetsToWsl {
     Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot 'systemd\ssh-agent-proxy.service') -RemotePath '/etc/systemd/system/ssh-agent-proxy.service' -Mode '0644' -NormalizeLF
 
     if ($IncludeProxySource) {
-        $proxyFiles = @('go.mod', 'main.go', 'policy.go', 'proxy.go', 'bind_pin.go', 'policy_test.go')
+        Invoke-WslRootBash -DistroName $distro -Script 'rm -rf /usr/local/src/docker-policy-proxy && mkdir -p /usr/local/src/docker-policy-proxy'
+        $proxyDir = Join-Path $AppRoot 'docker-policy-proxy'
+        $proxyFiles = [System.IO.FileInfo[]]@(Get-ChildItem -LiteralPath $proxyDir -File | Where-Object {
+            $_.Name -eq 'go.mod' -or $_.Name -eq 'go.sum' -or $_.Extension -eq '.go'
+        })
+        [System.Array]::Sort($proxyFiles, [System.Comparison[System.IO.FileInfo]]{
+            param($a, $b)
+            [string]::CompareOrdinal($a.Name, $b.Name)
+        })
         foreach ($pf in $proxyFiles) {
-            Copy-FileToWsl -DistroName $distro -LocalPath (Join-Path $AppRoot "docker-policy-proxy\$pf") -RemotePath "/usr/local/src/docker-policy-proxy/$pf" -Mode '0644' -NormalizeLF
+            Copy-FileToWsl -DistroName $distro -LocalPath $pf.FullName -RemotePath "/usr/local/src/docker-policy-proxy/$($pf.Name)" -Mode '0644' -NormalizeLF
         }
     }
 }
@@ -352,6 +360,44 @@ function Invoke-Init {
     }
 }
 
+function Build-WslDockerPolicyProxy {
+    param(
+        [Parameter(Mandatory)][string]$DistroName,
+        [Parameter(Mandatory)][string]$ExpectedHash
+    )
+    $safeHash = $ExpectedHash.Trim().ToLowerInvariant()
+    if ($safeHash -notmatch '^[0-9a-f]{64}$') {
+        throw "Invalid expected proxy source hash: '$ExpectedHash'"
+    }
+    Write-Host "[apply] Re-testing and rebuilding docker-policy-proxy..."
+    $buildScript = @"
+set -euo pipefail
+unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
+export GOPROXY=off GOFLAGS=-mod=readonly
+if ! command -v go >/dev/null 2>&1; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y
+  apt-get install -y --no-install-recommends golang-go gcc libc6-dev
+fi
+cd /usr/local/src/docker-policy-proxy
+if command -v gcc >/dev/null 2>&1; then
+  go test -v -race ./...
+else
+  CGO_ENABLED=0 go test -v ./...
+fi
+mkdir -p /usr/local/libexec
+CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /usr/local/libexec/docker-policy-proxy.new .
+chown root:root /usr/local/libexec/docker-policy-proxy.new
+chmod 0755 /usr/local/libexec/docker-policy-proxy.new
+mv -f /usr/local/libexec/docker-policy-proxy.new /usr/local/libexec/docker-policy-proxy
+printf '%s\n' '$safeHash' >/usr/local/libexec/docker-policy-proxy.sha256.new
+chown root:root /usr/local/libexec/docker-policy-proxy.sha256.new
+chmod 0644 /usr/local/libexec/docker-policy-proxy.sha256.new
+mv -f /usr/local/libexec/docker-policy-proxy.sha256.new /usr/local/libexec/docker-policy-proxy.sha256
+"@
+    Invoke-WslRootBash -DistroName $DistroName -Script $buildScript
+}
+
 function Invoke-Apply {
     param(
         $Config,
@@ -368,19 +414,18 @@ function Invoke-Apply {
     if ($Config.docker.enabled) {
         [void](Sync-DockerDesktopSocketBridge)
     }
-    Sync-AssetsToWsl -Config $Config -IncludeProxySource:$RebuildProxy
-    if ($RebuildProxy) {
-        Write-Host "[apply] Re-testing and rebuilding docker-policy-proxy..."
-        $buildScript = @'
-set -euo pipefail
-cd /usr/local/src/docker-policy-proxy
-go test -v -race ./...
-CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /usr/local/libexec/docker-policy-proxy.new .
-chown root:root /usr/local/libexec/docker-policy-proxy.new
-chmod 0755 /usr/local/libexec/docker-policy-proxy.new
-mv -f /usr/local/libexec/docker-policy-proxy.new /usr/local/libexec/docker-policy-proxy
-'@
-        Invoke-WslRootBash -DistroName $distro -Script $buildScript
+    $expectedProxyHash = Get-DockerPolicyProxySourceHash -AppRoot $AppRoot
+    $needsProxyRebuild = [bool]$RebuildProxy
+    if (-not $needsProxyRebuild) {
+        $probeOut = (& wsl.exe -d $distro -u root -- sh -c 'if [ -x /usr/local/libexec/docker-policy-proxy ] && [ -f /usr/local/libexec/docker-policy-proxy.sha256 ]; then tr -d " \t\r\n" </usr/local/libexec/docker-policy-proxy.sha256; else echo MISSING; fi' 2>$null | Out-String).Trim()
+        if ($LASTEXITCODE -ne 0 -or $probeOut -ne $expectedProxyHash) {
+            $needsProxyRebuild = $true
+            Write-Host "[apply] docker-policy-proxy is missing or outdated (installed='$probeOut', expected='$expectedProxyHash'); auto-rebuilding..."
+        }
+    }
+    Sync-AssetsToWsl -Config $Config -IncludeProxySource:$needsProxyRebuild
+    if ($needsProxyRebuild) {
+        Build-WslDockerPolicyProxy -DistroName $distro -ExpectedHash $expectedProxyHash
     }
     & wsl.exe -d $distro -u root -- /usr/local/sbin/box-apply-policy.sh
     if ($LASTEXITCODE -ne 0) {
@@ -1515,7 +1560,10 @@ switch ($Command) {
         Invoke-ClearSecrets -Config $cfg -Service $Service
     }
     'register-terminal' {
-        [void](Register-WindowsTerminalProfile -Config $cfg -Unregister:$Unregister)
+        $defaultAppCfg = Join-Path $AppRoot 'box.json'
+        $defaultUserCfg = Join-Path $env:USERPROFILE '.wsl-agent-sandbox\box.json'
+        $explicitCfg = if ($userSpecifiedConfigPath -or ($ConfigPath -ne $defaultAppCfg -and $ConfigPath -ne $defaultUserCfg)) { $ConfigPath } else { '' }
+        [void](Register-WindowsTerminalProfile -Config $cfg -Unregister:$Unregister -BoxScriptPath $PSCommandPath -ProfileName $ProfileName -ConfigPath $explicitCfg)
     }
     'shell' {
         if ($cfg.docker.enabled) {
