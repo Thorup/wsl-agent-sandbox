@@ -667,6 +667,7 @@ compiled_docker_policy = {
     "maxLimits": docker_cfg.get("maxLimits", {}),
     "allowedRegistries": docker_cfg.get("allowedRegistries", []),
     "bindMappings": bind_mappings,
+    "distroName": distro,
 }
 if is_mountpoint(private_wsl_mnt):
     eph_local = os.path.join(private_wsl_mnt, "box-binds", distro, "ephemeral")
