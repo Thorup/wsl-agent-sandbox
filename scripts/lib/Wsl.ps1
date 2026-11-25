@@ -49,6 +49,64 @@ function Invoke-WslRootBash {
     }
 }
 
+function ConvertTo-WindowsCliArg {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
+    if ($Value.Length -eq 0) {
+        return '""'
+    }
+    if ($Value -notmatch '[\s"]') {
+        return $Value
+    }
+    $escaped = [regex]::Replace($Value, '(\\*)"', '$1$1\"')
+    $escaped = [regex]::Replace($escaped, '(\\+)$', '$1$1')
+    return '"' + $escaped + '"'
+}
+
+function Copy-BytesToWsl {
+    param(
+        [Parameter(Mandatory)][string]$DistroName,
+        [Parameter(Mandatory)][byte[]]$Bytes,
+        [Parameter(Mandatory)][string]$RemotePath,
+        [string]$Mode = '0644'
+    )
+    $remoteDir = ($RemotePath -replace '/[^/]+$', '')
+    if ([string]::IsNullOrEmpty($remoteDir)) { $remoteDir = '/' }
+
+    $shCmd = 'set -e; mkdir -p "$1"; tmp="$2.tmp.$$"; trap ''rm -f "$tmp"'' EXIT; cat > "$tmp" && chown root:root "$tmp" && chmod "$3" "$tmp" && mv -f "$tmp" "$2"'
+    $argDistro = ConvertTo-WindowsCliArg -Value $DistroName
+    $argShCmd = ConvertTo-WindowsCliArg -Value $shCmd
+    $argDir = ConvertTo-WindowsCliArg -Value $remoteDir
+    $argRemote = ConvertTo-WindowsCliArg -Value $RemotePath
+    $argMode = ConvertTo-WindowsCliArg -Value $Mode
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'wsl.exe'
+    $psi.Arguments = "-d $argDistro -u root --exec sh -c $argShCmd _ $argDir $argRemote $argMode"
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardError = $true
+    $psi.RedirectStandardOutput = $true
+
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    try {
+        $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+        $stderrTask = $proc.StandardError.ReadToEndAsync()
+        if ($Bytes.Length -gt 0) {
+            $proc.StandardInput.BaseStream.Write($Bytes, 0, $Bytes.Length)
+            $proc.StandardInput.BaseStream.Flush()
+        }
+        $proc.StandardInput.Close()
+        $proc.WaitForExit()
+        [void]$stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        if ($proc.ExitCode -ne 0) {
+            throw "Failed writing -> '${DistroName}:${RemotePath}' (exit $($proc.ExitCode)): $stderr"
+        }
+    } finally {
+        $proc.Dispose()
+    }
+}
+
 function Copy-FileToWsl {
     param(
         [Parameter(Mandatory)][string]$DistroName,
@@ -63,30 +121,13 @@ function Copy-FileToWsl {
     if ($NormalizeLF) {
         $text = Get-Content -LiteralPath $LocalPath -Raw -Encoding UTF8
         $text = ($text -replace "`r`n", "`n") -replace "`r", "`n"
-        $bytes = [System.Text.Encoding]::UTF8.GetBytes($text)
+        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+        $bytes = $utf8NoBom.GetBytes($text)
     } else {
         $bytes = [System.IO.File]::ReadAllBytes($LocalPath)
     }
 
-    $b64 = [Convert]::ToBase64String($bytes)
-    $remoteDir = ($RemotePath -replace '/[^/]+$', '')
-    # Pipe via stdin to handle arbitrarily large files without Windows command-line length limits
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = 'wsl.exe'
-    $psi.Arguments = "-d $DistroName -u root -- sh -c ""mkdir -p '$remoteDir' && base64 -d > '$RemotePath' && chown root:root '$RemotePath' && chmod $Mode '$RemotePath'"""
-    $psi.UseShellExecute = $false
-    $psi.RedirectStandardInput = $true
-    $psi.RedirectStandardError = $true
-    $psi.RedirectStandardOutput = $true
-
-    $proc = [System.Diagnostics.Process]::Start($psi)
-    $proc.StandardInput.Write($b64)
-    $proc.StandardInput.Close()
-    $stderr = $proc.StandardError.ReadToEnd()
-    $proc.WaitForExit()
-    if ($proc.ExitCode -ne 0) {
-        throw "Failed copying '$LocalPath' -> '${DistroName}:${RemotePath}' (exit $($proc.ExitCode)): $stderr"
-    }
+    Copy-BytesToWsl -DistroName $DistroName -Bytes $bytes -RemotePath $RemotePath -Mode $Mode
 }
 
 function Copy-TextToWsl {
@@ -97,25 +138,10 @@ function Copy-TextToWsl {
         [string]$Mode = '0600'
     )
     $lf = ($Content -replace "`r`n", "`n") -replace "`r", "`n"
-    $b64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($lf))
-    $remoteDir = ($RemotePath -replace '/[^/]+$', '')
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    $bytes = $utf8NoBom.GetBytes($lf)
 
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = 'wsl.exe'
-    $psi.Arguments = "-d $DistroName -u root -- sh -c ""mkdir -p '$remoteDir' && base64 -d > '$RemotePath' && chown root:root '$RemotePath' && chmod $Mode '$RemotePath'"""
-    $psi.UseShellExecute = $false
-    $psi.RedirectStandardInput = $true
-    $psi.RedirectStandardError = $true
-    $psi.RedirectStandardOutput = $true
-
-    $proc = [System.Diagnostics.Process]::Start($psi)
-    $proc.StandardInput.Write($b64)
-    $proc.StandardInput.Close()
-    $stderr = $proc.StandardError.ReadToEnd()
-    $proc.WaitForExit()
-    if ($proc.ExitCode -ne 0) {
-        throw "Failed writing text -> '${DistroName}:${RemotePath}' (exit $($proc.ExitCode)): $stderr"
-    }
+    Copy-BytesToWsl -DistroName $DistroName -Bytes $bytes -RemotePath $RemotePath -Mode $Mode
 }
 
 function Wait-WslSystemdReady {

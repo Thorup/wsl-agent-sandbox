@@ -27,9 +27,9 @@ All commands accept:
 
 | Command | Description |
 | :--- | :--- |
-| `.\box.ps1 push-repo <path> [-Dest <relpath>] [-Branch <ref>] [-Force]` | Bundle a Windows git repository and import it onto native Linux `ext4` (`~/work/<name>`) without mounting `/mnt/c` or `rw` `/shared`. |
-| `.\box.ps1 pull-diff <name>` | Display a clean diff summary of agent commits made inside `~/work/<name>`. |
-| `.\box.ps1 pull-branch <name> [-RepoPath <winPath>] [-Branch <ref>]` | Pull agent commits back into a reviewable local `sandbox/<name>` branch on Windows without touching your active working tree or `.git/hooks`. |
+| `.\box.ps1 push-repo <path> [-Dest <relpath>] [-Branch <ref>] [-Force]` | Bundle a Windows git repository (and `main`/`master` if present to seed `origin/main` and `refs/sandbox/base`) and stream it onto native Linux `ext4` (`~/work/<name>`) without mounting `/mnt/c` or `rw` `/shared`. |
+| `.\box.ps1 pull-diff <name>` | Display a clean diff summary of committed agent changes (`refs/sandbox/base..HEAD`), uncommitted working-tree edits, and active git worktrees inside `~/work/<name>`. |
+| `.\box.ps1 pull-branch <name> [-RepoPath <winPath>] [-Branch <ref>]` | Pull agent commits back into a reviewable local `sandbox/<name>` (or `sandbox/<name>-<branch>` when `-Branch` is specified) branch on Windows without touching your active working tree or `.git/hooks`. |
 
 ---
 

@@ -1028,6 +1028,48 @@ function Resolve-WslWorkRelPath {
     return $norm.TrimEnd('/')
 }
 
+function Resolve-SandboxCheckoutBranch {
+    param(
+        [Parameter(Mandatory)][string]$SafeBranch,
+        [string]$SymbolicHead = ''
+    )
+    $candidate = ''
+    if ($SafeBranch -eq 'HEAD') {
+        $candidate = $SymbolicHead.Trim()
+    } elseif ($SafeBranch -notmatch '^[0-9a-fA-F]{7,40}$') {
+        $candidate = $SafeBranch -replace '^refs/heads/', ''
+    }
+
+    if ([string]::IsNullOrWhiteSpace($candidate) -or
+        $candidate -eq 'HEAD' -or
+        $candidate -match '[\^~:@]' -or
+        $candidate -match '^[0-9a-fA-F]{7,40}$') {
+        return 'sandbox-base'
+    }
+
+    & git check-ref-format --branch $candidate 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        return 'sandbox-base'
+    }
+    return $candidate
+}
+
+function Resolve-PullTargetBranchName {
+    param(
+        [Parameter(Mandatory)][string]$RepoLeafName,
+        [string]$SafeBranch = 'HEAD'
+    )
+    $safeName = $RepoLeafName -replace '[^A-Za-z0-9._-]', '-'
+    if ([string]::IsNullOrWhiteSpace($SafeBranch) -or $SafeBranch -eq 'HEAD') {
+        return "sandbox/$safeName"
+    }
+    $sanitizedBranch = ($SafeBranch -replace '^refs/heads/', '').Trim('/') -replace '[^A-Za-z0-9._-]', '-'
+    if ([string]::IsNullOrWhiteSpace($sanitizedBranch)) {
+        return "sandbox/$safeName"
+    }
+    return "sandbox/$safeName-$sanitizedBranch"
+}
+
 function Invoke-PushRepo {
     param(
         $Config,
@@ -1048,8 +1090,8 @@ function Invoke-PushRepo {
         throw "'$resolved' is not a git repository."
     }
     $safeBranch = Assert-SafeBoxBranchName -Name $Branch
-    & git -C $resolved rev-parse --verify --quiet $safeBranch | Out-Null
-    if ($LASTEXITCODE -ne 0) {
+    $targetOid = (& git -C $resolved rev-parse --verify --quiet "$safeBranch^{commit}" 2>$null | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($targetOid)) {
         throw "Git ref '$safeBranch' not found in '$resolved'."
     }
 
@@ -1057,39 +1099,49 @@ function Invoke-PushRepo {
     $rawDest = if ([string]::IsNullOrWhiteSpace($Dest)) { "work/$repoName" } else { $Dest }
     $targetRel = Resolve-WslWorkRelPath -RawPath $rawDest
 
-    $checkoutBranch = 'sandbox-base'
+    $headSym = ''
     if ($safeBranch -eq 'HEAD') {
         $headSym = (& git -C $resolved symbolic-ref --short -q HEAD 2>$null | Out-String).Trim()
-        if ($headSym -and $headSym -match '^[A-Za-z0-9._/-]+$') {
-            $checkoutBranch = $headSym
+    }
+    $checkoutBranch = Resolve-SandboxCheckoutBranch -SafeBranch $safeBranch -SymbolicHead $headSym
+
+    $bundleRefs = New-Object System.Collections.Generic.List[string]
+    $bundleRefs.Add($safeBranch)
+    $mainRef = ''
+    foreach ($candidateMain in @('refs/heads/main', 'refs/remotes/origin/main', 'refs/heads/master')) {
+        & git -C $resolved rev-parse --verify --quiet $candidateMain 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            $mainRef = $candidateMain
+            break
         }
-    } elseif ($safeBranch -notmatch '^[0-9a-f]{7,40}$') {
-        $checkoutBranch = $safeBranch -replace '^refs/heads/', ''
+    }
+    $mainOid = ''
+    if ($mainRef) {
+        $mainOid = (& git -C $resolved rev-parse --verify --quiet "$mainRef^{commit}" 2>$null | Out-String).Trim()
+        if ($mainRef -ne $safeBranch) {
+            $bundleRefs.Add($mainRef)
+        }
     }
 
     $tmpBundle = Join-Path ([System.IO.Path]::GetTempPath()) ("wsl-push-" + [Guid]::NewGuid().ToString('N').Substring(0, 8) + ".bundle")
     try {
-        Write-Host "[push-repo] Creating git bundle from '$resolved' ($safeBranch)..."
-        & git -C $resolved bundle create $tmpBundle $safeBranch
+        Write-Host "[push-repo] Creating git bundle from '$resolved' ($($bundleRefs -join ', '))..."
+        & git -C $resolved bundle create $tmpBundle @bundleRefs
         if ($LASTEXITCODE -ne 0) { throw "git bundle create failed." }
-        $bytes = [System.IO.File]::ReadAllBytes($tmpBundle)
-        $b64 = [Convert]::ToBase64String($bytes)
 
-        $scriptHead = @'
+        $remoteScript = @'
 set -euo pipefail
 target_rel="$1"
 checkout_branch="$2"
 force_flag="$3"
+target_oid="$4"
+main_oid="${5:-}"
 tmp="$(mktemp /tmp/box-push-XXXXXX.bundle)"
 trap 'rm -f "$tmp"' EXIT
-base64 -d > "$tmp" <<'__WSL_BUNDLE__'
-'@
-        $scriptTail = @'
-__WSL_BUNDLE__
+cat > "$tmp"
 target="$HOME/$target_rel"
-bundle_ref="$(git bundle list-heads "$tmp" | awk 'NR==1 { print $2 }')"
-if [ -z "$bundle_ref" ]; then
-  echo "[push-repo] ERROR: bundle contains no refs." >&2
+if [ ! -s "$tmp" ]; then
+  echo "[push-repo] ERROR: received empty bundle." >&2
   exit 1
 fi
 if [ -d "$target/.git" ]; then
@@ -1102,35 +1154,64 @@ if [ -d "$target/.git" ]; then
       /tmp/box-push-*.bundle) git -C "$target" remote remove origin 2>/dev/null || true ;;
     esac
   fi
-  git -C "$target" fetch "$tmp" "$bundle_ref"
-  git -C "$target" checkout -B "$checkout_branch" FETCH_HEAD
 else
   mkdir -p "$target"
   git -C "$target" init -q
-  git -C "$target" fetch "$tmp" "$bundle_ref"
-  git -C "$target" checkout -B "$checkout_branch" FETCH_HEAD
+fi
+while read -r _oid bref; do
+  [ -n "$bref" ] && git -C "$target" fetch -q "$tmp" "$bref"
+done < <(git bundle list-heads "$tmp")
+git -C "$target" checkout -B "$checkout_branch" "$target_oid"
+git -C "$target" update-ref refs/sandbox/base "$target_oid"
+if [ -n "$main_oid" ]; then
+  git -C "$target" update-ref refs/remotes/origin/main "$main_oid"
 fi
 echo "[push-repo] Synced branch $checkout_branch to $target"
 '@
-        $fullScript = ($scriptHead + "`n" + $b64 + "`n" + $scriptTail + "`n").Replace("`r`n", "`n")
+        $lfScript = ($remoteScript -replace "`r`n", "`n").TrimEnd("`n") + "`n"
         $forceArg = if ($Force) { '1' } else { '0' }
+        $cliArgs = @(
+            '-d', (ConvertTo-WindowsCliArg -Value $distro),
+            '-u', (ConvertTo-WindowsCliArg -Value $agent),
+            '--exec', 'bash', '-c',
+            (ConvertTo-WindowsCliArg -Value $lfScript),
+            '_',
+            (ConvertTo-WindowsCliArg -Value $targetRel),
+            (ConvertTo-WindowsCliArg -Value $checkoutBranch),
+            (ConvertTo-WindowsCliArg -Value $forceArg),
+            (ConvertTo-WindowsCliArg -Value $targetOid),
+            (ConvertTo-WindowsCliArg -Value $mainOid)
+        ) -join ' '
 
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = 'wsl.exe'
-        $psi.Arguments = "-d $distro -u $agent -- bash -s -- $targetRel $checkoutBranch $forceArg"
+        $psi.Arguments = $cliArgs
         $psi.UseShellExecute = $false
         $psi.RedirectStandardInput = $true
         $psi.RedirectStandardOutput = $true
         $psi.RedirectStandardError = $true
+
         $proc = [System.Diagnostics.Process]::Start($psi)
-        $proc.StandardInput.Write($fullScript)
-        $proc.StandardInput.Close()
-        $stdout = $proc.StandardOutput.ReadToEnd()
-        $stderr = $proc.StandardError.ReadToEnd()
-        $proc.WaitForExit()
-        if ($stdout) { Write-Host $stdout.TrimEnd() }
-        if ($proc.ExitCode -ne 0) {
-            throw "Failed pushing bundle into WSL: $stderr"
+        try {
+            $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+            $stderrTask = $proc.StandardError.ReadToEndAsync()
+            $fs = [System.IO.File]::OpenRead($tmpBundle)
+            try {
+                $fs.CopyTo($proc.StandardInput.BaseStream)
+                $proc.StandardInput.BaseStream.Flush()
+            } finally {
+                $fs.Dispose()
+            }
+            $proc.StandardInput.Close()
+            $proc.WaitForExit()
+            $stdout = $stdoutTask.GetAwaiter().GetResult()
+            $stderr = $stderrTask.GetAwaiter().GetResult()
+            if ($stdout) { Write-Host $stdout.TrimEnd() }
+            if ($proc.ExitCode -ne 0) {
+                throw "Failed pushing bundle into WSL: $stderr"
+            }
+        } finally {
+            $proc.Dispose()
         }
     } finally {
         Remove-Item -LiteralPath $tmpBundle -Force -ErrorAction SilentlyContinue
@@ -1147,24 +1228,31 @@ function Invoke-WslAgentBashStdin {
     $lfScript = ($ScriptText -replace "`r`n", "`n").TrimEnd("`n") + "`n"
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = 'wsl.exe'
-    $escapedArgs = ($BashArgs | ForEach-Object {
-        if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
-    }) -join ' '
-    $psi.Arguments = "-d $DistroName -u $AgentName -- bash -s -- $escapedArgs"
+    $escapedArgs = ($BashArgs | ForEach-Object { ConvertTo-WindowsCliArg -Value $_ }) -join ' '
+    $psi.Arguments = "-d $(ConvertTo-WindowsCliArg -Value $DistroName) -u $(ConvertTo-WindowsCliArg -Value $AgentName) --exec bash -s -- $escapedArgs"
     $psi.UseShellExecute = $false
     $psi.RedirectStandardInput = $true
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $proc = [System.Diagnostics.Process]::Start($psi)
-    $proc.StandardInput.Write($lfScript)
-    $proc.StandardInput.Close()
-    $stdout = $proc.StandardOutput.ReadToEnd()
-    $stderr = $proc.StandardError.ReadToEnd()
-    $proc.WaitForExit()
-    return [pscustomobject]@{
-        ExitCode = $proc.ExitCode
-        Stdout   = $stdout
-        Stderr   = $stderr
+    try {
+        $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+        $stderrTask = $proc.StandardError.ReadToEndAsync()
+        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+        $bytes = $utf8NoBom.GetBytes($lfScript)
+        $proc.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)
+        $proc.StandardInput.BaseStream.Flush()
+        $proc.StandardInput.Close()
+        $proc.WaitForExit()
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        return [pscustomobject]@{
+            ExitCode = $proc.ExitCode
+            Stdout   = $stdout
+            Stderr   = $stderr
+        }
+    } finally {
+        $proc.Dispose()
     }
 }
 
@@ -1188,10 +1276,26 @@ if ! git -C "$target" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
 fi
 echo "=== Status ==="
 git -C "$target" status --short
-echo "=== Recent Commits ==="
-git -C "$target" log --oneline -n 15
-echo "=== Diff Stat ==="
-git -C "$target" diff --stat
+if git -C "$target" rev-parse --verify --quiet refs/sandbox/base >/dev/null; then
+  echo "=== Commits Since Push (refs/sandbox/base..HEAD) ==="
+  git -C "$target" log --oneline refs/sandbox/base..HEAD
+  echo "=== Committed Diff Stat (refs/sandbox/base..HEAD) ==="
+  git -C "$target" diff --stat refs/sandbox/base..HEAD
+  if [ -n "$(git -C "$target" status --porcelain)" ]; then
+    echo "=== Uncommitted Working Tree Diff Stat ==="
+    git -C "$target" diff HEAD --stat
+  fi
+else
+  echo "=== Recent Commits ==="
+  git -C "$target" log --oneline -n 15
+  echo "=== Diff Stat ==="
+  git -C "$target" diff HEAD --stat 2>/dev/null || git -C "$target" diff --stat
+fi
+wt_count="$(git -C "$target" worktree list --porcelain | grep -c '^worktree ' || true)"
+if [ "$wt_count" -gt 1 ]; then
+  echo "=== Active Git Worktrees ==="
+  git -C "$target" worktree list
+fi
 '@
     $res = Invoke-WslAgentBashStdin -DistroName $distro -AgentName $agent -BashArgs @($rel) -ScriptText $remoteScript
     if ($res.Stdout) { Write-Host $res.Stdout.TrimEnd() }
@@ -1225,8 +1329,7 @@ function Invoke-PullBranch {
         throw "Windows target '$winRepo' is not a git repository."
     }
 
-    $safeName = (Split-Path -Leaf $rel) -replace '[^A-Za-z0-9._-]', '-'
-    $targetBranch = "sandbox/$safeName"
+    $targetBranch = Resolve-PullTargetBranchName -RepoLeafName (Split-Path -Leaf $rel) -SafeBranch $safeBranch
     $tmpBundle = Join-Path ([System.IO.Path]::GetTempPath()) ("wsl-pull-" + [Guid]::NewGuid().ToString('N').Substring(0, 8) + ".bundle")
     try {
         $remoteScript = @'
@@ -1240,14 +1343,44 @@ fi
 tmp="$(mktemp /tmp/box-pull-XXXXXX.bundle)"
 trap 'rm -f "$tmp"' EXIT
 git -C "$target" bundle create "$tmp" "$ref" >/dev/null
-base64 -w0 "$tmp"
+cat "$tmp"
 '@
-        $res = Invoke-WslAgentBashStdin -DistroName $distro -AgentName $agent -BashArgs @($rel, $safeBranch) -ScriptText $remoteScript
-        $b64 = ($res.Stdout | Out-String).Trim()
-        if ($res.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($b64)) {
-            throw "Failed creating bundle from ~/$rel in '$distro': $($res.Stderr)"
+        $lfScript = ($remoteScript -replace "`r`n", "`n").TrimEnd("`n") + "`n"
+        $cliArgs = @(
+            '-d', (ConvertTo-WindowsCliArg -Value $distro),
+            '-u', (ConvertTo-WindowsCliArg -Value $agent),
+            '--exec', 'bash', '-c',
+            (ConvertTo-WindowsCliArg -Value $lfScript),
+            '_',
+            (ConvertTo-WindowsCliArg -Value $rel),
+            (ConvertTo-WindowsCliArg -Value $safeBranch)
+        ) -join ' '
+
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = 'wsl.exe'
+        $psi.Arguments = $cliArgs
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        try {
+            $stderrTask = $proc.StandardError.ReadToEndAsync()
+            $outFs = [System.IO.File]::Create($tmpBundle)
+            try {
+                $proc.StandardOutput.BaseStream.CopyTo($outFs)
+            } finally {
+                $outFs.Dispose()
+            }
+            $proc.WaitForExit()
+            $stderr = $stderrTask.GetAwaiter().GetResult()
+            if ($proc.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $tmpBundle) -or (Get-Item -LiteralPath $tmpBundle).Length -eq 0) {
+                throw "Failed creating bundle from ~/$rel in '$distro': $stderr"
+            }
+        } finally {
+            $proc.Dispose()
         }
-        [System.IO.File]::WriteAllBytes($tmpBundle, [Convert]::FromBase64String($b64))
+
         $bundleRef = ((& git bundle list-heads $tmpBundle 2>$null | Out-String).Trim() -split '\s+' | Select-Object -Skip 1 -First 1)
         if ([string]::IsNullOrWhiteSpace($bundleRef)) {
             $bundleRef = $safeBranch
