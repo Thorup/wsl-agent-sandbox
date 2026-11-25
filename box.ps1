@@ -48,7 +48,7 @@ param(
 
     [string[]]$Scope = @('all'),
 
-    [ValidateSet('all', 'docker', 'network', 'hardening')]
+    [ValidateSet('all', 'docker', 'network', 'egress', 'credentials', 'ssh-agent', 'hardening')]
     [string]$Source = 'all',
 
     [string]$Since = '1 hour ago',
@@ -500,11 +500,21 @@ function Invoke-Status {
         Write-Host "Profile override ($ProfileName): $profileOverride (active)"
     }
     $agentUid = [int]$Config.agentUser.uid
-    $statusScript = "AGENT_UID=$agentUid`n" + @'
+    $egressMode = if ($Config.PSObject.Properties['network'] -and $Config.network.PSObject.Properties['egressMode']) { "$($Config.network.egressMode)" } else { 'open' }
+    $statusScript = "AGENT_UID=$agentUid`nEGRESS_MODE='$egressMode'`n" + @'
 echo "OS:          $(. /etc/os-release && echo "$PRETTY_NAME")"
 echo "Systemd:     $(systemctl is-system-running 2>/dev/null || echo inactive)"
 echo "Hardening:   $(systemctl is-active box-hardening.service 2>/dev/null || echo inactive)"
 echo "DockerProxy: $(systemctl is-active docker-policy-proxy.service 2>/dev/null || echo inactive)"
+if [ "$EGRESS_MODE" = "allowlist" ]; then
+  echo "EgressProxy: $(systemctl is-active egress-proxy.service 2>/dev/null || echo inactive)"
+fi
+if [ -f /etc/wsl-agent-sandbox/credential-proxy.json ]; then
+  echo "CredProxy:   $(systemctl is-active credential-proxy.service 2>/dev/null || echo inactive)"
+fi
+if [ -f /etc/wsl-agent-sandbox/ssh-agent-allowlist.json ]; then
+  echo "SshProxy:    $(systemctl is-active ssh-agent-proxy.service 2>/dev/null || echo inactive)"
+fi
 echo ""
 echo "Active /shared mounts:"
 SHARES="$(findmnt -rn -o TARGET,SOURCE,OPTIONS -R /shared 2>/dev/null || true)"
@@ -803,6 +813,30 @@ function Invoke-Doctor {
             Write-Host "  [FAIL] box-hardening.service is $hardenState (run '.\box.ps1 apply')"
             $hasFail = $true
         }
+        $egressMode = if ($Config.PSObject.Properties['network'] -and $Config.network.PSObject.Properties['egressMode']) { "$($Config.network.egressMode)" } else { 'open' }
+        if ($egressMode -eq 'allowlist') {
+            $egressState = (& $wslCmd.Source -d $distro -u root -- sh -c "systemctl is-active egress-proxy.service 2>/dev/null || echo inactive" | Out-String).Trim()
+            if ($egressState -eq 'active') {
+                Write-Host "  [PASS] egress-proxy.service is active"
+            } else {
+                Write-Host "  [FAIL] egress-proxy.service is $egressState (run '.\box.ps1 apply')"
+                $hasFail = $true
+            }
+        }
+        $credState = (& $wslCmd.Source -d $distro -u root -- sh -c 'if [ -f /etc/wsl-agent-sandbox/credential-proxy.json ]; then systemctl is-active credential-proxy.service 2>/dev/null || echo inactive; else echo NOT_CONFIGURED; fi' | Out-String).Trim()
+        if ($credState -eq 'active') {
+            Write-Host "  [PASS] credential-proxy.service is active"
+        } elseif ($credState -ne 'NOT_CONFIGURED') {
+            Write-Host "  [FAIL] credential-proxy.service is $credState (run '.\box.ps1 seed-secrets')"
+            $hasFail = $true
+        }
+        $sshState = (& $wslCmd.Source -d $distro -u root -- sh -c 'if [ -f /etc/wsl-agent-sandbox/ssh-agent-allowlist.json ]; then systemctl is-active ssh-agent-proxy.service 2>/dev/null || echo inactive; else echo NOT_CONFIGURED; fi' | Out-String).Trim()
+        if ($sshState -eq 'active') {
+            Write-Host "  [PASS] ssh-agent-proxy.service is active"
+        } elseif ($sshState -ne 'NOT_CONFIGURED') {
+            Write-Host "  [FAIL] ssh-agent-proxy.service is $sshState (run '.\box.ps1 apply')"
+            $hasFail = $true
+        }
     } else {
         Write-Host "  [WARN] Distro '$distro' is not installed yet (run '.\box.ps1 init')"
     }
@@ -945,10 +979,13 @@ function Invoke-AuditLogs {
     # Validate --since timestamp up front so invalid expressions fail loudly instead of being masked.
     $sinceCheck = "journalctl --since '$safeSince' -n 0 >/dev/null"
     $cmd = switch ($Source) {
-        'docker'    { "$sinceCheck && journalctl -u docker-policy-proxy.service --since '$safeSince' -n $Lines --no-pager" }
-        'hardening' { "$sinceCheck && journalctl -u box-hardening.service --since '$safeSince' -n $Lines --no-pager" }
-        'network'   { "$sinceCheck && (journalctl -k --grep='wsl-agent-sandbox-drop' --since '$safeSince' -n $Lines --no-pager || true)" }
-        default     { "$sinceCheck && (journalctl -u docker-policy-proxy.service -u box-hardening.service --since '$safeSince' -n $Lines --no-pager || true) && echo '--- Kernel nftables drops ---' && (journalctl -k --grep='wsl-agent-sandbox-drop' --since '$safeSince' -n $Lines --no-pager || true)" }
+        'docker'      { "$sinceCheck && journalctl -u docker-policy-proxy.service --since '$safeSince' -n $Lines --no-pager" }
+        'hardening'   { "$sinceCheck && journalctl -u box-hardening.service --since '$safeSince' -n $Lines --no-pager" }
+        'egress'      { "$sinceCheck && journalctl -u egress-proxy.service --since '$safeSince' -n $Lines --no-pager" }
+        'credentials' { "$sinceCheck && journalctl -u credential-proxy.service --since '$safeSince' -n $Lines --no-pager" }
+        'ssh-agent'   { "$sinceCheck && journalctl -u ssh-agent-proxy.service --since '$safeSince' -n $Lines --no-pager" }
+        'network'     { "$sinceCheck && (journalctl -u egress-proxy.service --since '$safeSince' -n $Lines --no-pager || true) && echo '--- Kernel nftables drops ---' && (journalctl -k --grep='wsl-agent-sandbox-drop' --since '$safeSince' -n $Lines --no-pager || true)" }
+        default       { "$sinceCheck && (journalctl -u docker-policy-proxy.service -u box-hardening.service -u egress-proxy.service -u credential-proxy.service -u ssh-agent-proxy.service -u 'wsl-box-ttl-*.service' --since '$safeSince' -n $Lines --no-pager || true) && echo '--- Kernel nftables drops ---' && (journalctl -k --grep='wsl-agent-sandbox-drop' --since '$safeSince' -n $Lines --no-pager || true)" }
     }
     Write-Host "=== Security Audit Logs: $distro (source=$Source, since='$safeSince') ==="
     Invoke-WslRootBash -DistroName $distro -Script $cmd
@@ -1239,6 +1276,28 @@ function Invoke-Destroy {
         }
     }
     if (Test-WslDistroExists -DistroName $distro) {
+        $agentUid = [int]$Config.agentUser.uid
+        $cleanupScript = @"
+nft delete table inet "wsl_agent_sandbox_${agentUid}" 2>/dev/null || true
+for _ in 1 2 3 4; do
+  ip -4 rule del pref 0 to 127.0.0.0/8 uidrange "${agentUid}-${agentUid}" lookup local 2>/dev/null || break
+done
+for _ in 1 2 3 4; do
+  ip -6 rule del pref 0 to ::1/128 uidrange "${agentUid}-${agentUid}" lookup local 2>/dev/null || break
+done
+BIND_DIR="/run/box-root/mnt-wsl/box-binds/${distro}"
+if [ -d "`$BIND_DIR" ]; then
+  findmnt -rn -o TARGET -R "`$BIND_DIR" 2>/dev/null | sort -r | while IFS= read -r mp; do
+    umount -l "`$mp" 2>/dev/null || true
+  done
+  rm -rf "`$BIND_DIR" 2>/dev/null || true
+fi
+"@
+        try {
+            Invoke-WslRootBash -DistroName $distro -Script $cleanupScript
+        } catch {
+            Write-Verbose "Best-effort shared kernel cleanup for '$distro' skipped: $($_.Exception.Message)"
+        }
         Write-Host "[destroy] Unregistering '$distro'..."
         & wsl.exe --unregister $distro
     }
@@ -1284,6 +1343,7 @@ switch ($Command) {
             if (-not (Wait-WslSystemdReady -DistroName $cfg.distroName -TimeoutSeconds 45)) {
                 throw "Distro '$($cfg.distroName)' failed to start systemd hardening."
             }
+            Sync-HostIpsIfChanged -Config $cfg
             Write-Host "[up] '$($cfg.distroName)' is running and hardened."
         }
     }
@@ -1327,6 +1387,7 @@ switch ($Command) {
         if ($cfg.docker.enabled) {
             [void](Sync-DockerDesktopSocketBridge)
         }
+        Sync-HostIpsIfChanged -Config $cfg
         & wsl.exe -d $cfg.distroName -u $cfg.agentUser.name --cd ~
     }
     'root-shell' {
