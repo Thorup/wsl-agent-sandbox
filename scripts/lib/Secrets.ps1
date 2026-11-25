@@ -37,8 +37,217 @@ $script:ForbiddenEnvVars = @(
     'PULSE_SERVER'
 )
 
+$script:SecretsSchemaCache = $null
+
 function Get-SupportedSecretServices {
     return @($script:SupportedSecretServices)
+}
+
+function Test-IsSecretsJsonObject {
+    param($Value)
+    if ($null -eq $Value) { return $false }
+    if ($Value -is [System.Collections.IDictionary]) { return $true }
+    if ($Value -is [psobject] -and $Value -isnot [string] -and $Value -isnot [System.Collections.IEnumerable] -and $Value.GetType().IsClass) {
+        return $true
+    }
+    return $false
+}
+
+function Get-SecretsSchema {
+    if ($null -ne $script:SecretsSchemaCache) {
+        return $script:SecretsSchemaCache
+    }
+    $schemaPath = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\secrets.schema.json'))
+    if (-not (Test-Path -LiteralPath $schemaPath -PathType Leaf)) {
+        throw "Secrets schema not found at '$schemaPath'."
+    }
+    $rawSchema = Get-Content -LiteralPath $schemaPath -Raw -Encoding UTF8
+    $script:SecretsSchemaCache = $rawSchema | ConvertFrom-Json
+    return $script:SecretsSchemaCache
+}
+
+function Resolve-SecretsSchemaNode {
+    param(
+        $Schema,
+        $RootSchema
+    )
+    $current = $Schema
+    $depth = 0
+    while ((Test-IsSecretsJsonObject $current) -and (Test-ObjectHasProperty -Object $current -Name '$ref') -and $depth -lt 16) {
+        $refStr = [string](Get-ObjectProperty -Object $current -Name '$ref' -Default '')
+        if (-not $refStr.StartsWith('#/') -or $null -eq $RootSchema) {
+            break
+        }
+        $target = $RootSchema
+        foreach ($seg in ($refStr.Substring(2) -split '/')) {
+            $unescaped = $seg -replace '~1', '/' -replace '~0', '~'
+            if ((Test-IsSecretsJsonObject $target) -and (Test-ObjectHasProperty -Object $target -Name $unescaped)) {
+                $target = Get-ObjectProperty -Object $target -Name $unescaped
+            } else {
+                $target = $null
+                break
+            }
+        }
+        if ($null -eq $target) { break }
+        $current = $target
+        $depth++
+    }
+    return $current
+}
+
+function Get-SecretsValueJsonKind {
+    param($Value)
+    if ($null -eq $Value) { return 'null' }
+    if (Test-IsSecretsJsonObject $Value) { return 'object' }
+    if ($Value -is [string]) { return 'string' }
+    if ($Value -is [bool]) { return 'boolean' }
+    if ($Value -is [System.Collections.IEnumerable]) { return 'array' }
+    if ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal] -or $Value -is [float]) { return 'number' }
+    return 'unknown'
+}
+
+function Test-SecretsSchemaBranchCompatible {
+    param(
+        $Schema,
+        [Parameter(Mandatory)][string]$Kind,
+        $RootSchema
+    )
+    $resolved = Resolve-SecretsSchemaNode -Schema $Schema -RootSchema $RootSchema
+    if (-not (Test-IsSecretsJsonObject $resolved)) { return $false }
+    if (-not (Test-ObjectHasProperty -Object $resolved -Name 'type')) { return $true }
+    $typeVal = Get-ObjectProperty -Object $resolved -Name 'type'
+    $types = @($typeVal | ForEach-Object { [string]$_ })
+    if ($Kind -eq 'number') {
+        return ($types -contains 'number') -or ($types -contains 'integer')
+    }
+    return ($types -contains $Kind)
+}
+
+function Assert-SecretsSchemaProperties {
+    param(
+        $Value,
+        [Parameter(Mandatory)]$Schema,
+        [Parameter(Mandatory)][string]$Context,
+        $RootSchema = $null
+    )
+    if ($null -eq $Value) { return }
+    if ($null -eq $RootSchema) { $RootSchema = $Schema }
+    $Schema = Resolve-SecretsSchemaNode -Schema $Schema -RootSchema $RootSchema
+    if (-not (Test-IsSecretsJsonObject $Schema)) { return }
+
+    if (Test-ObjectHasProperty -Object $Schema -Name 'allOf') {
+        $allBranches = Get-ObjectProperty -Object $Schema -Name 'allOf'
+        foreach ($sub in @($allBranches)) {
+            Assert-SecretsSchemaProperties -Value $Value -Schema $sub -Context $Context -RootSchema $RootSchema
+        }
+    }
+
+    foreach ($combKey in @('oneOf', 'anyOf')) {
+        if (Test-ObjectHasProperty -Object $Schema -Name $combKey) {
+            $branches = @(Get-ObjectProperty -Object $Schema -Name $combKey)
+            $kind = Get-SecretsValueJsonKind -Value $Value
+            $compatible = @($branches | Where-Object { Test-SecretsSchemaBranchCompatible -Schema $_ -Kind $kind -RootSchema $RootSchema })
+            if ($compatible.Count -eq 0) {
+                $compatible = $branches
+            }
+            $firstErr = $null
+            $matched = $false
+            foreach ($branch in $compatible) {
+                try {
+                    Assert-SecretsSchemaProperties -Value $Value -Schema $branch -Context $Context -RootSchema $RootSchema
+                    $matched = $true
+                    break
+                } catch {
+                    if ($null -eq $firstErr) {
+                        $firstErr = $_
+                    }
+                }
+            }
+            if (-not $matched -and $null -ne $firstErr) {
+                throw $firstErr.Exception
+            }
+            return
+        }
+    }
+
+    if (Test-IsSecretsJsonObject $Value) {
+        $propsSchema = if (Test-ObjectHasProperty -Object $Schema -Name 'properties') {
+            Get-ObjectProperty -Object $Schema -Name 'properties'
+        } else { $null }
+        $patternPropsSchema = if (Test-ObjectHasProperty -Object $Schema -Name 'patternProperties') {
+            Get-ObjectProperty -Object $Schema -Name 'patternProperties'
+        } else { $null }
+
+        $ap = $null
+        if (Test-ObjectHasProperty -Object $Schema -Name 'additionalProperties') {
+            $ap = Get-ObjectProperty -Object $Schema -Name 'additionalProperties'
+        }
+        $rejectAdditional = ($ap -is [bool]) -and (-not $ap)
+
+        $propsSchemaNames = if ($null -ne $propsSchema) { @(Get-ObjectPropertyNames -Object $propsSchema) } else { @() }
+        $propNames = Get-ObjectPropertyNames -Object $Value
+        foreach ($propName in $propNames) {
+            if ($Value -is [System.Collections.IDictionary]) {
+                $childVal = $Value[$propName]
+            } else {
+                $childVal = ($Value.PSObject.Properties | Where-Object { $_.Name -ceq $propName } | Select-Object -First 1).Value
+            }
+            $childCtx = if ($Context -eq '$') { $propName } else { "$Context.$propName" }
+
+            if ($null -ne $propsSchema -and ($propsSchemaNames -ccontains $propName)) {
+                if ($propsSchema -is [System.Collections.IDictionary]) {
+                    $subSchema = $propsSchema[$propName]
+                } else {
+                    $subSchema = ($propsSchema.PSObject.Properties | Where-Object { $_.Name -ceq $propName } | Select-Object -First 1).Value
+                }
+                Assert-SecretsSchemaProperties -Value $childVal -Schema $subSchema -Context $childCtx -RootSchema $RootSchema
+                continue
+            }
+
+            $matchedPattern = $false
+            if ($null -ne $patternPropsSchema) {
+                foreach ($pat in (Get-ObjectPropertyNames -Object $patternPropsSchema)) {
+                    if ($propName -cmatch $pat) {
+                        $matchedPattern = $true
+                        $patSub = Get-ObjectProperty -Object $patternPropsSchema -Name $pat
+                        Assert-SecretsSchemaProperties -Value $childVal -Schema $patSub -Context $childCtx -RootSchema $RootSchema
+                    }
+                }
+            }
+            if ($matchedPattern) { continue }
+
+            if ($rejectAdditional) {
+                $allowedList = New-Object System.Collections.Generic.List[string]
+                if ($null -ne $propsSchema) {
+                    foreach ($k in (Get-ObjectPropertyNames -Object $propsSchema)) {
+                        $allowedList.Add([string]$k)
+                    }
+                } elseif ($null -ne $patternPropsSchema) {
+                    foreach ($k in (Get-ObjectPropertyNames -Object $patternPropsSchema)) {
+                        $allowedList.Add([string]$k)
+                    }
+                }
+                throw "Unknown property '$propName' in $Context. Allowed properties: $($allowedList -join ', ')."
+            }
+
+            if (Test-IsSecretsJsonObject $ap) {
+                Assert-SecretsSchemaProperties -Value $childVal -Schema $ap -Context $childCtx -RootSchema $RootSchema
+            }
+        }
+        return
+    }
+
+    if (($Value -is [System.Collections.IEnumerable]) -and ($Value -isnot [string])) {
+        if (Test-ObjectHasProperty -Object $Schema -Name 'items') {
+            $itemsSchema = Get-ObjectProperty -Object $Schema -Name 'items'
+            if (Test-IsSecretsJsonObject $itemsSchema) {
+                $arr = @($Value)
+                for ($i = 0; $i -lt $arr.Count; $i++) {
+                    Assert-SecretsSchemaProperties -Value $arr[$i] -Schema $itemsSchema -Context "${Context}[$i]" -RootSchema $RootSchema
+                }
+            }
+        }
+    }
 }
 
 function Test-ObjectHasProperty {
@@ -609,17 +818,24 @@ function Build-SeedSecretsPayload {
     if ($null -eq $manifest) {
         throw "Secrets manifest '$ManifestPath' is empty."
     }
+    if (-not (Test-IsSecretsJsonObject $manifest)) {
+        throw "Secrets manifest '$ManifestPath' must be a JSON object."
+    }
 
     $baseDir = Split-Path -Parent ([System.IO.Path]::GetFullPath($ManifestPath))
 
     # Reject unknown top-level keys to catch typos early
     foreach ($key in (Get-ObjectPropertyNames -Object $manifest)) {
-        if ($key -eq '$schema') { continue }
-        if ($key -notin $script:SupportedSecretServices) {
+        if ($key -ceq '$schema') { continue }
+        if ($key -cnotin $script:SupportedSecretServices) {
             $allowed = $script:SupportedSecretServices -join ', '
             throw "Unknown top-level service '$key' in '$ManifestPath'. Supported services: $allowed."
         }
     }
+
+    # Reject unknown nested keys across all services/profiles/hosts against secrets.schema.json
+    $secretsSchema = Get-SecretsSchema
+    Assert-SecretsSchemaProperties -Value $manifest -Schema $secretsSchema -Context '$' -RootSchema $secretsSchema
 
     $filterServices = @(Resolve-RequestedServiceFilter -Services $Services)
     $resolvedServices = [ordered]@{}

@@ -908,6 +908,93 @@ try {
     Assert-Throws "Rejects invalid ssh.mode value" {
         Build-SeedSecretsPayload -ManifestPath $badModeManifest -AgentName 'agent' | Out-Null
     } "must be 'files' or 'agent-proxy'"
+
+    # 9. Schema-driven unknown nested property rejection without secret leakage
+    $unknownNestedCases = @(
+        @{
+            Name     = 'github unknown top-level property'
+            File     = 'unknown-gh-key.json'
+            Data     = @{ github = @{ token = 'ghp_secret_leak_check'; tkoen = 'ghp_secret_leak_check' } }
+            NoLeak   = 'ghp_secret_leak_check'
+        },
+        @{
+            Name     = 'github.profiles[*] unknown property'
+            File     = 'unknown-gh-prof-key.json'
+            Data     = @{ github = @{ profiles = @(@{ name = 'work'; pat = 'ghp_profile_leak_check' }) } }
+            NoLeak   = 'ghp_profile_leak_check'
+        },
+        @{
+            Name     = 'ssh unknown top-level property'
+            File     = 'unknown-ssh-key.json'
+            Data     = @{ ssh = @{ strictHostKeyCheck = 'yes'; keys = @(@{ name = 'deploy'; privateKeyFile = 'keys\ssh_deploy' }) } }
+            NoLeak   = ''
+        },
+        @{
+            Name     = 'ssh.hosts[*] unknown property'
+            File     = 'unknown-ssh-host-key.json'
+            Data     = @{ ssh = @{ hosts = @(@{ name = 'web'; hostName = 'web.example.com'; hostnameAlias = 'x' }) } }
+            NoLeak   = ''
+        },
+        @{
+            Name     = 'git.signing unknown property'
+            File     = 'unknown-git-sign-key.json'
+            Data     = @{ git = @{ privateKeyFile = 'keys\git_github'; signing = @{ enabled = $true; signCommit = $true } } }
+            NoLeak   = ''
+        },
+        @{
+            Name     = 'env.<VAR> object unknown property'
+            File     = 'unknown-env-obj-key.json'
+            Data     = @{ env = @{ NPM_TOKEN = @{ val = 'npm_secret_leak_check' } } }
+            NoLeak   = 'npm_secret_leak_check'
+        },
+        @{
+            Name     = 'files[*] unknown property'
+            File     = 'unknown-files-key.json'
+            Data     = @{ files = @(@{ name = 'npmrc'; sourcePath = 'keys\npmrc'; targetPath = '~/.npmrc'; chmod = '0600' }) }
+            NoLeak   = ''
+        }
+    )
+    foreach ($uc in $unknownNestedCases) {
+        $uPath = Join-Path $tmpDir $uc.File
+        [System.IO.File]::WriteAllText($uPath, ($uc.Data | ConvertTo-Json -Depth 8), (New-Object System.Text.UTF8Encoding($false)))
+        Assert-Throws "Rejects $($uc.Name) without leaking secrets" {
+            Build-SeedSecretsPayload -ManifestPath $uPath -AgentName 'agent' | Out-Null
+        } 'Unknown property' $uc.NoLeak
+    }
+
+    $gcloudObjSaManifest = Join-Path $tmpDir 'gcloud-obj-sa.json'
+    [System.IO.File]::WriteAllText($gcloudObjSaManifest, (@{
+        gcloud = @{
+            skipActivate          = $true
+            serviceAccountKeyJson = @{
+                type           = 'service_account'
+                project_id     = 'compat-proj'
+                private_key_id = 'key-id-123'
+                private_key    = "-----BEGIN PRIVATE KEY-----`nMOCKKEY`n-----END PRIVATE KEY-----`n"
+                client_email   = 'bot@compat-proj.iam.gserviceaccount.com'
+                auth_uri       = 'https://accounts.google.com/o/oauth2/auth'
+            }
+        }
+    } | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
+    $gcloudObjBuilt = Build-SeedSecretsPayload -ManifestPath $gcloudObjSaManifest -AgentName 'agent'
+    Assert-True "Accepts inline gcloud.serviceAccountKeyJson object with extra GCP metadata fields" ($gcloudObjBuilt.Payload.services.gcloud.projects[0].project -eq 'compat-proj')
+
+    # Case-sensitive key matching (parity with secrets.schema.json)
+    $wrongCaseNestedManifest = Join-Path $tmpDir 'wrong-case-nested.json'
+    [System.IO.File]::WriteAllText($wrongCaseNestedManifest, (@{
+        github = @{ TOKEN = 'ghp_wrong_case_canary_123' }
+    } | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding($false)))
+    Assert-Throws "Rejects wrong-case nested key github.TOKEN without leaking secret" {
+        Build-SeedSecretsPayload -ManifestPath $wrongCaseNestedManifest -AgentName 'agent' | Out-Null
+    } 'Unknown property' 'ghp_wrong_case_canary_123'
+
+    $wrongCaseTopManifest = Join-Path $tmpDir 'wrong-case-top.json'
+    [System.IO.File]::WriteAllText($wrongCaseTopManifest, (@{
+        GitHub = @{ token = 'ghp_top_case_canary_456' }
+    } | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding($false)))
+    Assert-Throws "Rejects wrong-case top-level service GitHub without leaking secret" {
+        Build-SeedSecretsPayload -ManifestPath $wrongCaseTopManifest -AgentName 'agent' | Out-Null
+    } 'Unknown top-level service' 'ghp_top_case_canary_456'
 } finally {
     [Environment]::SetEnvironmentVariable('WSL_AGENT_SANDBOX_SECRETS_PATH', $prevEnvManifest)
     [Environment]::SetEnvironmentVariable('TEST_SANDBOX_GH_TOKEN', $prevTestToken)
