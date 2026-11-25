@@ -149,6 +149,24 @@ Assert-Throws "Rejects / in docker.allowBindPrefixes" {
     Assert-BoxConfigValid -Config $c
 } 'Unsafe docker.allowBindPrefixes'
 
+foreach ($unsafePrefix in @('/etc', '/etc/wsl-agent-sandbox', '/run/box-root', '/var/run', '/root', '/shared/foo', '/home/agent/../etc')) {
+    Assert-Throws "Rejects $unsafePrefix in docker.allowBindPrefixes" {
+        $c = Copy-Config $baseCfg
+        $c.docker.allowBindPrefixes = @($unsafePrefix)
+        Assert-BoxConfigValid -Config $c
+    } 'Unsafe docker.allowBindPrefixes'
+}
+
+$customBindCfg = Copy-Config $baseCfg
+$customBindCfg.docker.allowBindPrefixes = @('/home/agent/work', '/tmp/builds')
+Assert-BoxConfigValid -Config $customBindCfg
+Assert-True "Accepts subdirectory and custom safe paths in docker.allowBindPrefixes" $true
+
+$emptyBindCfg = Copy-Config $baseCfg
+$emptyBindCfg.docker.allowBindPrefixes = @()
+Assert-BoxConfigValid -Config $emptyBindCfg
+Assert-True "Accepts empty array [] in docker.allowBindPrefixes" $true
+
 # Reject shell injection in apt package names
 Assert-Throws "Rejects shell metacharacters in apt package names" {
     $c = Copy-Config $baseCfg

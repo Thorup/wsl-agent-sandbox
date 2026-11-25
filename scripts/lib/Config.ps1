@@ -618,10 +618,30 @@ function Assert-BoxConfigValid {
     }
     $allowBindPrefixesVal = $null
     [void](Read-BoxObjectProperty -Object $dockerObj -Name 'allowBindPrefixes' -Value ([ref]$allowBindPrefixesVal))
+    $disallowedBindPrefixes = @(
+        '/etc', '/root', '/proc', '/sys', '/dev', '/boot',
+        '/usr', '/bin', '/sbin', '/lib', '/lib64',
+        '/var/run', '/run', '/mnt', '/shared'
+    )
     foreach ($bp in @($allowBindPrefixesVal)) {
-        if (-not $bp) { continue }
-        if ($bp -isnot [string] -or -not $bp.StartsWith('/') -or $bp -eq '/' -or $bp -match '^/mnt(/|$)' -or $bp -match '^/run/desktop') {
+        if ($null -eq $bp) { continue }
+        $bpStr = [string]$bp
+        if ([string]::IsNullOrWhiteSpace($bpStr) -or -not $bpStr.StartsWith('/') -or $bpStr.Contains('\')) {
             throw "Unsafe docker.allowBindPrefixes entry '$bp'."
+        }
+        $rawSegments = $bpStr -split '/'
+        if ($rawSegments -contains '..') {
+            throw "Unsafe docker.allowBindPrefixes entry '$bp'."
+        }
+        $cleanSegments = @($rawSegments | Where-Object { $_ -ne '' -and $_ -ne '.' })
+        $normBp = '/' + ($cleanSegments -join '/')
+        if ($normBp -eq '/') {
+            throw "Unsafe docker.allowBindPrefixes entry '$bp'."
+        }
+        foreach ($disallowed in $disallowedBindPrefixes) {
+            if ($normBp -eq $disallowed -or $normBp.StartsWith("$disallowed/")) {
+                throw "Unsafe docker.allowBindPrefixes entry '$bp'."
+            }
         }
     }
     $allowedPublishedPortsVal = $null
