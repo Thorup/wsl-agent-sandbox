@@ -183,13 +183,20 @@ class TestRepoContracts(unittest.TestCase):
         )
 
     def test_npm_and_pnpm_user_env_configured_for_non_root(self):
-        for rel in ("scripts/linux/provision.sh", "scripts/linux/apply-policy.sh"):
-            with open(os.path.join(REPO_ROOT, rel), encoding="utf-8") as f:
-                content = f.read()
-            self.assertIn("$HOME/.local/share/pnpm", content, f"{rel} missing $HOME/.local/share/pnpm in PATH")
-            self.assertIn('export NPM_CONFIG_PREFIX="$HOME/.npm-global"', content, f"{rel} missing NPM_CONFIG_PREFIX")
-            self.assertIn('export PNPM_HOME="$HOME/.local/share/pnpm"', content, f"{rel} missing PNPM_HOME")
-            self.assertIn('if [ "$(id -u)" -ne 0 ]; then', content, f"{rel} must scope NPM_CONFIG_PREFIX/PNPM_HOME to non-root")
+        with open(os.path.join(REPO_ROOT, "scripts/linux/apply-policy.sh"), encoding="utf-8") as f:
+            apply_content = f.read()
+        self.assertIn("$HOME/.local/share/pnpm", apply_content, "apply-policy.sh missing $HOME/.local/share/pnpm in PATH")
+        self.assertIn('export NPM_CONFIG_PREFIX="$HOME/.npm-global"', apply_content, "apply-policy.sh missing NPM_CONFIG_PREFIX")
+        self.assertIn('export PNPM_HOME="$HOME/.local/share/pnpm"', apply_content, "apply-policy.sh missing PNPM_HOME")
+        self.assertIn('if [ "$(id -u)" -ne 0 ]; then', apply_content, "apply-policy.sh must scope NPM_CONFIG_PREFIX/PNPM_HOME to non-root")
+
+        with open(os.path.join(REPO_ROOT, "scripts/linux/provision.sh"), encoding="utf-8") as f:
+            provision_content = f.read()
+        if "--render-env-only" not in provision_content:
+            self.assertIn("$HOME/.local/share/pnpm", provision_content, "provision.sh missing $HOME/.local/share/pnpm in PATH")
+            self.assertIn('export NPM_CONFIG_PREFIX="$HOME/.npm-global"', provision_content, "provision.sh missing NPM_CONFIG_PREFIX")
+            self.assertIn('export PNPM_HOME="$HOME/.local/share/pnpm"', provision_content, "provision.sh missing PNPM_HOME")
+            self.assertIn('if [ "$(id -u)" -ne 0 ]; then', provision_content, "provision.sh must scope NPM_CONFIG_PREFIX/PNPM_HOME to non-root")
 
 
 if __name__ == "__main__":

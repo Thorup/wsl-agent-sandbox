@@ -27,7 +27,7 @@ fetch_github_latest_json() {
   local repo="$1"
   local api_url="https://api.github.com/repos/${repo}/releases/latest"
   local -a auth_args=()
-  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+  if [[ -n "${GITHUB_TOKEN:-}" && "${GITHUB_TOKEN}" != sandbox-proxy-* ]]; then
     auth_args=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
   fi
 
@@ -92,12 +92,13 @@ upgrade_aws_cli() {
     aws_arch="aarch64"
   fi
   log "Updating AWS CLI v2 (${aws_arch})..."
-  local tmp_dir
-  tmp_dir="$(mktemp -d)"
-  curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${aws_arch}.zip" -o "${tmp_dir}/awscliv2.zip"
-  unzip -q "${tmp_dir}/awscliv2.zip" -d "${tmp_dir}"
-  "${tmp_dir}/aws/install" --bin-dir "${bin_dir}" --install-dir "${install_dir}" --update
-  rm -rf "${tmp_dir}"
+  (
+    tmp_dir="$(mktemp -d)"
+    trap 'rm -rf "${tmp_dir}"' EXIT
+    curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${aws_arch}.zip" -o "${tmp_dir}/awscliv2.zip"
+    unzip -q "${tmp_dir}/awscliv2.zip" -d "${tmp_dir}"
+    "${tmp_dir}/aws/install" --bin-dir "${bin_dir}" --install-dir "${install_dir}" --update
+  )
   record_ver "aws" "aws --version" "after"
 }
 
@@ -112,15 +113,15 @@ upgrade_dotnet_toolchains() {
 
   record_ver "dotnet" "'${dotnet_bin}' --list-sdks | tr '\n' ';'" "before"
   log "Updating .NET SDK (LTS) in ${install_dir}..."
-  local tmp_dir installer_bin
-  tmp_dir="$(mktemp -d)"
-  installer_bin="${tmp_dir}/dotnet-install.sh"
-  curl -fsSL "${installer_url}" -o "${installer_bin}"
-  chmod +x "${installer_bin}"
-  "${installer_bin}" --channel LTS --install-dir "${install_dir}" --no-path
+  (
+    tmp_dir="$(mktemp -d)"
+    trap 'rm -rf "${tmp_dir}"' EXIT
+    installer_bin="${tmp_dir}/dotnet-install.sh"
+    curl -fsSL "${installer_url}" -o "${installer_bin}"
+    chmod +x "${installer_bin}"
+    "${installer_bin}" --channel LTS --install-dir "${install_dir}" --no-path
 
-  local -a dotnet_channels=()
-  mapfile -t dotnet_channels < <(python3 -c '
+    mapfile -t dotnet_channels < <(python3 -c '
 import json, sys
 d = json.load(open(sys.argv[1]))
 channels = d.get("packages", {}).get("dotnetChannels")
@@ -134,17 +135,15 @@ for ch in channels:
         print(str(ch))
 ' "${policy_file}")
 
-  local ch
-  for ch in "${dotnet_channels[@]}"; do
-    if [[ ! "${ch}" =~ ^[0-9]+\.[0-9]+$ ]]; then
-      log "WARN: skipping invalid packages.dotnetChannels entry '${ch}' (expected '<major>.<minor>', e.g. '8.0')."
-      continue
-    fi
-    log "Updating .NET SDK channel ${ch} in ${install_dir}..."
-    "${installer_bin}" --channel "${ch}" --install-dir "${install_dir}" --no-path
-  done
-
-  rm -rf "${tmp_dir}"
+    for ch in "${dotnet_channels[@]}"; do
+      if [[ ! "${ch}" =~ ^[0-9]+\.[0-9]+$ ]]; then
+        log "WARN: skipping invalid packages.dotnetChannels entry '${ch}' (expected '<major>.<minor>', e.g. '8.0')."
+        continue
+      fi
+      log "Updating .NET SDK channel ${ch} in ${install_dir}..."
+      "${installer_bin}" --channel "${ch}" --install-dir "${install_dir}" --no-path
+    done
+  )
   record_ver "dotnet" "'${dotnet_bin}' --list-sdks | tr '\n' ';'" "after"
 }
 

@@ -30,7 +30,7 @@ fetch_github_latest_json() {
   local repo="$1"
   local api_url="https://api.github.com/repos/${repo}/releases/latest"
   local -a auth_args=()
-  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+  if [[ -n "${GITHUB_TOKEN:-}" && "${GITHUB_TOKEN}" != sandbox-proxy-* ]]; then
     auth_args=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
   fi
 
