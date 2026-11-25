@@ -308,6 +308,8 @@ verify_policy = {
     "allowPortBindings": bool(docker_cfg.get("allowPortBindings", True)),
     "forceLoopbackPortBindings": bool(docker_cfg.get("forceLoopbackPortBindings", True)),
     "forceInternalNetwork": bool(docker_cfg.get("forceInternalNetwork", False)),
+    "allowedRegistries": docker_cfg.get("allowedRegistries", []),
+    "blockHostAndLan": bool(policy.get("network", {}).get("blockHostAndLan", True)),
     "egressMode": policy.get("network", {}).get("egressMode", "open"),
     "allowedDomains": policy.get("network", {}).get("allowedDomains", []),
     "expectedTools": expected_tools,

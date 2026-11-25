@@ -113,23 +113,36 @@ interop_disabled_in_wslconf() {
 }
 
 check_wslinterop_binfmt() {
-  local binfmt_path="$1"
-  local wsl_conf="$2"
-  if [[ -f "${binfmt_path}" ]]; then
+  if [[ "$#" -lt 2 ]]; then
+    fail "check_wslinterop_binfmt requires at least 2 arguments"
+    return 1
+  fi
+  local wsl_conf="${!#}"
+  local -a binfmt_paths=("${@:1:$#-1}")
+  local -a present_handlers=()
+  local p
+  for p in "${binfmt_paths[@]}"; do
+    if [[ -f "${p}" ]]; then
+      present_handlers+=("$(basename "${p}")")
+    fi
+  done
+
+  if [[ "${#present_handlers[@]}" -gt 0 ]]; then
+    local handlers_str="${present_handlers[*]}"
     if interop_disabled_in_wslconf "${wsl_conf}"; then
       # binfmt_misc is shared across all distros in the WSL2 utility VM, so another distro with
       # interop enabled registers this handler VM-wide. With [interop] enabled=false, this distro's
       # /init refuses to launch Windows processes (the vsock handshake never completes).
-      warn "WSLInterop binfmt_misc handler is registered VM-wide by another distro; interop is disabled for this distro in /etc/wsl.conf"
+      warn "WSLInterop binfmt_misc handler(s) (${handlers_str}) registered VM-wide by another distro; interop is disabled for this distro in /etc/wsl.conf"
     else
-      fail "WSLInterop binfmt_misc handler is registered and [interop] is not disabled in /etc/wsl.conf!"
+      fail "WSLInterop binfmt_misc handler(s) (${handlers_str}) registered and [interop] is not disabled in /etc/wsl.conf!"
     fi
   else
-    pass "WSLInterop binfmt_misc handler is absent (interop disabled)"
+    pass "WSLInterop binfmt_misc handlers are absent (interop disabled)"
   fi
 }
 
-check_wslinterop_binfmt /proc/sys/fs/binfmt_misc/WSLInterop /etc/wsl.conf
+check_wslinterop_binfmt /proc/sys/fs/binfmt_misc/WSLInterop /proc/sys/fs/binfmt_misc/WSLInterop-late /etc/wsl.conf
 
 if [[ -n "${WSL_INTEROP:-}" ]]; then
   fail "WSL_INTEROP environment variable is set!"
@@ -155,21 +168,36 @@ fi
 echo ""
 echo "[4/6] Network Isolation & Internet Access"
 
-GW_IP="$(ip -4 route show default | awk '/via/ {print $3; exit}')"
-TARGET_IP="${HOST_TEST_IP:-${GW_IP}}"
-
-if [[ -n "${TARGET_IP}" ]]; then
-  TEST_PORT="${HOST_TEST_PORT:-445}"
-  if nc -z -w 2 "${TARGET_IP}" "${TEST_PORT}" >/dev/null 2>&1; then
-    fail "Agent was able to connect to Windows host ${TARGET_IP}:${TEST_PORT}!"
-  else
-    pass "Outbound connection from agent to Windows host ${TARGET_IP}:${TEST_PORT} blocked"
+is_block_host_and_lan_enabled() {
+  local policy_file="${1:-/etc/wsl-agent-sandbox/verify-policy.json}"
+  if [[ ! -r "${policy_file}" ]]; then
+    echo "true"
+    return 0
   fi
+  python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("true" if d.get("blockHostAndLan", True) else "false")' "${policy_file}" 2>/dev/null || echo "true"
+}
+
+VERIFY_POLICY_FILE="${VERIFY_POLICY_FILE:-/etc/wsl-agent-sandbox/verify-policy.json}"
+BLOCK_HOST_AND_LAN="$(is_block_host_and_lan_enabled "${VERIFY_POLICY_FILE}")"
+
+if [[ "${BLOCK_HOST_AND_LAN}" == "false" ]]; then
+  warn "Windows host & LAN blocking disabled by policy (network.blockHostAndLan=false)"
 else
-  warn "Could not determine default gateway IP to probe Windows host"
+  GW_IP="$(ip -4 route show default | awk '/via/ {print $3; exit}')"
+  TARGET_IP="${HOST_TEST_IP:-${GW_IP}}"
+
+  if [[ -n "${TARGET_IP}" ]]; then
+    TEST_PORT="${HOST_TEST_PORT:-445}"
+    if nc -z -w 2 "${TARGET_IP}" "${TEST_PORT}" >/dev/null 2>&1; then
+      fail "Agent was able to connect to Windows host ${TARGET_IP}:${TEST_PORT}!"
+    else
+      pass "Outbound connection from agent to Windows host ${TARGET_IP}:${TEST_PORT} blocked"
+    fi
+  else
+    warn "Could not determine default gateway IP to probe Windows host"
+  fi
 fi
 
-VERIFY_POLICY_FILE="/etc/wsl-agent-sandbox/verify-policy.json"
 EGRESS_MODE="open"
 ALLOWED_DOMAIN_COUNT=0
 ALLOWLIST_PROBE_URL=""
@@ -214,6 +242,8 @@ if [[ "${EGRESS_MODE}" == "allowlist" ]]; then
     else
       fail "Allowlisted egress failed via proxy (${ALLOWLIST_PROBE_URL})"
     fi
+  elif [[ "${ALLOWED_DOMAIN_COUNT}" -gt 0 ]]; then
+    pass "Strict allowlist active (${ALLOWED_DOMAIN_COUNT} wildcard pattern(s) configured)"
   else
     pass "Strict allowlist active (0 allowedDomains configured)"
   fi
@@ -237,6 +267,27 @@ if [[ -r "${VERIFY_POLICY_FILE}" ]]; then
   DOCKER_ENABLED="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("true" if d.get("dockerEnabled", True) else "false")' "${VERIFY_POLICY_FILE}" 2>/dev/null || echo "true")"
 fi
 
+resolve_docker_verify_image() {
+  local policy_file="${1:-/etc/wsl-agent-sandbox/verify-policy.json}"
+  if [[ ! -r "${policy_file}" ]]; then
+    echo "true|alpine:latest"
+    return 0
+  fi
+  python3 -c 'import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    print("true|alpine:latest")
+    sys.exit(0)
+regs = [str(r).strip().lower() for r in d.get("allowedRegistries", []) if str(r).strip()]
+hub = {"docker.io", "index.docker.io", "registry-1.docker.io"}
+if not regs or any(r in hub for r in regs):
+    print("true|alpine:latest")
+else:
+    print(f"false|{regs[0]}/wsl-sandbox-verify-dummy:latest")
+' "${policy_file}" 2>/dev/null || echo "true|alpine:latest"
+}
+
 export DOCKER_HOST="unix:///run/docker-policy/docker.sock"
 
 if [[ "${DOCKER_ENABLED}" == "false" ]]; then
@@ -258,19 +309,11 @@ elif docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
   SRV_VER="$(docker version --format '{{.Server.Version}}')"
   pass "Docker Desktop reachable through policy proxy (Engine ${SRV_VER})"
 
-  # Ensure alpine:latest is cached before testing so pull progress doesn't pollute stdout
-  docker pull -q alpine:latest >/dev/null 2>&1 || true
+  DOCKER_IMAGE_INFO="$(resolve_docker_verify_image "${VERIFY_POLICY_FILE}")"
+  DOCKER_HUB_ALLOWED="${DOCKER_IMAGE_INFO%%|*}"
+  VERIFY_IMAGE="${DOCKER_IMAGE_INFO#*|}"
 
-  # Test allowed container execution + bind mount inside $HOME
   WORK_DIR="$(mktemp -d "${HOME}/.box-verify-XXXXXX")"
-  echo "hello-from-wsl-agent" > "${WORK_DIR}/input.txt"
-
-  OUT="$(docker run --rm -v "${WORK_DIR}:/data" alpine:latest sh -c 'cat /data/input.txt && echo ok-from-docker > /data/output.txt' 2>&1)"
-  if echo "${OUT}" | grep -q "hello-from-wsl-agent" && [[ "$(cat "${WORK_DIR}/output.txt" 2>/dev/null)" == "ok-from-docker" ]]; then
-    pass "Allowed bind mount inside /home/agent works seamlessly through proxy rewrite"
-  else
-    fail "Allowed bind mount inside /home/agent failed: ${OUT}"
-  fi
 
   # Helper: assert docker command is blocked by policy proxy (HTTP 403 / docker-policy-proxy)
   expect_docker_blocked() {
@@ -286,43 +329,62 @@ elif docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
     fi
   }
 
+  if [[ "${DOCKER_HUB_ALLOWED}" == "true" ]]; then
+    # Ensure alpine:latest is cached before testing so pull progress doesn't pollute stdout
+    docker pull -q alpine:latest >/dev/null 2>&1 || true
+
+    # Test allowed container execution + bind mount inside $HOME
+    echo "hello-from-wsl-agent" > "${WORK_DIR}/input.txt"
+
+    OUT="$(docker run --rm -v "${WORK_DIR}:/data" alpine:latest sh -c 'cat /data/input.txt && echo ok-from-docker > /data/output.txt' 2>&1)"
+    if echo "${OUT}" | grep -q "hello-from-wsl-agent" && [[ "$(cat "${WORK_DIR}/output.txt" 2>/dev/null)" == "ok-from-docker" ]]; then
+      pass "Allowed bind mount inside /home/agent works seamlessly through proxy rewrite"
+    else
+      fail "Allowed bind mount inside /home/agent failed: ${OUT}"
+    fi
+  else
+    warn "Skipping live alpine:latest container run because docker.io is excluded from docker.allowedRegistries"
+    expect_docker_blocked "unlisted registry (docker.io/library/alpine:latest)" \
+      docker pull alpine:latest
+  fi
+
   expect_docker_blocked "Windows host mount (/run/desktop/mnt/host/c)" \
-    docker run --rm -v /run/desktop/mnt/host/c:/host alpine:latest ls /host
+    docker run --rm -v /run/desktop/mnt/host/c:/host "${VERIFY_IMAGE}" ls /host
 
   expect_docker_blocked "/mnt/c bind mount" \
-    docker run --rm -v /mnt/c:/host alpine:latest ls /host
+    docker run --rm -v /mnt/c:/host "${VERIFY_IMAGE}" ls /host
 
   expect_docker_blocked "/etc bind mount" \
-    docker run --rm -v /etc:/host alpine:latest ls /host
+    docker run --rm -v /etc:/host "${VERIFY_IMAGE}" ls /host
 
   expect_docker_blocked "/var/run/docker.sock bind mount" \
-    docker run --rm -v /var/run/docker.sock:/var/run/docker.sock alpine:latest ls
+    docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "${VERIFY_IMAGE}" ls
 
   expect_docker_blocked "--privileged container" \
-    docker run --rm --privileged alpine:latest id
+    docker run --rm --privileged "${VERIFY_IMAGE}" id
 
   expect_docker_blocked "--cap-add=SYS_ADMIN" \
-    docker run --rm --cap-add=SYS_ADMIN alpine:latest id
+    docker run --rm --cap-add=SYS_ADMIN "${VERIFY_IMAGE}" id
 
   expect_docker_blocked "--pid=host" \
-    docker run --rm --pid=host alpine:latest ps
+    docker run --rm --pid=host "${VERIFY_IMAGE}" ps
 
   expect_docker_blocked "--network=host" \
-    docker run --rm --network=host alpine:latest ip a
+    docker run --rm --network=host "${VERIFY_IMAGE}" ip a
 
   expect_docker_blocked "--security-opt seccomp=unconfined" \
-    docker run --rm --security-opt seccomp=unconfined alpine:latest id
+    docker run --rm --security-opt seccomp=unconfined "${VERIFY_IMAGE}" id
 
   expect_docker_blocked "host-gateway ExtraHosts" \
-    docker run --rm --add-host=win:host-gateway alpine:latest cat /etc/hosts
+    docker run --rm --add-host=win:host-gateway "${VERIFY_IMAGE}" cat /etc/hosts
 
   ln -s /etc "${WORK_DIR}/sym_etc"
   expect_docker_blocked "local symlink escape (/home/agent/... -> /etc)" \
-    docker run --rm -v "${WORK_DIR}/sym_etc:/host" alpine:latest ls /host
+    docker run --rm -v "${WORK_DIR}/sym_etc:/host" "${VERIFY_IMAGE}" ls /host
 
   ln -s /run/desktop/mnt/host/c "${WORK_DIR}/sym_win"
   expect_docker_blocked "cross-VM dangling symlink escape (-> /run/desktop/mnt/host/c)" \
-    docker run --rm -v "${WORK_DIR}/sym_win:/host" alpine:latest ls /host
+    docker run --rm -v "${WORK_DIR}/sym_win:/host" "${VERIFY_IMAGE}" ls /host
 
   expect_docker_blocked "malicious volume create (type=none,o=bind,device=/run/desktop/mnt/host/c)" \
     docker volume create --driver local --opt type=none --opt o=bind --opt device=/run/desktop/mnt/host/c evil_box_vol
@@ -337,32 +399,34 @@ elif docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
 
   if [[ "${ENFORCE_LOOPBACK_PB}" == "true" ]]; then
     expect_docker_blocked "non-loopback PortBindings (0.0.0.0:18999:80)" \
-      docker run --rm -p 0.0.0.0:18999:80 alpine:latest true
+      docker run --rm -p 0.0.0.0:18999:80 "${VERIFY_IMAGE}" true
   else
     pass "Non-loopback PortBindings allowed by policy (allowPortBindings=true, forceLoopbackPortBindings=false)"
   fi
 
   if [[ "${FORCE_INTERNAL_NET}" == "true" ]]; then
     expect_docker_blocked "--network=bridge when forceInternalNetwork=true" \
-      docker run --rm --network=bridge alpine:latest true
+      docker run --rm --network=bridge "${VERIFY_IMAGE}" true
 
-    NET_AUDIT_OUT="$(docker run --rm alpine:latest sh -c '
-      if nc -z -w 2 1.1.1.1 443 >/dev/null 2>&1; then
-        echo "LEAK_INTERNET"
-        exit 0
+    if [[ "${DOCKER_HUB_ALLOWED}" == "true" ]]; then
+      NET_AUDIT_OUT="$(docker run --rm alpine:latest sh -c '
+        if nc -z -w 2 1.1.1.1 443 >/dev/null 2>&1; then
+          echo "LEAK_INTERNET"
+          exit 0
+        fi
+        if nc -z -w 2 host.docker.internal 80 >/dev/null 2>&1; then
+          echo "LEAK_HOST"
+          exit 0
+        fi
+        echo "ISOLATED_OK"
+      ' 2>/dev/null || true)"
+      if [[ "${NET_AUDIT_OUT}" == "ISOLATED_OK" ]]; then
+        pass "Default container isolated from host.docker.internal and external internet (forceInternalNetwork=true)"
+      elif [[ "${NET_AUDIT_OUT}" == "LEAK_"* ]]; then
+        fail "Default container leaked outbound connectivity (${NET_AUDIT_OUT}) despite forceInternalNetwork=true"
+      else
+        warn "Could not execute active container network audit (alpine:latest unavailable or container failed to start)"
       fi
-      if nc -z -w 2 host.docker.internal 80 >/dev/null 2>&1; then
-        echo "LEAK_HOST"
-        exit 0
-      fi
-      echo "ISOLATED_OK"
-    ' 2>/dev/null || true)"
-    if [[ "${NET_AUDIT_OUT}" == "ISOLATED_OK" ]]; then
-      pass "Default container isolated from host.docker.internal and external internet (forceInternalNetwork=true)"
-    elif [[ "${NET_AUDIT_OUT}" == "LEAK_"* ]]; then
-      fail "Default container leaked outbound connectivity (${NET_AUDIT_OUT}) despite forceInternalNetwork=true"
-    else
-      warn "Could not execute active container network audit (alpine:latest unavailable or container failed to start)"
     fi
   fi
 
