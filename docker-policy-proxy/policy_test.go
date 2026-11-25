@@ -1,14 +1,17 @@
 package main
 
 import (
+	"archive/tar"
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1785,5 +1788,134 @@ func TestTenantIsolationHardening(t *testing.T) {
 	}
 	if code := doReqCT(http.MethodPost, "/exec/preexisting_host_exec/start", "application/json", `{}`); code != http.StatusForbidden {
 		t.Fatalf("expected 403 on preexisting host exec, got %d", code)
+
+func makeBuildTar(t *testing.T, files map[string]string, gzipped bool) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	var tw *tar.Writer
+	var gw *gzip.Writer
+	if gzipped {
+		gw = gzip.NewWriter(&buf)
+		tw = tar.NewWriter(gw)
+	} else {
+		tw = tar.NewWriter(&buf)
+	}
+	for name, content := range files {
+		hdr := &tar.Header{
+			Name: name,
+			Mode: 0o644,
+			Size: int64(len(content)),
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write([]byte(content)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if gw != nil {
+		if err := gw.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return buf.Bytes()
+}
+
+func TestLegacyBuildDockerfileRegistryAllowlist(t *testing.T) {
+	proxy, sock, _, _, cleanup := setupTestEnv(t)
+	defer cleanup()
+	proxy.UpdatePolicy(&Policy{
+		Enabled:           true,
+		AllowedRegistries: []string{"docker.io", "ghcr.io"},
+	})
+	client := unixHTTPClient(sock)
+
+	postBuild := func(rawQuery string, body []byte) int {
+		t.Helper()
+		u := "http://docker/v1.47/build"
+		if rawQuery != "" {
+			u += "?" + rawQuery
+		}
+		resp, err := client.Post(u, "application/x-tar", bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		_, _ = io.ReadAll(resp.Body)
+		return resp.StatusCode
+	}
+
+	// 1. Uncompressed and gzip-compressed tar with allowed registries, multi-stage AS alias, and scratch -> 200.
+	dfAllowed := `
+# escape=\
+FROM alpine:3.20
+FROM ghcr.io/org/builder:1 AS build
+FROM build
+FROM scratch
+`
+	if code := postBuild("", makeBuildTar(t, map[string]string{"Dockerfile": dfAllowed}, false)); code != http.StatusOK {
+		t.Fatalf("expected uncompressed allowed build to return 200, got %d", code)
+	}
+	if code := postBuild("", makeBuildTar(t, map[string]string{"./Dockerfile": dfAllowed}, true)); code != http.StatusOK {
+		t.Fatalf("expected gzipped allowed build to return 200, got %d", code)
+	}
+
+	// 2. Denied registries: second stage, --platform flag, and backslash line continuation -> 403.
+	deniedDockerfiles := []string{
+		"FROM alpine:3.20\nFROM quay.io/untrusted/img:latest\n",
+		"FROM --platform=linux/amd64 quay.io/untrusted/img:latest\n",
+		"FROM \\\n  quay.io/untrusted/img:latest\n",
+	}
+	for i, df := range deniedDockerfiles {
+		if code := postBuild("", makeBuildTar(t, map[string]string{"Dockerfile": df}, false)); code != http.StatusForbidden {
+			t.Fatalf("case %d: expected 403 for denied Dockerfile, got %d", i, code)
+		}
+	}
+
+	// 3. Custom dockerfile query parameter -> inspects custom path and denies unapproved registry.
+	customTar := makeBuildTar(t, map[string]string{
+		"Dockerfile":            "FROM alpine:3.20\n",
+		"docker/App.Dockerfile": "FROM quay.io/untrusted/app:1\n",
+	}, false)
+	if code := postBuild("dockerfile="+url.QueryEscape("docker/App.Dockerfile"), customTar); code != http.StatusForbidden {
+		t.Fatalf("expected 403 for custom dockerfile with unapproved registry, got %d", code)
+	}
+
+	// 4. ARG and buildargs expansion, plus unresolved ARG fail-closed -> 403.
+	argDF := "ARG REG=quay.io\nFROM ${REG}/app:1\n"
+	if code := postBuild("", makeBuildTar(t, map[string]string{"Dockerfile": argDF}, false)); code != http.StatusForbidden {
+		t.Fatalf("expected 403 for ARG REG=quay.io, got %d", code)
+	}
+	overrideDF := "ARG REG=docker.io\nFROM ${REG}/app:1\n"
+	buildargs := url.QueryEscape(`{"REG":"quay.io"}`)
+	if code := postBuild("buildargs="+buildargs, makeBuildTar(t, map[string]string{"Dockerfile": overrideDF}, false)); code != http.StatusForbidden {
+		t.Fatalf("expected 403 when buildargs overrides REG to quay.io, got %d", code)
+	}
+	unresolvedDF := "FROM ${UNKNOWN_REG}/app:1\n"
+	if code := postBuild("", makeBuildTar(t, map[string]string{"Dockerfile": unresolvedDF}, false)); code != http.StatusForbidden {
+		t.Fatalf("expected 403 for unresolved ARG in FROM, got %d", code)
+	}
+
+	// 5. remote query parameter -> 403 (both under AllowedRegistries and ForceInternalNetwork).
+	if code := postBuild("remote="+url.QueryEscape("https://evil.com/repo.git"), makeBuildTar(t, map[string]string{"Dockerfile": "FROM alpine:3.20\n"}, false)); code != http.StatusForbidden {
+		t.Fatalf("expected 403 for POST /build?remote=... under AllowedRegistries, got %d", code)
+	}
+	polInternal := &Policy{Enabled: true, ForceInternalNetwork: true}
+	if err := polInternal.CheckEndpoint(http.MethodPost, "/build", map[string][]string{
+		"networkmode": {"none"},
+		"remote":      {"https://evil.com/repo.git"},
+	}); err == nil {
+		t.Fatalf("expected POST /build?remote=... to be denied when ForceInternalNetwork is active")
+	}
+
+	// 6. Missing Dockerfile or non-tar garbage payload -> 403.
+	if code := postBuild("", makeBuildTar(t, map[string]string{"README.md": "hello"}, false)); code != http.StatusForbidden {
+		t.Fatalf("expected 403 when Dockerfile is missing from archive, got %d", code)
+	}
+	if code := postBuild("", []byte("not-a-tar-archive-at-all")); code != http.StatusForbidden {
+		t.Fatalf("expected 403 for non-tar garbage payload, got %d", code)
 	}
 }
