@@ -149,7 +149,7 @@ Assert-Throws "Rejects / in docker.allowBindPrefixes" {
     Assert-BoxConfigValid -Config $c
 } 'Unsafe docker.allowBindPrefixes'
 
-foreach ($unsafePrefix in @('/etc', '/etc/wsl-agent-sandbox', '/run/box-root', '/var/run', '/root', '/shared/foo', '/home/agent/../etc')) {
+foreach ($unsafePrefix in @('/etc', '/etc/wsl-agent-sandbox', '/var', '/var/run', '/var/spool', '/run/box-root', '/root', '/shared/foo', '/home/agent/../etc')) {
     Assert-Throws "Rejects $unsafePrefix in docker.allowBindPrefixes" {
         $c = Copy-Config $baseCfg
         $c.docker.allowBindPrefixes = @($unsafePrefix)
@@ -157,8 +157,14 @@ foreach ($unsafePrefix in @('/etc', '/etc/wsl-agent-sandbox', '/run/box-root', '
     } 'Unsafe docker.allowBindPrefixes'
 }
 
+Assert-Throws "Rejects null item in docker.allowBindPrefixes" {
+    $c = Copy-Config $baseCfg
+    $c.docker.allowBindPrefixes = @($null)
+    Assert-BoxConfigValid -Config $c
+} 'Unsafe docker.allowBindPrefixes'
+
 $customBindCfg = Copy-Config $baseCfg
-$customBindCfg.docker.allowBindPrefixes = @('/home/agent/work', '/tmp/builds')
+$customBindCfg.docker.allowBindPrefixes = @('/home/agent/work', '/tmp/builds', '/var/tmp/builds')
 Assert-BoxConfigValid -Config $customBindCfg
 Assert-True "Accepts subdirectory and custom safe paths in docker.allowBindPrefixes" $true
 

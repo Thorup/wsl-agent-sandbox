@@ -31,7 +31,7 @@ def load_bind_helpers():
     ]
     module_ast = ast.Module(body=kept_nodes, type_ignores=[])
     ast.fix_missing_locations(module_ast)
-    ns = {}
+    ns = {"agent_uid": 26040}
     exec(compile(module_ast, BOX_HARDENING_SH, "exec"), ns)
     return ns
 
@@ -92,7 +92,10 @@ class TestBoxHardeningBinds(unittest.TestCase):
             "/sbin",
             "/lib",
             "/lib64",
+            "/var",
             "/var/run",
+            "/var/spool",
+            "/var/lib",
             "/run",
             "/run/box-root",
             "/run/desktop",
@@ -122,10 +125,15 @@ class TestBoxHardeningBinds(unittest.TestCase):
             ensure_dir("/tmp/builds", "/home/agent", uid, gid, root_prefix=tmpdir)
             self.assertTrue(os.path.isdir(os.path.join(tmpdir, "tmp", "builds")))
 
-            # Symlink component must be rejected
+            # Symlink component (intermediate and leaf) must be rejected via O_NOFOLLOW
             os.symlink("/etc", os.path.join(tmpdir, "home", "agent", "evil"))
             with self.assertRaises(ValueError):
                 ensure_dir("/home/agent/evil/sub", "/home/agent", uid, gid, root_prefix=tmpdir)
+            with self.assertRaises(ValueError):
+                ensure_dir("/home/agent/evil", "/home/agent", uid, gid, root_prefix=tmpdir)
+
+            # /var/tmp subpath remains allowed despite /var being disallowed
+            self.assertEqual(self.helpers["validate_bind_prefix"]("/var/tmp/builds"), "/var/tmp/builds")
 
 
 if __name__ == "__main__":

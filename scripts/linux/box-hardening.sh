@@ -180,7 +180,6 @@ def run(cmd, check=True):
 def is_mountpoint(path):
     return subprocess.run(["mountpoint", "-q", path]).returncode == 0
 
-<<<<<<< HEAD
 bind_mappings = []
 docker_cfg = policy.get("docker", {})
 
@@ -386,8 +385,17 @@ DISALLOWED_BIND_PREFIXES = (
     "/bin",
     "/sbin",
     "/lib",
+    "/lib32",
     "/lib64",
+    "/libx32",
     "/var/run",
+    "/var/lib",
+    "/var/spool",
+    "/var/log",
+    "/var/cache",
+    "/var/backups",
+    "/var/mail",
+    "/var/opt",
     "/run",
     "/mnt",
     "/shared",
@@ -404,7 +412,7 @@ def validate_bind_prefix(prefix):
     if p_clean == "/":
         raise ValueError(f"Unsafe docker.allowBindPrefixes entry: {prefix!r}")
     for disallowed in DISALLOWED_BIND_PREFIXES:
-        if p_clean == disallowed or p_clean.startswith(disallowed + "/"):
+        if p_clean == disallowed or p_clean.startswith(disallowed + "/") or disallowed.startswith(p_clean + "/"):
             raise ValueError(f"Unsafe docker.allowBindPrefixes entry: {prefix!r}")
     return p_clean
 
@@ -427,26 +435,65 @@ def resolve_bind_prefixes(policy, agent_home):
             resolved.append((p_clean, bind_prefix_slug(p_clean, agent_home)))
     return resolved
 
-def ensure_bind_prefix_dir(p_clean, agent_home, agent_uid, agent_gid, root_prefix=""):
-    """Ensure p_clean exists as a real directory (no symlinks along the path)."""
+def open_pinned_bind_prefix_dir(p_clean, agent_home, agent_uid, agent_gid, root_prefix=""):
+    """Traverse and create p_clean using O_NOFOLLOW | O_DIRECTORY dirfds, returning a pinned fd."""
+    import errno
+    import stat as statmod
+
+    open_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_DIRECTORY", 0)
+    base_path = root_prefix if root_prefix else "/"
+    cur_fd = os.open(base_path, open_flags)
     rel_parts = [part for part in p_clean.split("/") if part]
     cur_guest = ""
-    cur_fs = root_prefix if root_prefix else "/"
     is_under_home = p_clean == agent_home or p_clean.startswith(agent_home + "/")
-    for part in rel_parts:
-        cur_guest = f"{cur_guest}/{part}"
-        cur_fs = os.path.join(cur_fs, part) if root_prefix else cur_guest
-        if os.path.islink(cur_fs):
-            raise ValueError(f"Refusing symlink in docker.allowBindPrefixes path: {cur_guest}")
-        if os.path.exists(cur_fs):
-            if not os.path.isdir(cur_fs):
+    try:
+        for part in rel_parts:
+            cur_guest = f"{cur_guest}/{part}"
+            created = False
+            try:
+                next_fd = os.open(part, open_flags, dir_fd=cur_fd)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(part, 0o755, dir_fd=cur_fd)
+                    created = True
+                except FileExistsError:
+                    pass
+                try:
+                    next_fd = os.open(part, open_flags, dir_fd=cur_fd)
+                except OSError as exc:
+                    if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                        raise ValueError(f"Refusing symlink or non-directory in docker.allowBindPrefixes path: {cur_guest}") from exc
+                    raise
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    raise ValueError(f"Refusing symlink in docker.allowBindPrefixes path: {cur_guest}") from exc
+                if exc.errno == errno.ENOTDIR:
+                    raise ValueError(f"docker.allowBindPrefixes path is not a directory: {cur_guest}") from exc
+                raise
+
+            st = os.fstat(next_fd)
+            if not statmod.S_ISDIR(st.st_mode):
+                os.close(next_fd)
                 raise ValueError(f"docker.allowBindPrefixes path is not a directory: {cur_guest}")
-            continue
-        os.mkdir(cur_fs, 0o755)
-        if is_under_home and (cur_guest == agent_home or cur_guest.startswith(agent_home + "/")):
-            os.chown(cur_fs, agent_uid, agent_gid)
-        elif cur_guest.startswith("/tmp/") or cur_guest.startswith("/var/tmp/"):
-            os.chown(cur_fs, agent_uid, agent_gid)
+
+            if created and (
+                (is_under_home and (cur_guest == agent_home or cur_guest.startswith(agent_home + "/")))
+                or cur_guest.startswith("/tmp/")
+                or cur_guest.startswith("/var/tmp/")
+            ):
+                os.fchown(next_fd, agent_uid, agent_gid)
+
+            os.close(cur_fd)
+            cur_fd = next_fd
+        return cur_fd
+    except Exception:
+        os.close(cur_fd)
+        raise
+
+def ensure_bind_prefix_dir(p_clean, agent_home, agent_uid, agent_gid, root_prefix=""):
+    """Ensure p_clean exists as a real directory (no symlinks along the path) without fd leak."""
+    fd = open_pinned_bind_prefix_dir(p_clean, agent_home, agent_uid, agent_gid, root_prefix=root_prefix)
+    os.close(fd)
 
 # --- A. Allowlisted Windows shared folders under /shared/<name> ---
 shared_root = "/shared"
@@ -494,104 +541,112 @@ for name, sf in desired_shares.items():
 
 # --- B. Root-only Docker Desktop bind-mount mirrors under /run/box-root/mnt-wsl/box-binds/<distro> ---
 bind_prefixes = resolve_bind_prefixes(policy, agent_home)
-for p_clean, _slug in bind_prefixes:
-    ensure_bind_prefix_dir(p_clean, agent_home, agent_uid, agent_gid)
-
-bind_mappings = []
-if is_mountpoint(private_wsl_mnt):
-    binds_base = os.path.join(private_wsl_mnt, "box-binds")
-    distro_binds = os.path.join(binds_base, distro)
-    prefixes_dir = os.path.join(distro_binds, "prefixes")
-    os.makedirs(prefixes_dir, mode=0o700, exist_ok=True)
-    os.chmod(binds_base, 0o700)
-    os.chmod(distro_binds, 0o700)
-    os.chmod(prefixes_dir, 0o700)
-
-    # Clean up legacy home-agent mirror if present
-    legacy_home_mirror = os.path.join(distro_binds, "home-agent")
-    if os.path.exists(legacy_home_mirror) or is_mountpoint(legacy_home_mirror):
-        if is_mountpoint(legacy_home_mirror):
-            run(["mount", "--make-rprivate", legacy_home_mirror], check=False)
-            run(["umount", "-l", legacy_home_mirror], check=False)
-        try:
-            os.rmdir(legacy_home_mirror)
-        except OSError:
-            pass
-
-    # Mirror each validated allowBindPrefixes entry under prefixes/<slug>
-    active_slugs = set()
+pinned_prefix_fds = []
+try:
     for p_clean, slug in bind_prefixes:
-        active_slugs.add(slug)
-        mirror_local = os.path.join(prefixes_dir, slug)
-        mirror_daemon = f"/run/desktop/mnt/host/wsl/box-binds/{distro}/prefixes/{slug}"
-        os.makedirs(mirror_local, mode=0o700, exist_ok=True)
-        if is_mountpoint(mirror_local):
-            run(["mount", "--make-rprivate", mirror_local], check=False)
-            run(["umount", "-l", mirror_local], check=False)
-        if os.path.isdir(p_clean):
-            run(["mount", "--bind", p_clean, mirror_local])
+        pinned_fd = open_pinned_bind_prefix_dir(p_clean, agent_home, agent_uid, agent_gid)
+        pinned_prefix_fds.append((p_clean, slug, pinned_fd))
+
+    bind_mappings = []
+    if is_mountpoint(private_wsl_mnt):
+        binds_base = os.path.join(private_wsl_mnt, "box-binds")
+        distro_binds = os.path.join(binds_base, distro)
+        prefixes_dir = os.path.join(distro_binds, "prefixes")
+        os.makedirs(prefixes_dir, mode=0o700, exist_ok=True)
+        os.chmod(binds_base, 0o700)
+        os.chmod(distro_binds, 0o700)
+        os.chmod(prefixes_dir, 0o700)
+
+        # Clean up legacy home-agent mirror if present
+        legacy_home_mirror = os.path.join(distro_binds, "home-agent")
+        if os.path.exists(legacy_home_mirror) or is_mountpoint(legacy_home_mirror):
+            if is_mountpoint(legacy_home_mirror):
+                run(["mount", "--make-rprivate", legacy_home_mirror], check=False)
+                run(["umount", "-l", legacy_home_mirror], check=False)
+            try:
+                os.rmdir(legacy_home_mirror)
+            except OSError:
+                pass
+
+        # Mirror each validated allowBindPrefixes entry under prefixes/<slug> via pinned /proc/self/fd
+        active_slugs = set()
+        for p_clean, slug, pinned_fd in pinned_prefix_fds:
+            active_slugs.add(slug)
+            mirror_local = os.path.join(prefixes_dir, slug)
+            mirror_daemon = f"/run/desktop/mnt/host/wsl/box-binds/{distro}/prefixes/{slug}"
+            os.makedirs(mirror_local, mode=0o700, exist_ok=True)
+            if is_mountpoint(mirror_local):
+                run(["mount", "--make-rprivate", mirror_local], check=False)
+                run(["umount", "-l", mirror_local], check=False)
+            run(["mount", "--bind", f"/proc/self/fd/{pinned_fd}", mirror_local])
             bind_mappings.append({
                 "guestPrefix": p_clean,
                 "daemonPrefix": mirror_daemon,
                 "readOnly": False,
             })
 
-    # Clean stale prefix mirrors
-    for entry in os.listdir(prefixes_dir):
-        if entry not in active_slugs:
-            stale = os.path.join(prefixes_dir, entry)
-            if is_mountpoint(stale):
-                run(["mount", "--make-rprivate", stale], check=False)
-                run(["umount", "-l", stale], check=False)
-            try:
-                os.rmdir(stale)
-            except OSError:
-                pass
+        # Clean stale prefix mirrors
+        for entry in os.listdir(prefixes_dir):
+            if entry not in active_slugs:
+                stale = os.path.join(prefixes_dir, entry)
+                if is_mountpoint(stale):
+                    run(["mount", "--make-rprivate", stale], check=False)
+                    run(["umount", "-l", stale], check=False)
+                try:
+                    os.rmdir(stale)
+                except OSError:
+                    pass
 
-    # Mirror any sharedFolders with allowDockerBind == true
-    shared_mirror_dir = os.path.join(distro_binds, "shared")
-    os.makedirs(shared_mirror_dir, mode=0o700, exist_ok=True)
-    active_docker_shares = set()
-    for name, sf in desired_shares.items():
-        if not sf.get("allowDockerBind", False):
-            continue
-        active_docker_shares.add(name)
-        guest_dir = os.path.join(shared_root, name)
-        mirror_local = os.path.join(shared_mirror_dir, name)
-        mirror_daemon = f"/run/desktop/mnt/host/wsl/box-binds/{distro}/shared/{name}"
-        os.makedirs(mirror_local, mode=0o700, exist_ok=True)
-        if is_mountpoint(mirror_local):
-            run(["mount", "--make-rprivate", mirror_local], check=False)
-            run(["umount", "-l", mirror_local], check=False)
-        if is_mountpoint(guest_dir):
-            run(["mount", "--bind", guest_dir, mirror_local])
-            if sf.get("mode", "ro") == "ro":
-                run(["mount", "-o", "remount,ro,bind", mirror_local], check=False)
+        # Mirror any sharedFolders with allowDockerBind == true
+        shared_mirror_dir = os.path.join(distro_binds, "shared")
+        os.makedirs(shared_mirror_dir, mode=0o700, exist_ok=True)
+        active_docker_shares = set()
+        for name, sf in desired_shares.items():
+            if not sf.get("allowDockerBind", False):
+                continue
+            active_docker_shares.add(name)
+            guest_dir = os.path.join(shared_root, name)
+            mirror_local = os.path.join(shared_mirror_dir, name)
+            mirror_daemon = f"/run/desktop/mnt/host/wsl/box-binds/{distro}/shared/{name}"
+            os.makedirs(mirror_local, mode=0o700, exist_ok=True)
+            if is_mountpoint(mirror_local):
+                run(["mount", "--make-rprivate", mirror_local], check=False)
+                run(["umount", "-l", mirror_local], check=False)
+            if is_mountpoint(guest_dir):
+                run(["mount", "--bind", guest_dir, mirror_local])
+                if sf.get("mode", "ro") == "ro":
+                    run(["mount", "-o", "remount,ro,bind", mirror_local], check=False)
+                bind_mappings.append({
+                    "guestPrefix": guest_dir,
+                    "daemonPrefix": mirror_daemon,
+                    "readOnly": sf.get("mode", "ro") == "ro",
+                })
+
+        # Clean stale shared mirrors
+        for entry in os.listdir(shared_mirror_dir):
+            if entry not in active_docker_shares:
+                stale = os.path.join(shared_mirror_dir, entry)
+                if is_mountpoint(stale):
+                    run(["mount", "--make-rprivate", stale], check=False)
+                    run(["umount", "-l", stale], check=False)
+                try:
+                    os.rmdir(stale)
+                except OSError:
+                    pass
+    else:
+        # Still generate bind_mappings even if /mnt/wsl wasn't available yet
+        for p_clean, slug, _pinned_fd in pinned_prefix_fds:
             bind_mappings.append({
-                "guestPrefix": guest_dir,
-                "daemonPrefix": mirror_daemon,
-                "readOnly": sf.get("mode", "ro") == "ro",
+                "guestPrefix": p_clean,
+                "daemonPrefix": f"/run/desktop/mnt/host/wsl/box-binds/{distro}/prefixes/{slug}",
+                "readOnly": False,
             })
-
-    # Clean stale shared mirrors
-    for entry in os.listdir(shared_mirror_dir):
-        if entry not in active_docker_shares:
-            stale = os.path.join(shared_mirror_dir, entry)
-            if is_mountpoint(stale):
-                run(["mount", "--make-rprivate", stale], check=False)
-                run(["umount", "-l", stale], check=False)
-            try:
-                os.rmdir(stale)
-            except OSError:
-                pass
-else:
-    # Still generate bind_mappings even if /mnt/wsl wasn't available yet
-    for p_clean, slug in bind_prefixes:
-        bind_mappings.append({
-            "guestPrefix": p_clean,
-            "daemonPrefix": f"/run/desktop/mnt/host/wsl/box-binds/{distro}/prefixes/{slug}",
-            "readOnly": False,
-        })
+finally:
+    for _p, _s, pinned_fd in pinned_prefix_fds:
+        try:
+            os.close(pinned_fd)
+        except OSError:
+            pass
 
 docker_cfg = policy.get("docker", {})
 force_internal = bool(docker_cfg.get("forceInternalNetwork", False))
