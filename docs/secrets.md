@@ -21,13 +21,14 @@ Every secret field supports **four mutually exclusive sources**:
 - **Inline value** (e.g., `"token": "..."`)
 - **Windows file** (e.g., `"tokenFile": "tokens/github.txt"`, `"serviceAccountKeyFile": "keys/gcp-sa.json"` — relative paths resolve against the manifest directory; `%ENVVAR%` expansion supported)
 - **Windows environment variable** (e.g., `"tokenEnv": "SANDBOX_GH_TOKEN"`)
-- **Password manager or cloud vault URI** (e.g., `"tokenVault": "op://Sandbox/GitHub/pat"` — supports `op://` 1Password CLI, `bw://` Bitwarden CLI, `dpapi://` Windows CurrentUser DPAPI file, `azkv://` Azure Key Vault, `awssm://` AWS Secrets Manager, and `gcpsm://` GCP Secret Manager, resolved on Windows at seed time)
+- **Password manager or cloud vault URI** (e.g., `"tokenVault": "op://Sandbox/GitHub/pat"` — supports `op://` 1Password CLI, `bw://` Bitwarden CLI (`bw://<item>`, `bw://notes/<item>`, `bw://password/<item>`, `bw://field/<item>/<field>`), `dpapi://` Windows CurrentUser DPAPI file, `azkv://` Azure Key Vault, `awssm://` AWS Secrets Manager, and `gcpsm://` GCP Secret Manager, resolved on Windows at seed time)
 
 ### Manifest Path Resolution Priority
 1. CLI argument: `.\box.ps1 seed-secrets "D:\vault\secrets.json"` or `-SecretsPath "D:\vault\secrets.json"`
 2. Windows environment variable: `$env:WSL_AGENT_SANDBOX_SECRETS_PATH`
-3. Optional non-secret pointer in `box.json`: `"secrets": { "manifestPath": "%USERPROFILE%\\.wsl-agent-sandbox\\secrets.json" }`
-4. Default: `%USERPROFILE%\.wsl-agent-sandbox\secrets.json`
+3. Optional non-secret pointer in `box.json` (or `profiles/<profile>.json`): `"secrets": { "manifestPath": "%USERPROFILE%\\.wsl-agent-sandbox\\secrets.json" }`
+4. When `-Profile <name>` is specified: `%USERPROFILE%\.wsl-agent-sandbox\secrets.<name>.json` (never falls back to the default `secrets.json`)
+5. Default profile: `%USERPROFILE%\.wsl-agent-sandbox\secrets.json`
 
 ---
 
@@ -72,8 +73,8 @@ Every secret field supports **four mutually exclusive sources**:
 | `gemini` | `gemini` | `GEMINI_API_KEY` and/or Vertex AI; supports `"proxyInject": true` (`GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:3129/gemini` + placeholder token). |
 | `claude` | `claude` | `ANTHROPIC_API_KEY` and/or `CLAUDE_CODE_OAUTH_TOKEN`; supports `"proxyInject": true` (`ANTHROPIC_BASE_URL=http://127.0.0.1:3129/claude` + placeholder token). |
 | `ssh` | `ssh` / `scp` / `sftp` | Named SSH private keys for remote servers/bastions (plus optional `.pub` & `-cert.pub` certs) → `~/.ssh/wsl-agent-sandbox/` (`0600`) or root-owned `ssh-agent` (`"mode": "agent-proxy"`), marker-delimited `Host` stanzas in `~/.ssh/config`, and pinned `known_hosts`. |
-| `env` | Any CLI | Additional custom token environment variables exported into `~/.config/wsl-agent-sandbox/secrets.env` (protected system vars like `PATH`/`DOCKER_HOST`/`LD_PRELOAD` are rejected). |
-| `files` | Any CLI | Additional secret files (e.g., `~/.npmrc`, `~/.netrc`) copied atomically with `0600` strictly inside `/home/<agent>/`. |
+| `env` | Any CLI | Additional custom token environment variables exported into `~/.config/wsl-agent-sandbox/secrets.env` (protected system vars like `PATH`/`DOCKER_HOST`/`LD_PRELOAD` are rejected; supports optional `"$ttl"`). |
+| `files` | Any CLI | Additional secret files (e.g., `~/.npmrc`, `~/.netrc`) written atomically with `0600` strictly inside `/home/<agent>/` (`sourcePath`, `content`, `contentEnv`, `contentVault`, and optional per-item `ttl`). |
 
 ---
 

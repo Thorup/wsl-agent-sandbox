@@ -81,6 +81,12 @@ try {
     Assert-True "Explicit -SecretsPath overrides env and box.json" ($fromExplicit -eq 'C:\CliSecrets\secrets.json')
     [Environment]::SetEnvironmentVariable('WSL_AGENT_SANDBOX_SECRETS_PATH', $null)
 
+    $profilePath = Resolve-SecretsManifestPath -ExplicitPath '' -Config $null -RepoRoot $RepoRoot -ProfileName 'untrusted'
+    Assert-True "Profile -ProfileName 'untrusted' isolates default manifest to secrets.untrusted.json" ($profilePath -eq (Join-Path $env:USERPROFILE '.wsl-agent-sandbox\secrets.untrusted.json'))
+    Assert-Throws "Missing profile manifest error mentions secrets.untrusted.json" {
+        Build-SeedSecretsPayload -ManifestPath (Join-Path $tmpDir 'missing-untrusted.json') -AgentName 'agent' -ProfileName 'untrusted' | Out-Null
+    } 'secrets.untrusted.json'
+
     # 2. Prepare fixture files for all supported services
     [System.IO.File]::WriteAllText((Join-Path $tmpDir 'tokens\ado.txt'), "ado_pat_from_file_123`r`n", (New-Object System.Text.UTF8Encoding($false)))
     [System.IO.File]::WriteAllText((Join-Path $tmpDir 'tokens\claude.txt'), "sk-ant-from-file-456`n", (New-Object System.Text.UTF8Encoding($false)))
@@ -1026,6 +1032,127 @@ try {
         $profProxyBuilt.Payload.services.gemini.proxyBaseUrl -eq "http://127.0.0.1:$($profPorts.CredentialPort)/gemini" -and
         $profProxyBuilt.Payload.services.github.proxyBaseUrl -eq "http://127.0.0.1:$($profPorts.CredentialPort)/github"
     )
+
+    # Bitwarden bw:// URI validation, CLI argument construction, and item/field parsing
+    $bwNotesSpec = Resolve-BitwardenUriSpec -Target 'notes/my-ssh-key' -Uri 'bw://notes/my-ssh-key' -Context 'test.bw'
+    Assert-True "bw://notes/<item> builds 'bw get notes -- <item>'" (($bwNotesSpec.Arguments -join ' ') -eq 'get notes -- my-ssh-key')
+    $bwFieldSpec = Resolve-BitwardenUriSpec -Target 'field/my-item/api_token' -Uri 'bw://field/my-item/api_token' -Context 'test.bw'
+    Assert-True "bw://field/<item>/<field> builds 'bw get item -- <item>'" (($bwFieldSpec.Arguments -join ' ') -eq 'get item -- my-item' -and $bwFieldSpec.FieldName -eq 'api_token')
+    Assert-Throws "Rejects bw://notes/ with empty item" {
+        Resolve-VaultSecretUri -Uri 'bw://notes/' -BaseDir $tmpDir -Context 'test.bw' | Out-Null
+    } 'non-empty item'
+    Assert-Throws "Rejects bw://field/<item> without field name" {
+        Resolve-VaultSecretUri -Uri 'bw://field/my-item' -BaseDir $tmpDir -Context 'test.bw' | Out-Null
+    } 'custom field name'
+
+    $origInvokeVaultCli = (Get-Item Function:\Invoke-VaultCliProcess).ScriptBlock
+    try {
+        Set-Item Function:\Invoke-VaultCliProcess -Value {
+            param([string]$FileName, [string[]]$Arguments)
+            $argLine = $Arguments -join ' '
+            if ($argLine -eq 'get notes -- my-ssh-key') {
+                return "-----BEGIN OPENSSH PRIVATE KEY-----`nBW_NOTE_KEY`n-----END OPENSSH PRIVATE KEY-----"
+            }
+            if ($argLine -eq 'get item -- my-item') {
+                return (@{
+                    type = 1
+                    login = @{ password = 'bw_login_pw' }
+                    fields = @(@{ name = 'api_token'; value = 'bw_custom_field_val' })
+                } | ConvertTo-Json -Depth 5)
+            }
+            if ($argLine -eq 'get item -- my-secure-note') {
+                return (@{
+                    type = 2
+                    notes = "secure_note_secret_line1`nsecure_note_secret_line2"
+                } | ConvertTo-Json -Depth 4)
+            }
+            throw "Unexpected mock bw call: $FileName $argLine"
+        }
+        $bwNotesVal = Resolve-VaultSecretUri -Uri 'bw://notes/my-ssh-key' -BaseDir $tmpDir -Context 'test.bw'
+        Assert-True "Resolves bw://notes/<item>" ($bwNotesVal.Contains('BW_NOTE_KEY'))
+        $bwFieldVal = Resolve-VaultSecretUri -Uri 'bw://field/my-item/API_TOKEN' -BaseDir $tmpDir -Context 'test.bw'
+        Assert-True "Resolves bw://field/<item>/<field> case-insensitively" ($bwFieldVal -eq 'bw_custom_field_val')
+        $bwAutoNoteVal = Resolve-VaultSecretUri -Uri 'bw://my-secure-note' -BaseDir $tmpDir -Context 'test.bw'
+        Assert-True "Resolves bw://<item> Secure Note (type=2) to notes" ($bwAutoNoteVal -eq "secure_note_secret_line1`nsecure_note_secret_line2")
+        $bwAutoLoginVal = Resolve-VaultSecretUri -Uri 'bw://my-item' -BaseDir $tmpDir -Context 'test.bw'
+        Assert-True "Resolves bw://<item> Login (type=1) to login.password" ($bwAutoLoginVal -eq 'bw_login_pw')
+    } finally {
+        Set-Item Function:\Invoke-VaultCliProcess -Value $origInvokeVaultCli
+    }
+
+    # 4-source vault parity for azure, kubectl, files, and per-service TTLs on env & files
+    $parityManifest = Join-Path $tmpDir 'parity-vault.json'
+    [System.IO.File]::WriteAllText($parityManifest, (@{
+        azure = @{
+            clientId = 'az-cid'
+            tenantId = 'az-tid'
+            certificateVault = 'bw://notes/az-cert'
+        }
+        kubectl = @{
+            kubeconfigVault = 'op://Sandbox/K8s/kubeconfig'
+        }
+        env = [ordered]@{
+            '$ttl' = '45m'
+            CUSTOM_TOKEN = 'env_tok_123'
+        }
+        files = @(
+            @{
+                name = 'npmrc-vault'
+                contentVault = 'op://Sandbox/Npm/npmrc'
+                targetPath = '~/.npmrc'
+                ttl = '2h'
+            },
+            @{
+                name = 'netrc-inline'
+                content = "machine example.com login bot password secret`n"
+                targetPath = '~/.netrc'
+                ttl = '30m'
+            }
+        )
+    } | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
+
+    $script:VaultResolverHook = {
+        param([string]$Uri)
+        switch ($Uri) {
+            'bw://notes/az-cert' { return "-----BEGIN CERTIFICATE-----`r`nAZ_VAULT_CERT`r`n-----END CERTIFICATE-----`r`n" }
+            'op://Sandbox/K8s/kubeconfig' { return "apiVersion: v1`r`nkind: Config`r`n" }
+            'op://Sandbox/Npm/npmrc' { return "//registry.npmjs.org/:_authToken=npm_vault_tok`n" }
+            default { throw "Unexpected URI: $Uri" }
+        }
+    }
+    try {
+        $parityBuilt = Build-SeedSecretsPayload -ManifestPath $parityManifest -AgentName 'agent'
+        Assert-True "Resolves azure.certificateVault with LF normalization" ($parityBuilt.Payload.services.azure.certificatePem.Contains('AZ_VAULT_CERT') -and -not $parityBuilt.Payload.services.azure.certificatePem.Contains("`r"))
+        Assert-True "Resolves kubectl.kubeconfigVault with LF normalization" ($parityBuilt.Payload.services.kubectl.kubeconfigContent.Contains('kind: Config') -and -not $parityBuilt.Payload.services.kubectl.kubeconfigContent.Contains("`r"))
+        $npmBytes = [Convert]::FromBase64String($parityBuilt.Payload.services.files[0].contentBase64)
+        $npmText = [System.Text.Encoding]::UTF8.GetString($npmBytes)
+        Assert-True "Resolves files[].contentVault without sourcePath" ($npmText.Contains('npm_vault_tok'))
+        Assert-True "Does not export env.`$ttl as an environment variable" (-not $parityBuilt.Payload.services.env.Contains('$ttl') -and $parityBuilt.Payload.services.env['CUSTOM_TOKEN'] -eq 'env_tok_123')
+        Assert-True "Populates serviceTtls for env (`$ttl=45m -> 2700s)" ($parityBuilt.Payload.serviceTtls['env'] -eq 2700)
+        Assert-True "Populates serviceTtls for files using minimum item ttl (30m -> 1800s)" ($parityBuilt.Payload.serviceTtls['files'] -eq 1800)
+    } finally {
+        $script:VaultResolverHook = $null
+    }
+
+    # kubectl.caCertVault in token mode
+    $k8sCaManifest = Join-Path $tmpDir 'k8s-cacert-vault.json'
+    [System.IO.File]::WriteAllText($k8sCaManifest, (@{
+        kubectl = @{
+            server = 'https://k8s.example.com:6443'
+            token = 'sa-tok-123'
+            caCertVault = 'op://Sandbox/K8s/ca.crt'
+        }
+    } | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding($false)))
+    $script:VaultResolverHook = {
+        return "-----BEGIN CERTIFICATE-----`nK8S_CA_PEM`n-----END CERTIFICATE-----`n"
+    }
+    try {
+        $k8sCaBuilt = Build-SeedSecretsPayload -ManifestPath $k8sCaManifest -AgentName 'agent'
+        $decodedCa = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($k8sCaBuilt.Payload.services.kubectl.caCertData))
+        Assert-True "Resolves kubectl.caCertVault to base64 caCertData" ($decodedCa.Contains('K8S_CA_PEM'))
+    } finally {
+        $script:VaultResolverHook = $null
+    }
 } finally {
     [Environment]::SetEnvironmentVariable('WSL_AGENT_SANDBOX_SECRETS_PATH', $prevEnvManifest)
     [Environment]::SetEnvironmentVariable('TEST_SANDBOX_GH_TOKEN', $prevTestToken)

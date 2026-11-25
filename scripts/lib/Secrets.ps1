@@ -294,7 +294,8 @@ function Resolve-SecretsManifestPath {
     param(
         [string]$ExplicitPath = '',
         $Config = $null,
-        [string]$RepoRoot = ''
+        [string]$RepoRoot = '',
+        [string]$ProfileName = ''
     )
     if (-not [string]::IsNullOrWhiteSpace($ExplicitPath)) {
         return Expand-BoxPath -RawPath $ExplicitPath -BaseDir (Get-Location).Path
@@ -313,6 +314,11 @@ function Resolve-SecretsManifestPath {
                 return Expand-BoxPath -RawPath $cfgPath -BaseDir $RepoRoot
             }
         }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($ProfileName)) {
+        $trimmedProfile = $ProfileName.Trim()
+        return Expand-BoxPath -RawPath "%USERPROFILE%\.wsl-agent-sandbox\secrets.$trimmedProfile.json"
     }
 
     return Expand-BoxPath -RawPath '%USERPROFILE%\.wsl-agent-sandbox\secrets.json'
@@ -394,6 +400,51 @@ function Invoke-VaultCliProcess {
     }
 }
 
+function Resolve-BitwardenUriSpec {
+    param(
+        [Parameter(Mandatory)][string]$Target,
+        [Parameter(Mandatory)][string]$Uri,
+        [Parameter(Mandatory)][string]$Context
+    )
+    if ($Target -match '^(?i)(notes|password)/(.+)$') {
+        $mode = $Matches[1].ToLowerInvariant()
+        $item = $Matches[2].Trim()
+        if ([string]::IsNullOrWhiteSpace($item) -or $item.StartsWith('-')) {
+            throw "${Context}: bw://${mode}/<item> requires a non-empty item ID or name that does not start with '-' in '$Uri'."
+        }
+        return [pscustomobject]@{
+            Mode      = $mode
+            Item      = $item
+            FieldName = ''
+            Arguments = @('get', $mode, '--', $item)
+        }
+    }
+    if ($Target -match '^(?i)notes/$' -or $Target -match '^(?i)password/$') {
+        throw "${Context}: bw:// URI requires a non-empty item ID or name in '$Uri'."
+    }
+    if ($Target -match '^(?i)field/(.*)$') {
+        $rest = $Matches[1]
+        $parts = $rest -split '/', 2
+        $item = if ($parts.Count -ge 1) { $parts[0].Trim() } else { '' }
+        $fieldName = if ($parts.Count -ge 2) { $parts[1].Trim() } else { '' }
+        if ([string]::IsNullOrWhiteSpace($item) -or $item.StartsWith('-') -or [string]::IsNullOrWhiteSpace($fieldName)) {
+            throw "${Context}: bw://field/<item>/<field> requires a non-empty item and custom field name in '$Uri'."
+        }
+        return [pscustomobject]@{
+            Mode      = 'field'
+            Item      = $item
+            FieldName = $fieldName
+            Arguments = @('get', 'item', '--', $item)
+        }
+    }
+    return [pscustomobject]@{
+        Mode      = 'item'
+        Item      = $Target
+        FieldName = ''
+        Arguments = @('get', 'item', '--', $Target)
+    }
+}
+
 function Resolve-VaultSecretUri {
     param(
         [Parameter(Mandatory)][string]$Uri,
@@ -420,7 +471,7 @@ function Resolve-VaultSecretUri {
             }
         }
         'bw' {
-            # Validated non-empty and non-flag above
+            $null = Resolve-BitwardenUriSpec -Target $target -Uri $Uri -Context $Context
         }
         'dpapi' {
             # Validated non-empty above
@@ -467,7 +518,58 @@ function Resolve-VaultSecretUri {
             return (Invoke-VaultCliProcess -FileName 'op' -Arguments @('read', $Uri) -Context $Context -Uri $Uri)
         }
         'bw' {
-            return (Invoke-VaultCliProcess -FileName 'bw' -Arguments @('get', 'password', '--', $target) -Context $Context -Uri $Uri)
+            $bwSpec = Resolve-BitwardenUriSpec -Target $target -Uri $Uri -Context $Context
+            $bwOut = Invoke-VaultCliProcess -FileName 'bw' -Arguments $bwSpec.Arguments -Context $Context -Uri $Uri
+            if ($bwSpec.Mode -in @('notes', 'password')) {
+                return $bwOut
+            }
+            try {
+                $itemObj = $bwOut | ConvertFrom-Json
+            } catch {
+                throw "${Context}: 'bw get item' returned invalid JSON for '$Uri': $($_.Exception.Message)"
+            }
+            if ($null -eq $itemObj) {
+                throw "${Context}: 'bw get item' returned an empty item for '$Uri'."
+            }
+            if ($bwSpec.Mode -eq 'field') {
+                $fields = @(Get-ObjectProperty -Object $itemObj -Name 'fields' -Default @())
+                $matched = $null
+                foreach ($fld in $fields) {
+                    if ($null -eq $fld) { continue }
+                    $fName = [string](Get-ObjectProperty -Object $fld -Name 'name' -Default '')
+                    if ($fName.Equals($bwSpec.FieldName, [System.StringComparison]::OrdinalIgnoreCase)) {
+                        $matched = [string](Get-ObjectProperty -Object $fld -Name 'value' -Default '')
+                        break
+                    }
+                }
+                if ([string]::IsNullOrWhiteSpace($matched)) {
+                    throw "${Context}: Bitwarden item '$($bwSpec.Item)' has no non-empty custom field '$($bwSpec.FieldName)' for '$Uri'."
+                }
+                return $matched.Trim()
+            }
+            $itemType = Get-ObjectProperty -Object $itemObj -Name 'type' -Default $null
+            $notesVal = [string](Get-ObjectProperty -Object $itemObj -Name 'notes' -Default '')
+            if ($itemType -eq 2) {
+                if ([string]::IsNullOrWhiteSpace($notesVal)) {
+                    throw "${Context}: Bitwarden Secure Note '$($bwSpec.Item)' has empty notes for '$Uri'."
+                }
+                return $notesVal.Trim()
+            }
+            if ($itemType -eq 1) {
+                $loginObj = Get-ObjectProperty -Object $itemObj -Name 'login' -Default $null
+                $pwVal = if ($null -ne $loginObj) { [string](Get-ObjectProperty -Object $loginObj -Name 'password' -Default '') } else { '' }
+                if (-not [string]::IsNullOrWhiteSpace($pwVal)) {
+                    return $pwVal.Trim()
+                }
+                if (-not [string]::IsNullOrWhiteSpace($notesVal)) {
+                    return $notesVal.Trim()
+                }
+                throw "${Context}: Bitwarden Login '$($bwSpec.Item)' has empty password and notes for '$Uri'."
+            }
+            if (-not [string]::IsNullOrWhiteSpace($notesVal)) {
+                return $notesVal.Trim()
+            }
+            throw "${Context}: Bitwarden item '$($bwSpec.Item)' (type '$itemType') has no password or notes for '$Uri'."
         }
         'dpapi' {
             if (-not ('System.Security.Cryptography.ProtectedData' -as [type])) {
@@ -799,14 +901,20 @@ function Build-SeedSecretsPayload {
         [int]$AgentUid = 26040,
         [string[]]$Services = @(),
         [switch]$Prune,
-        [string]$Ttl = ''
+        [string]$Ttl = '',
+        [string]$ProfileName = ''
     )
 
     $proxyPorts = Get-DeterministicProxyPorts -Uid $AgentUid
     $credProxyBase = "http://127.0.0.1:$($proxyPorts.CredentialPort)"
 
     if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
-        throw "Secrets manifest not found at '$ManifestPath'. Create it from 'examples\secrets.example.json' (default path: %USERPROFILE%\.wsl-agent-sandbox\secrets.json) or pass -SecretsPath."
+        $defaultHint = if (-not [string]::IsNullOrWhiteSpace($ProfileName)) {
+            "%USERPROFILE%\.wsl-agent-sandbox\secrets.$($ProfileName.Trim()).json"
+        } else {
+            '%USERPROFILE%\.wsl-agent-sandbox\secrets.json'
+        }
+        throw "Secrets manifest not found at '$ManifestPath'. Create it from 'examples\secrets.example.json' (default path: $defaultHint) or pass -SecretsPath."
     }
     $ttlSeconds = 0
     if (-not [string]::IsNullOrWhiteSpace($Ttl)) {
@@ -1760,19 +1868,18 @@ function Build-SeedSecretsPayload {
                 if ([string]::IsNullOrWhiteSpace($tenantId)) {
                     throw "azure.tenantId is required."
                 }
-                $certFile = [string](Get-ObjectProperty -Object $entry -Name 'certificateFile' -Default '')
-                $hasCert = -not [string]::IsNullOrWhiteSpace($certFile)
+                $certPem = Resolve-SecretValue -Object $entry -BaseName 'certificate' -BaseDir $baseDir -Context 'azure'
+                $hasCert = -not [string]::IsNullOrWhiteSpace($certPem)
+                if ($hasCert) {
+                    $certPem = ($certPem -replace "`r`n", "`n")
+                }
                 $clientSecret = Resolve-SecretValue -Object $entry -BaseName 'clientSecret' -BaseDir $baseDir -Context 'azure'
                 $hasSecret = -not [string]::IsNullOrWhiteSpace($clientSecret)
                 if ($hasCert -and $hasSecret) {
-                    throw "azure: specify either clientSecret* or certificateFile, not both."
+                    throw "azure: specify either clientSecret* or certificate*, not both."
                 }
                 if (-not $hasCert -and -not $hasSecret) {
-                    throw "azure: missing required clientSecret/clientSecretFile/clientSecretEnv or certificateFile."
-                }
-                $certPem = ''
-                if ($hasCert) {
-                    $certPem = Resolve-SecretFileContent -RawPath $certFile -BaseDir $baseDir -Context 'azure.certificateFile'
+                    throw "azure: missing required clientSecret* or certificate*."
                 }
                 $subscription = [string](Get-ObjectProperty -Object $entry -Name 'subscription' -Default '')
                 $allowNoSubs = [bool](Get-ObjectProperty -Object $entry -Name 'allowNoSubscriptions' -Default $false)
@@ -1896,36 +2003,47 @@ function Build-SeedSecretsPayload {
             }
 
             'kubectl' {
-                $kcFile = [string](Get-ObjectProperty -Object $entry -Name 'kubeconfigFile' -Default '')
+                $kcContent = Resolve-SecretValue -Object $entry -BaseName 'kubeconfig' -BaseDir $baseDir -Context 'kubectl'
                 $server = [string](Get-ObjectProperty -Object $entry -Name 'server' -Default '')
-                $hasKc = -not [string]::IsNullOrWhiteSpace($kcFile)
+                $hasKc = -not [string]::IsNullOrWhiteSpace($kcContent)
                 $hasServer = -not [string]::IsNullOrWhiteSpace($server)
                 if ($hasKc -and $hasServer) {
-                    throw "kubectl: specify either 'kubeconfigFile' or 'server'+token, not both."
+                    throw "kubectl: specify either 'kubeconfig*' or 'server'+token, not both."
                 }
                 if (-not $hasKc -and -not $hasServer) {
-                    throw "kubectl: specify either 'kubeconfigFile' or 'server' + token*."
+                    throw "kubectl: specify either 'kubeconfig*' or 'server' + token*."
                 }
                 $context = [string](Get-ObjectProperty -Object $entry -Name 'context' -Default '')
                 if ($hasKc) {
-                    $kcContent = Resolve-SecretFileContent -RawPath $kcFile -BaseDir $baseDir -Context 'kubectl.kubeconfigFile'
+                    $kcContent = ($kcContent -replace "`r`n", "`n")
                     $resolvedServices['kubectl'] = [ordered]@{
                         mode              = 'file'
                         kubeconfigContent = $kcContent
                         context           = $context
                     }
-                    $summary.Add("kubectl (mode=kubeconfigFile)")
+                    $summary.Add("kubectl (mode=kubeconfig)")
                 } else {
                     Assert-ValidHttpUrl -Url $server -Context 'kubectl.server'
                     $token = Resolve-SecretValue -Object $entry -BaseName 'token' -BaseDir $baseDir -Context 'kubectl' -Required
-                    $caCertFile = [string](Get-ObjectProperty -Object $entry -Name 'caCertFile' -Default '')
                     $caCertData = [string](Get-ObjectProperty -Object $entry -Name 'caCertData' -Default '')
-                    if (-not [string]::IsNullOrWhiteSpace($caCertFile) -and -not [string]::IsNullOrWhiteSpace($caCertData)) {
-                        throw "kubectl: specify either caCertFile or caCertData, not both."
+                    $caCertFile = [string](Get-ObjectProperty -Object $entry -Name 'caCertFile' -Default '')
+                    $caCertEnv = [string](Get-ObjectProperty -Object $entry -Name 'caCertEnv' -Default '')
+                    $caCertVault = [string](Get-ObjectProperty -Object $entry -Name 'caCertVault' -Default '')
+                    $hasCaData = -not [string]::IsNullOrWhiteSpace($caCertData)
+                    $hasCaFile = -not [string]::IsNullOrWhiteSpace($caCertFile)
+                    $hasCaEnv = -not [string]::IsNullOrWhiteSpace($caCertEnv)
+                    $hasCaVault = -not [string]::IsNullOrWhiteSpace($caCertVault)
+                    $caSourceCount = @($hasCaData, $hasCaFile, $hasCaEnv, $hasCaVault | Where-Object { $_ }).Count
+                    if ($caSourceCount -gt 1) {
+                        throw "kubectl: specify only one of 'caCertData', 'caCertFile', 'caCertEnv', or 'caCertVault'."
                     }
-                    if (-not [string]::IsNullOrWhiteSpace($caCertFile)) {
+                    if ($hasCaFile) {
                         $caBytes = Resolve-SecretFileContent -RawPath $caCertFile -BaseDir $baseDir -Context 'kubectl.caCertFile' -AsBytes
                         $caCertData = [Convert]::ToBase64String($caBytes)
+                    } elseif ($hasCaEnv -or $hasCaVault) {
+                        $caPem = Resolve-SecretValue -Object $entry -BaseName 'caCert' -BaseDir $baseDir -Context 'kubectl'
+                        $caPem = ($caPem -replace "`r`n", "`n")
+                        $caCertData = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($caPem))
                     }
                     $resolvedServices['kubectl'] = [ordered]@{
                         mode                  = 'token'
@@ -2328,7 +2446,15 @@ function Build-SeedSecretsPayload {
 
             'env' {
                 $envMap = [ordered]@{}
+                $envTtlSeconds = [int64]0
                 foreach ($varName in (Get-ObjectPropertyNames -Object $entry)) {
+                    if ($varName -eq '$ttl') {
+                        $rawEnvTtl = [string](Get-ObjectProperty -Object $entry -Name '$ttl' -Default '')
+                        if (-not [string]::IsNullOrWhiteSpace($rawEnvTtl)) {
+                            $envTtlSeconds = ConvertTo-TtlSeconds -Ttl $rawEnvTtl
+                        }
+                        continue
+                    }
                     if ($varName -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') {
                         throw "env: invalid environment variable name '$varName'."
                     }
@@ -2356,6 +2482,7 @@ function Build-SeedSecretsPayload {
             'files' {
                 $filesOut = New-Object System.Collections.Generic.List[object]
                 $seenNames = @{}
+                $filesMinTtlSeconds = [int64]0
                 foreach ($f in @($entry)) {
                     if ($null -eq $f) { continue }
                     $fEnabled = [bool](Get-ObjectProperty -Object $f -Name 'enabled' -Default $true)
@@ -2369,13 +2496,39 @@ function Build-SeedSecretsPayload {
                     }
                     $seenNames[$fName.ToLowerInvariant()] = $true
                     $src = [string](Get-ObjectProperty -Object $f -Name 'sourcePath' -Default '')
+                    $hasSrc = -not [string]::IsNullOrWhiteSpace($src)
+                    $hasContent = (Test-ObjectHasProperty -Object $f -Name 'content') -and -not [string]::IsNullOrEmpty([string](Get-ObjectProperty -Object $f -Name 'content' -Default ''))
+                    $hasContentEnv = (Test-ObjectHasProperty -Object $f -Name 'contentEnv') -and -not [string]::IsNullOrWhiteSpace([string](Get-ObjectProperty -Object $f -Name 'contentEnv' -Default ''))
+                    $hasContentVault = (Test-ObjectHasProperty -Object $f -Name 'contentVault') -and -not [string]::IsNullOrWhiteSpace([string](Get-ObjectProperty -Object $f -Name 'contentVault' -Default ''))
+                    $srcCount = @($hasSrc, $hasContent, $hasContentEnv, $hasContentVault | Where-Object { $_ }).Count
+                    if ($srcCount -gt 1) {
+                        throw "files[$fName]: specify only one of 'sourcePath', 'content', 'contentEnv', or 'contentVault'."
+                    }
+                    if ($srcCount -eq 0) {
+                        throw "files[$fName]: missing required file content ('sourcePath', 'content', 'contentEnv', or 'contentVault')."
+                    }
                     $dst = [string](Get-ObjectProperty -Object $f -Name 'targetPath' -Default '')
                     $mode = [string](Get-ObjectProperty -Object $f -Name 'mode' -Default '0600')
                     if ($mode -notmatch '^0?[0-7]{3}$') {
                         throw "files[$fName].mode '$mode' must be a 3- or 4-digit octal permission (e.g. '0600')."
                     }
                     $safeTarget = Assert-SafeAgentTargetPath -TargetPath $dst -AgentName $AgentName -Context "files[$fName]"
-                    $bytes = Resolve-SecretFileContent -RawPath $src -BaseDir $baseDir -Context "files[$fName].sourcePath" -AsBytes
+                    if ($hasSrc) {
+                        $bytes = Resolve-SecretFileContent -RawPath $src -BaseDir $baseDir -Context "files[$fName].sourcePath" -AsBytes
+                    } else {
+                        $resolvedText = Resolve-SecretValue -Object $f -BaseName 'content' -BaseDir $baseDir -Context "files[$fName]" -Required
+                        $resolvedText = ($resolvedText -replace "`r`n", "`n")
+                        $bytes = [System.Text.Encoding]::UTF8.GetBytes($resolvedText)
+                    }
+                    if (Test-ObjectHasProperty -Object $f -Name 'ttl') {
+                        $rawFileTtl = [string](Get-ObjectProperty -Object $f -Name 'ttl' -Default '')
+                        if (-not [string]::IsNullOrWhiteSpace($rawFileTtl)) {
+                            $fTtlSec = ConvertTo-TtlSeconds -Ttl $rawFileTtl
+                            if ($filesMinTtlSeconds -eq 0 -or $fTtlSec -lt $filesMinTtlSeconds) {
+                                $filesMinTtlSeconds = $fTtlSec
+                            }
+                        }
+                    }
                     $filesOut.Add([ordered]@{
                         name          = $fName
                         targetPath    = $safeTarget
@@ -2405,6 +2558,10 @@ function Build-SeedSecretsPayload {
             $effSvcTtl = [int64]0
             if ($ttlSeconds -gt 0) {
                 $effSvcTtl = $ttlSeconds
+            } elseif ($svcName -eq 'env' -and $envTtlSeconds -gt 0) {
+                $effSvcTtl = $envTtlSeconds
+            } elseif ($svcName -eq 'files' -and $filesMinTtlSeconds -gt 0) {
+                $effSvcTtl = $filesMinTtlSeconds
             } elseif ($svcName -notin @('env', 'files') -and (Test-ObjectHasProperty -Object $entry -Name 'ttl')) {
                 $rawSvcTtl = [string](Get-ObjectProperty -Object $entry -Name 'ttl' -Default '')
                 if (-not [string]::IsNullOrWhiteSpace($rawSvcTtl)) {
