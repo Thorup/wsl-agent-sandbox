@@ -1147,3 +1147,438 @@ func TestLegacyBuildWithForceInternalNetwork(t *testing.T) {
 		t.Fatalf("expected POST /build with networkmode=none to be allowed, got %v", err)
 	}
 }
+
+func TestBlockedVolumesFromCgroupParentOomKillDisable(t *testing.T) {
+	pol := &Policy{Enabled: true}
+	cases := []struct {
+		name string
+		path string
+		body map[string]any
+	}{
+		{
+			name: "VolumesFrom",
+			path: "/containers/create",
+			body: map[string]any{
+				"Image":      "alpine",
+				"HostConfig": map[string]any{"VolumesFrom": []string{"other"}},
+			},
+		},
+		{
+			name: "CgroupParent",
+			path: "/containers/create",
+			body: map[string]any{
+				"Image":      "alpine",
+				"HostConfig": map[string]any{"CgroupParent": "/custom"},
+			},
+		},
+		{
+			name: "OomKillDisable",
+			path: "/containers/create",
+			body: map[string]any{
+				"Image":      "alpine",
+				"HostConfig": map[string]any{"OomKillDisable": true},
+			},
+		},
+		{
+			name: "UpdateCgroupParent",
+			path: "/containers/c1/update",
+			body: map[string]any{"CgroupParent": "/custom"},
+		},
+	}
+	for _, tc := range cases {
+		raw, _ := json.Marshal(tc.body)
+		if _, _, err := pol.ProcessJSONBody(http.MethodPost, tc.path, raw); err == nil {
+			t.Fatalf("expected %s to be denied", tc.name)
+		}
+	}
+
+	// Verify HTTP 403 via PolicyProxy
+	tmp := t.TempDir()
+	upSock := filepath.Join(tmp, "up.sock")
+	ln, err := net.Listen("unix", upSock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})}
+	go func() { _ = srv.Serve(ln) }()
+	defer srv.Close()
+
+	pp := NewPolicyProxy(upSock, &Policy{Enabled: true}, log.New(io.Discard, "", 0))
+	defer pp.Close()
+	pxSock := filepath.Join(tmp, "px.sock")
+	pxLn, err := net.Listen("unix", pxSock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pxSrv := &http.Server{Handler: pp}
+	go func() { _ = pxSrv.Serve(pxLn) }()
+	defer pxSrv.Close()
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return net.Dial("unix", pxSock)
+			},
+		},
+	}
+	for _, tc := range cases {
+		raw, _ := json.Marshal(tc.body)
+		resp, err := client.Post("http://docker"+tc.path, "application/json", bytes.NewReader(raw))
+		if err != nil {
+			t.Fatalf("%s request failed: %v", tc.name, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("expected HTTP 403 for %s, got %d", tc.name, resp.StatusCode)
+		}
+	}
+}
+
+func TestCrossTenantLabelIsolation(t *testing.T) {
+	tmp := t.TempDir()
+	upSock := filepath.Join(tmp, "upstream.sock")
+	pxSock := filepath.Join(tmp, "proxy.sock")
+
+	const distro = "wsl-agent-sandbox"
+
+	var mu sync.Mutex
+	volumes := map[string]map[string]string{
+		"host_vol":    {},
+		"sandbox_vol": {sandboxDistroLabel: distro},
+	}
+	networks := map[string]map[string]string{
+		"host_net":    {},
+		"sandbox_net": {sandboxDistroLabel: distro},
+	}
+	var lastContainerCreateLabels map[string]any
+	var lastVolumeCreateLabels map[string]any
+	var lastNetworkCreateLabels map[string]any
+	recordedFilters := map[string]string{}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/containers/create", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		if lbls, ok := body["Labels"].(map[string]any); ok {
+			lastContainerCreateLabels = lbls
+		}
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"Id":"sandbox_c"}`))
+	})
+	mux.HandleFunc("/containers/json", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		recordedFilters["/containers/json"] = r.URL.Query().Get("filters")
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"Id":"sandbox_c"}]`))
+	})
+	mux.HandleFunc("/containers/prune", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		recordedFilters["/containers/prune"] = r.URL.Query().Get("filters")
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ContainersDeleted":[]}`))
+	})
+	mux.HandleFunc("/containers/host_c/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/containers/host_c/json" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"Id":"host_c","Config":{"Labels":{}}}`))
+			return
+		}
+		t.Errorf("unexpected upstream call to host_c: %s %s", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/containers/host_c", func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected upstream DELETE/call to host_c: %s %s", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/containers/sandbox_c/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/containers/sandbox_c/json":
+			_, _ = w.Write([]byte(`{"Id":"sandbox_c","Config":{"Labels":{"com.wsl-agent-sandbox.distro":"wsl-agent-sandbox"}}}`))
+		case "/containers/sandbox_c/exec":
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"Id":"exec_sandbox_1"}`))
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	})
+	mux.HandleFunc("/containers/sandbox_c", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("/commit", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"Id":"sha256:abc"}`))
+	})
+	mux.HandleFunc("/exec/", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/volumes/create", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Name   string            `json:"Name"`
+			Labels map[string]string `json:"Labels"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		lastVolumeCreateLabels = map[string]any{}
+		for k, v := range body.Labels {
+			lastVolumeCreateLabels[k] = v
+		}
+		if body.Name != "" {
+			volumes[body.Name] = body.Labels
+		}
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"Name":"` + body.Name + `"}`))
+	})
+	mux.HandleFunc("/volumes/prune", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		recordedFilters["/volumes/prune"] = r.URL.Query().Get("filters")
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	})
+	mux.HandleFunc("/volumes/", func(w http.ResponseWriter, r *http.Request) {
+		volName := strings.TrimPrefix(r.URL.Path, "/volumes/")
+		mu.Lock()
+		lbls, exists := volumes[volName]
+		mu.Unlock()
+		if !exists {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"Name": volName, "Labels": lbls})
+	})
+	mux.HandleFunc("/volumes", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		recordedFilters["/volumes"] = r.URL.Query().Get("filters")
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"Volumes":[]}`))
+	})
+	mux.HandleFunc("/networks/create", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		if lbls, ok := body["Labels"].(map[string]any); ok {
+			lastNetworkCreateLabels = lbls
+		}
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"Id":"sandbox_net"}`))
+	})
+	mux.HandleFunc("/networks/prune", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		recordedFilters["/networks/prune"] = r.URL.Query().Get("filters")
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	})
+	mux.HandleFunc("/networks/", func(w http.ResponseWriter, r *http.Request) {
+		rest := strings.TrimPrefix(r.URL.Path, "/networks/")
+		netName, _, _ := strings.Cut(rest, "/")
+		mu.Lock()
+		lbls, exists := networks[netName]
+		mu.Unlock()
+		if !exists {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"Name": netName, "Labels": lbls})
+	})
+	mux.HandleFunc("/networks", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		recordedFilters["/networks"] = r.URL.Query().Get("filters")
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[]`))
+	})
+	mux.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		recordedFilters["/events"] = r.URL.Query().Get("filters")
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	})
+
+	upLn, err := net.Listen("unix", upSock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upSrv := &http.Server{Handler: mux}
+	go func() { _ = upSrv.Serve(upLn) }()
+	defer upSrv.Close()
+
+	pol := &Policy{
+		Enabled:    true,
+		DistroName: distro,
+	}
+	pp := NewPolicyProxy(upSock, pol, log.New(io.Discard, "", 0))
+	defer pp.Close()
+
+	pxLn, err := net.Listen("unix", pxSock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pxSrv := &http.Server{Handler: pp}
+	go func() { _ = pxSrv.Serve(pxLn) }()
+	defer pxSrv.Close()
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return net.Dial("unix", pxSock)
+			},
+		},
+	}
+
+	doReq := func(method, path string, body string) int {
+		var rdr io.Reader
+		if body != "" {
+			rdr = strings.NewReader(body)
+		}
+		req, err := http.NewRequest(method, "http://docker"+path, rdr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s failed: %v", method, path, err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	// 1. Creation endpoints inject and overwrite spoofed sandbox distro label.
+	if code := doReq(http.MethodPost, "/containers/create", `{"Image":"alpine","Labels":{"com.wsl-agent-sandbox.distro":"evil","foo":"bar"}}`); code != http.StatusCreated {
+		t.Fatalf("expected 201 on container create, got %d", code)
+	}
+	if lastContainerCreateLabels[sandboxDistroLabel] != distro || lastContainerCreateLabels["foo"] != "bar" {
+		t.Fatalf("expected injected container label, got %#v", lastContainerCreateLabels)
+	}
+	if code := doReq(http.MethodPost, "/volumes/create", ``); code != http.StatusCreated {
+		t.Fatalf("expected 201 on empty-body volume create, got %d", code)
+	}
+	if lastVolumeCreateLabels[sandboxDistroLabel] != distro {
+		t.Fatalf("expected injected volume label, got %#v", lastVolumeCreateLabels)
+	}
+	if code := doReq(http.MethodPost, "/networks/create", `{"Name":"sandbox_net","Labels":{"com.wsl-agent-sandbox.distro":"spoof"}}`); code != http.StatusCreated {
+		t.Fatalf("expected 201 on network create (ForceInternalNetwork=false), got %d", code)
+	}
+	if lastNetworkCreateLabels[sandboxDistroLabel] != distro {
+		t.Fatalf("expected injected network label, got %#v", lastNetworkCreateLabels)
+	}
+
+	// 2. Host container operations must return 403; sandbox container operations succeed.
+	for _, tc := range []struct {
+		method string
+		path   string
+		body   string
+	}{
+		{http.MethodGet, "/containers/host_c/json", ""},
+		{http.MethodPost, "/containers/host_c/exec", `{"Cmd":["sh"]}`},
+		{http.MethodGet, "/containers/host_c/archive?path=/etc/passwd", ""},
+		{http.MethodDelete, "/containers/host_c", ""},
+		{http.MethodPost, "/commit?container=host_c", ""},
+	} {
+		if code := doReq(tc.method, tc.path, tc.body); code != http.StatusForbidden {
+			t.Fatalf("expected 403 for %s %s, got %d", tc.method, tc.path, code)
+		}
+	}
+
+	if code := doReq(http.MethodGet, "/containers/sandbox_c/json", ""); code != http.StatusOK {
+		t.Fatalf("expected 200 for sandbox_c inspect, got %d", code)
+	}
+	if code := doReq(http.MethodGet, "/containers/sandbox_c/archive?path=/tmp", ""); code != http.StatusOK {
+		t.Fatalf("expected 200 for sandbox_c archive, got %d", code)
+	}
+	if code := doReq(http.MethodPost, "/commit?container=sandbox_c", ""); code != http.StatusCreated {
+		t.Fatalf("expected 201 for sandbox_c commit, got %d", code)
+	}
+	if code := doReq(http.MethodDelete, "/containers/sandbox_c", ""); code != http.StatusNoContent {
+		t.Fatalf("expected 204 for sandbox_c delete, got %d", code)
+	}
+
+	// 3. Untracked exec IDs return 403; exec IDs created on sandbox_c succeed.
+	if code := doReq(http.MethodPost, "/exec/untracked_exec_id/start", `{}`); code != http.StatusForbidden {
+		t.Fatalf("expected 403 for untracked exec start, got %d", code)
+	}
+	if code := doReq(http.MethodPost, "/containers/sandbox_c/exec", `{"Cmd":["id"]}`); code != http.StatusCreated {
+		t.Fatalf("expected 201 for sandbox_c exec create, got %d", code)
+	}
+	if code := doReq(http.MethodPost, "/exec/exec_sandbox_1/start", `{}`); code != http.StatusOK {
+		t.Fatalf("expected 200 for tracked exec start, got %d", code)
+	}
+
+	// 4. List/prune/events endpoints receive injected label filter.
+	for _, ep := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/containers/json"},
+		{http.MethodPost, "/containers/prune"},
+		{http.MethodGet, "/volumes"},
+		{http.MethodPost, "/volumes/prune"},
+		{http.MethodGet, "/networks"},
+		{http.MethodPost, "/networks/prune"},
+		{http.MethodGet, "/events"},
+	} {
+		if code := doReq(ep.method, ep.path, ""); code != http.StatusOK {
+			t.Fatalf("expected 200 for %s %s, got %d", ep.method, ep.path, code)
+		}
+		got := recordedFilters[ep.path]
+		if !strings.Contains(got, sandboxDistroLabel+"="+distro) {
+			t.Fatalf("expected label filter on %s, got %q", ep.path, got)
+		}
+	}
+
+	// 5. Volume ownership: host_vol denied (403), sandbox_vol and new implicit volume allowed.
+	if code := doReq(http.MethodPost, "/containers/create", `{"Image":"alpine","HostConfig":{"Binds":["host_vol:/data"]}}`); code != http.StatusForbidden {
+		t.Fatalf("expected 403 when mounting host_vol via Binds, got %d", code)
+	}
+	if code := doReq(http.MethodPost, "/containers/create", `{"Image":"alpine","HostConfig":{"Mounts":[{"Type":"volume","Source":"host_vol","Target":"/data"}]}}`); code != http.StatusForbidden {
+		t.Fatalf("expected 403 when mounting host_vol via Mounts, got %d", code)
+	}
+	if code := doReq(http.MethodGet, "/volumes/host_vol", ""); code != http.StatusForbidden {
+		t.Fatalf("expected 403 on GET /volumes/host_vol, got %d", code)
+	}
+	if code := doReq(http.MethodGet, "/volumes/sandbox_vol", ""); code != http.StatusOK {
+		t.Fatalf("expected 200 on GET /volumes/sandbox_vol, got %d", code)
+	}
+	if code := doReq(http.MethodPost, "/containers/create", `{"Image":"alpine","HostConfig":{"Binds":["sandbox_vol:/data"]}}`); code != http.StatusCreated {
+		t.Fatalf("expected 201 when mounting sandbox_vol, got %d", code)
+	}
+	if code := doReq(http.MethodPost, "/containers/create", `{"Image":"alpine","HostConfig":{"Binds":["new_implicit_vol:/data"]}}`); code != http.StatusCreated {
+		t.Fatalf("expected 201 when mounting new implicit named volume, got %d", code)
+	}
+	mu.Lock()
+	implicitLbls := volumes["new_implicit_vol"]
+	mu.Unlock()
+	if implicitLbls[sandboxDistroLabel] != distro {
+		t.Fatalf("expected new_implicit_vol to be pre-created with sandbox label, got %#v", implicitLbls)
+	}
+
+	// 6. Network ownership: host_net denied (403), sandbox_net allowed.
+	if code := doReq(http.MethodGet, "/networks/host_net", ""); code != http.StatusForbidden {
+		t.Fatalf("expected 403 on GET /networks/host_net, got %d", code)
+	}
+	if code := doReq(http.MethodPost, "/networks/host_net/connect", `{"Container":"sandbox_c"}`); code != http.StatusForbidden {
+		t.Fatalf("expected 403 on POST /networks/host_net/connect, got %d", code)
+	}
+	if code := doReq(http.MethodGet, "/networks/sandbox_net", ""); code != http.StatusOK {
+		t.Fatalf("expected 200 on GET /networks/sandbox_net, got %d", code)
+	}
+}
