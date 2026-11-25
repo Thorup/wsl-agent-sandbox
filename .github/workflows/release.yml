@@ -30,6 +30,8 @@ jobs:
       - name: Render Scoop manifest
         env:
           TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          SERVER_URL: ${{ github.server_url }}
         run: |
           python3 - <<'PYEOF'
           import json
@@ -37,6 +39,8 @@ jobs:
           from pathlib import Path
 
           tag = os.environ["TAG"]
+          repo = os.environ["REPO"]
+          server_url = os.environ["SERVER_URL"].rstrip("/")
           version = tag[1:] if tag.startswith("v") else tag
           pkg_name = f"wsl-agent-sandbox-{tag}"
           sha_line = Path("dist/SHA256SUMS.txt").read_text(encoding="utf-8").strip().splitlines()[0]
@@ -44,7 +48,7 @@ jobs:
 
           manifest = json.loads(Path("packaging/scoop/wsl-agent-sandbox.json").read_text(encoding="utf-8"))
           manifest["version"] = version
-          manifest["url"] = f"https://github.com/Thorup/wsl-agent-sandbox/releases/download/{tag}/{pkg_name}.zip"
+          manifest["url"] = f"{server_url}/{repo}/releases/download/{tag}/{pkg_name}.zip"
           manifest["extract_dir"] = pkg_name
           manifest["hash"] = zip_sha256
 
