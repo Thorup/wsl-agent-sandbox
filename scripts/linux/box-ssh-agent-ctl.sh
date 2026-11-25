@@ -10,13 +10,30 @@ SSH_AGENT_ALLOWLIST_FILE="${SSH_AGENT_ALLOWLIST_FILE:-/etc/wsl-agent-sandbox/ssh
 SSH_AGENT_DIR="${SSH_AGENT_DIR:-/run/box-root/ssh-agent}"
 SSH_AGENT_UPSTREAM_SOCK="${SSH_AGENT_UPSTREAM_SOCK:-${SSH_AGENT_DIR}/upstream.sock}"
 
-ensure_upstream() {
-  if [[ ! -f "${SSH_AGENT_KEYS_FILE}" ]]; then
+count_allowlist_blobs() {
+  if [[ ! -f "${SSH_AGENT_ALLOWLIST_FILE}" ]]; then
+    echo 0
     return 0
   fi
+  python3 - "${SSH_AGENT_ALLOWLIST_FILE}" <<'PYEOF'
+import json, sys
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as f:
+        data = json.load(f)
+    blobs = data.get("allowedKeyBlobsHex", []) if isinstance(data, dict) else []
+    print(len(blobs) if isinstance(blobs, list) else 0)
+except Exception:
+    print(0)
+PYEOF
+}
 
-  local key_count
-  key_count="$(python3 - "${SSH_AGENT_KEYS_FILE}" <<'PYEOF'
+ensure_upstream() {
+  local allowlist_count
+  allowlist_count="$(count_allowlist_blobs)"
+
+  local key_count=0
+  if [[ -f "${SSH_AGENT_KEYS_FILE}" ]]; then
+    key_count="$(python3 - "${SSH_AGENT_KEYS_FILE}" <<'PYEOF'
 import json, sys
 try:
     with open(sys.argv[1], "r", encoding="utf-8") as f:
@@ -34,7 +51,13 @@ except Exception:
     print(0)
 PYEOF
 )"
+  fi
+
   if [[ "${key_count}" -eq 0 ]]; then
+    if [[ "${allowlist_count}" -gt 0 ]]; then
+      printf '%s\n' "ERROR: ${SSH_AGENT_ALLOWLIST_FILE} has ${allowlist_count} allowed key(s), but ${SSH_AGENT_KEYS_FILE} is missing or has no keys. Run '.\\box.ps1 seed-secrets' to re-seed SSH agent keys." >&2
+      return 1
+    fi
     return 0
   fi
 

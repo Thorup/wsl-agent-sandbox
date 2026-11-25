@@ -879,7 +879,7 @@ function Invoke-Doctor {
         if ($sshState -eq 'active') {
             Write-Host "  [PASS] ssh-agent-proxy.service is active"
         } elseif ($sshState -ne 'NOT_CONFIGURED') {
-            Write-Host "  [FAIL] ssh-agent-proxy.service is $sshState (run '.\box.ps1 apply')"
+            Write-Host "  [FAIL] ssh-agent-proxy.service is $sshState (run '.\box.ps1 seed-secrets')"
             $hasFail = $true
         }
     } else {

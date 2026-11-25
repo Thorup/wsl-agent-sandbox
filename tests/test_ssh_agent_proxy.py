@@ -259,6 +259,31 @@ class SshAgentProxyTests(unittest.TestCase):
             subprocess.run(["pkill", "-f", os.path.join(tmpdir, "box-root", "ssh-agent", "upstream.sock")], check=False)
             shutil.rmtree(tmpdir, ignore_errors=True)
 
+    def test_ctl_ensure_upstream_fails_when_allowlist_has_blobs_but_keys_missing(self):
+        tmpdir = tempfile.mkdtemp(prefix="ssh-proxy-ctl-missing-")
+        try:
+            keys_file = os.path.join(tmpdir, "ssh-agent-keys.json")
+            allowlist_file = os.path.join(tmpdir, "ssh-agent-allowlist.json")
+            agent_dir = os.path.join(tmpdir, "box-root", "ssh-agent")
+            upstream_sock = os.path.join(agent_dir, "upstream.sock")
+
+            with open(allowlist_file, "w", encoding="utf-8") as f:
+                json.dump({"allowedKeyBlobsHex": ["deadbeef"]}, f)
+
+            env = dict(
+                os.environ,
+                SSH_AGENT_KEYS_FILE=keys_file,
+                SSH_AGENT_ALLOWLIST_FILE=allowlist_file,
+                SSH_AGENT_DIR=agent_dir,
+                SSH_AGENT_UPSTREAM_SOCK=upstream_sock,
+            )
+
+            proc = subprocess.run(["bash", str(CTL_SCRIPT_PATH), "ensure-upstream"], env=env, capture_output=True, text=True)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("seed-secrets", proc.stderr)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()
