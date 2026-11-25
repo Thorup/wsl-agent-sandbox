@@ -198,6 +198,39 @@ class TestRepoContracts(unittest.TestCase):
             self.assertIn('export PNPM_HOME="$HOME/.local/share/pnpm"', provision_content, "provision.sh missing PNPM_HOME")
             self.assertIn('if [ "$(id -u)" -ne 0 ]; then', provision_content, "provision.sh must scope NPM_CONFIG_PREFIX/PNPM_HOME to non-root")
 
+    def test_hardening_and_audit_contracts(self):
+        with open(os.path.join(REPO_ROOT, "scripts", "linux", "box-hardening.sh"), encoding="utf-8") as f:
+            hardening_sh = f.read()
+        with open(os.path.join(REPO_ROOT, "scripts", "linux", "provision.sh"), encoding="utf-8") as f:
+            provision_sh = f.read()
+        with open(os.path.join(REPO_ROOT, "box.ps1"), encoding="utf-8") as f:
+            box_ps1 = f.read()
+
+        # allowlist mode must use drop_action (so log_and_drop is used when logDrops=true)
+        allowlist_match = re.search(
+            r'if egress_mode == "allowlist"(?:\s+and\s+not\s+maintenance_egress_open)?:\s*\n(?:[^\n]*#[^\n]*\n)*\s*lines\.append\(([^)]+)\)',
+            hardening_sh,
+        )
+        self.assertIsNotNone(allowlist_match, "Could not locate egress_mode == 'allowlist' drop rule in box-hardening.sh")
+        self.assertIn("drop_action", allowlist_match.group(1))
+
+        # Both box-hardening.sh and provision.sh must enforce dpkg-statoverride for sudo/sudo-rs
+        for name, content in (("box-hardening.sh", hardening_sh), ("provision.sh", provision_sh)):
+            self.assertIn("dpkg-statoverride", content, f"{name} missing dpkg-statoverride sudo hardening")
+            self.assertIn("/usr/lib/cargo/bin/sudo", content, f"{name} missing sudo-rs path in sudo hardening")
+
+        # Invoke-AuditLogs must cover all root security daemons and TTL units
+        audit_match = re.search(r"function Invoke-AuditLogs\s*\{(.*?)\n\}", box_ps1, re.DOTALL)
+        self.assertIsNotNone(audit_match, "Could not locate Invoke-AuditLogs in box.ps1")
+        audit_body = audit_match.group(1)
+        for unit in (
+            "egress-proxy.service",
+            "credential-proxy.service",
+            "ssh-agent-proxy.service",
+            "wsl-box-ttl-*.service",
+        ):
+            self.assertIn(unit, audit_body, f"Invoke-AuditLogs missing {unit}")
+
 
 if __name__ == "__main__":
     unittest.main()

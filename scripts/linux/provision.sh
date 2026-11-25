@@ -138,6 +138,48 @@ if [[ -x /usr/local/sbin/box-sync-context.py ]]; then
   /usr/local/sbin/box-sync-context.py
 fi
 
+enforce_sudo_hardening() {
+  local -A seen=()
+  local -a targets=()
+  local candidate resolved
+
+  if [[ -L /usr/bin/sudo ]]; then
+    dpkg-statoverride --remove /usr/bin/sudo >/dev/null 2>&1 || true
+  fi
+
+  for candidate in \
+    "$(readlink -f /usr/bin/sudo 2>/dev/null || true)" \
+    /usr/bin/sudo \
+    /usr/bin/sudo.ws \
+    /usr/lib/cargo/bin/sudo \
+    $(update-alternatives --list sudo 2>/dev/null || true)
+  do
+    [[ -n "${candidate}" && -e "${candidate}" ]] || continue
+    resolved="$(readlink -f "${candidate}" 2>/dev/null || printf '%s' "${candidate}")"
+    if [[ -f "${resolved}" && ! -L "${resolved}" && -z "${seen[${resolved}]:-}" ]]; then
+      seen["${resolved}"]=1
+      targets+=("${resolved}")
+    fi
+  done
+
+  local desired current target
+  for target in "${targets[@]}"; do
+    desired="root sudo 750 ${target}"
+    current="$(dpkg-statoverride --list "${target}" 2>/dev/null || true)"
+    if [[ "${current}" != "${desired}" ]]; then
+      if [[ -n "${current}" ]]; then
+        dpkg-statoverride --remove "${target}" >/dev/null 2>&1 || true
+      fi
+      dpkg-statoverride --update --add root sudo 0750 "${target}" >/dev/null 2>&1 || true
+    fi
+    chown root:sudo "${target}" 2>/dev/null || true
+    chmod 0750 "${target}" 2>/dev/null || true
+  done
+}
+
+# Re-enforce sudo/sudo-rs hardening after all apt-get and tool installations
+enforce_sudo_hardening
+
 # Enable systemd services (active after WSL restart with systemd=true)
 chmod 0755 /usr/local/sbin/box-hardening.sh
 chmod 0644 /etc/systemd/system/box-hardening.service /etc/systemd/system/docker-policy-proxy.service

@@ -197,3 +197,20 @@ function Get-GlobalWslConfigWarnings {
     }
     return $warnings
 }
+
+function Sync-HostIpsIfChanged {
+    param([Parameter(Mandatory)]$Config)
+    $distro = $Config.distroName
+    if (-not (Test-WslDistroExists -DistroName $distro)) {
+        return
+    }
+    $desired = ((Get-WindowsHostIPs) -join "`n") + "`n"
+    $current = (& wsl.exe -d $distro -u root -- sh -c "cat /etc/wsl-agent-sandbox/host_ips.txt 2>/dev/null || true" | Out-String)
+    $currentNorm = (($current -replace "`r`n", "`n") -replace "`r", "`n").TrimEnd("`n")
+    $desiredNorm = $desired.TrimEnd("`n")
+    if ($currentNorm -ne $desiredNorm) {
+        Write-Host "[sync] Windows host IPs changed; refreshing host_ips.txt and reloading box-hardening.sh..."
+        Copy-TextToWsl -DistroName $distro -Content $desired -RemotePath '/etc/wsl-agent-sandbox/host_ips.txt' -Mode '0600'
+        Invoke-WslRootBash -DistroName $distro -Script '/usr/local/sbin/box-hardening.sh && if grep -q -- "--render-env-only" /usr/local/sbin/box-apply-policy.sh 2>/dev/null; then /usr/local/sbin/box-apply-policy.sh --render-env-only; fi'
+    }
+}

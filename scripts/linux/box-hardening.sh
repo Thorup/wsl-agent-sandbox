@@ -97,6 +97,47 @@ for d in /mnt/[a-z]; do
 done
 fi
 
+enforce_sudo_hardening() {
+  local -A seen=()
+  local -a targets=()
+  local candidate resolved
+
+  if [[ -L /usr/bin/sudo ]]; then
+    dpkg-statoverride --remove /usr/bin/sudo >/dev/null 2>&1 || true
+  fi
+
+  for candidate in \
+    "$(readlink -f /usr/bin/sudo 2>/dev/null || true)" \
+    /usr/bin/sudo \
+    /usr/bin/sudo.ws \
+    /usr/lib/cargo/bin/sudo \
+    $(update-alternatives --list sudo 2>/dev/null || true)
+  do
+    [[ -n "${candidate}" && -e "${candidate}" ]] || continue
+    resolved="$(readlink -f "${candidate}" 2>/dev/null || printf '%s' "${candidate}")"
+    if [[ -f "${resolved}" && ! -L "${resolved}" && -z "${seen[${resolved}]:-}" ]]; then
+      seen["${resolved}"]=1
+      targets+=("${resolved}")
+    fi
+  done
+
+  local desired current target
+  for target in "${targets[@]}"; do
+    desired="root sudo 750 ${target}"
+    current="$(dpkg-statoverride --list "${target}" 2>/dev/null || true)"
+    if [[ "${current}" != "${desired}" ]]; then
+      if [[ -n "${current}" ]]; then
+        dpkg-statoverride --remove "${target}" >/dev/null 2>&1 || true
+      fi
+      dpkg-statoverride --update --add root sudo 0750 "${target}" >/dev/null 2>&1 || true
+    fi
+    chown root:sudo "${target}" 2>/dev/null || true
+    chmod 0750 "${target}" 2>/dev/null || true
+  done
+}
+
+enforce_sudo_hardening
+
 # 2. Parse policy.json with Python 3 to apply shared folders, Docker bind mirrors,
 #    docker-policy.json, and per-UID nftables rules atomically.
 BOX_DRY_RUN_NFT="${DRY_RUN_NFT}" python3 - "${POLICY_FILE}" "${HOST_IPS_FILE}" "${DOCKER_POLICY_FILE}" "${NFT_CONF_FILE}" "${PRIVATE_WSL_MNT}" "${VERIFY_POLICY_FILE}" <<'PYEOF'
@@ -302,9 +343,10 @@ def render_nftables_rules(has_loopback0, probe_log_support=True):
             cidrs = ", ".join(sorted(set(blocked_v6)))
             lines.append(f"        ip6 daddr {{ {cidrs} }} {drop_action}")
 
+    drop_action = "jump log_and_drop" if log_drops else "drop"
     if egress_mode == "allowlist" and not maintenance_egress_open:
         # Loopback (127.0.0.1:3128 egress-proxy) is already permitted above via 'oifname "lo" accept'.
-        lines.append("        drop")
+        lines.append(f"        {drop_action}")
 
     lines.extend([
         "    }",
