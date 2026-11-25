@@ -1,12 +1,18 @@
 package main
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/bzip2"
+	"compress/gzip"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"math/big"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -227,6 +233,11 @@ func (p *Policy) CheckEndpoint(method, rawPath string, query map[string][]string
 				}
 				if lk == "securityopt" && isDangerousSecurityOpt(v) {
 					return deny("build securityopt %q is forbidden", v)
+				}
+				if (len(p.AllowedRegistries) > 0 || p.ForceInternalNetwork) && lk == "remote" {
+					if strings.TrimSpace(v) != "" {
+						return deny("remote build context %q is forbidden when docker.allowedRegistries or docker.forceInternalNetwork is active", v)
+					}
 				}
 				if len(p.AllowedRegistries) > 0 && lk == "from" {
 					if trimmed := strings.TrimSpace(v); trimmed != "" {
@@ -858,6 +869,462 @@ func (p *Policy) checkImageRegistry(imageRef string) error {
 		}
 	}
 	return deny("image %q registry %q is not in docker.allowedRegistries", imageRef, reg)
+}
+
+const (
+	maxInspectBuildContextBytes      = 64 * 1024 * 1024  // 64 MiB max build context body when allowedRegistries is active
+	maxDecompressedBuildContextBytes = 128 * 1024 * 1024 // 128 MiB max decompressed tar stream scan
+	maxDockerfileBytes               = 1 * 1024 * 1024   // 1 MiB max Dockerfile size
+)
+
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
+}
+
+// ValidateBuildContextRegistries inspects the Dockerfile inside a POST /build tar
+// archive (uncompressed, gzip, or bzip2) and verifies every FROM / COPY --from= image
+// against AllowedRegistries. Fails closed on unsupported/corrupt archives, missing or
+// duplicate Dockerfiles, symlinked Dockerfile paths, or unresolvable ARG variables.
+func (p *Policy) ValidateBuildContextRegistries(query url.Values, tarBody []byte) error {
+	if len(p.AllowedRegistries) == 0 {
+		return nil
+	}
+	if len(tarBody) == 0 {
+		return deny("cannot inspect empty POST /build archive when docker.allowedRegistries is active")
+	}
+
+	targetDockerfile, err := cleanDockerfilePath(query.Get("dockerfile"))
+	if err != nil {
+		return err
+	}
+
+	buildArgs, err := parseBuildArgsQuery(query.Get("buildargs"))
+	if err != nil {
+		return err
+	}
+
+	var rawStream io.Reader
+	switch {
+	case len(tarBody) >= 2 && tarBody[0] == 0x1f && tarBody[1] == 0x8b:
+		gr, err := gzip.NewReader(bytes.NewReader(tarBody))
+		if err != nil {
+			return deny("cannot inspect gzip POST /build archive when docker.allowedRegistries is active: %v", err)
+		}
+		defer gr.Close()
+		rawStream = gr
+	case len(tarBody) >= 3 && tarBody[0] == 'B' && tarBody[1] == 'Z' && tarBody[2] == 'h':
+		rawStream = bzip2.NewReader(bytes.NewReader(tarBody))
+	case len(tarBody) >= 6 && bytes.Equal(tarBody[:6], []byte{0xfd, '7', 'z', 'X', 'Z', 0x00}):
+		return deny("cannot inspect xz-compressed POST /build archive format when docker.allowedRegistries is active")
+	case len(tarBody) >= 4 && bytes.Equal(tarBody[:4], []byte{0x28, 0xb5, 0x2f, 0xfd}):
+		return deny("cannot inspect zstd-compressed POST /build archive format when docker.allowedRegistries is active")
+	default:
+		rawStream = bytes.NewReader(tarBody)
+	}
+
+	cr := &countingReader{r: io.LimitReader(rawStream, maxDecompressedBuildContextBytes+1)}
+	tr := tar.NewReader(cr)
+	var dfBytes []byte
+	found := false
+	for {
+		hdr, err := tr.Next()
+		if cr.n > maxDecompressedBuildContextBytes {
+			return deny("POST /build archive exceeds %d MiB decompressed inspection limit when docker.allowedRegistries is active", maxDecompressedBuildContextBytes/(1024*1024))
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return deny("cannot inspect POST /build archive format when docker.allowedRegistries is active: %v", err)
+		}
+		entryName := cleanTarEntryName(hdr.Name)
+		if entryName == ".." || strings.HasPrefix(entryName, "../") {
+			return deny("path traversal entry %q in POST /build archive is forbidden", hdr.Name)
+		}
+		if strings.HasPrefix(targetDockerfile, entryName+"/") && hdr.Typeflag != tar.TypeDir {
+			return deny("Dockerfile ancestor %q in POST /build archive must be a directory", entryName)
+		}
+		if entryName != targetDockerfile {
+			continue
+		}
+		if found {
+			return deny("duplicate Dockerfile %q entry in POST /build archive is forbidden when docker.allowedRegistries is active", targetDockerfile)
+		}
+		if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA {
+			return deny("Dockerfile %q in POST /build archive must be a regular file", targetDockerfile)
+		}
+		if hdr.Size > maxDockerfileBytes {
+			return deny("Dockerfile %q in POST /build archive exceeds %d byte inspection limit", targetDockerfile, maxDockerfileBytes)
+		}
+		b, err := io.ReadAll(io.LimitReader(tr, maxDockerfileBytes+1))
+		if cr.n > maxDecompressedBuildContextBytes {
+			return deny("POST /build archive exceeds %d MiB decompressed inspection limit when docker.allowedRegistries is active", maxDecompressedBuildContextBytes/(1024*1024))
+		}
+		if err != nil {
+			return deny("failed reading Dockerfile %q from POST /build archive: %v", targetDockerfile, err)
+		}
+		if len(b) > maxDockerfileBytes {
+			return deny("Dockerfile %q in POST /build archive exceeds %d byte inspection limit", targetDockerfile, maxDockerfileBytes)
+		}
+		dfBytes = b
+		found = true
+	}
+
+	if !found {
+		return deny("Dockerfile %q not found in POST /build archive when docker.allowedRegistries is active", targetDockerfile)
+	}
+
+	return p.validateDockerfileRegistries(string(dfBytes), buildArgs)
+}
+
+func cleanDockerfilePath(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "Dockerfile", nil
+	}
+	trimmed = strings.ReplaceAll(trimmed, "\\", "/")
+	trimmed = strings.TrimLeft(trimmed, "/")
+	if trimmed == "" {
+		return "", deny("invalid dockerfile path %q", raw)
+	}
+	cleaned := path.Clean(trimmed)
+	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") || cleaned == "" {
+		return "", deny("invalid dockerfile path %q", raw)
+	}
+	return cleaned, nil
+}
+
+func cleanTarEntryName(name string) string {
+	n := strings.ReplaceAll(name, "\\", "/")
+	n = strings.TrimLeft(n, "/")
+	if n == "" {
+		return ""
+	}
+	return path.Clean(n)
+}
+
+func parseBuildArgsQuery(raw string) (map[string]string, error) {
+	args := make(map[string]string)
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return args, nil
+	}
+	var parsed map[string]*string
+	if err := json.Unmarshal([]byte(trimmed), &parsed); err != nil {
+		return nil, deny("invalid buildargs JSON in POST /build query: %v", err)
+	}
+	for k, v := range parsed {
+		if v != nil {
+			args[k] = *v
+		}
+	}
+	return args, nil
+}
+
+func isValidDirectiveKey(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
+			return false
+		}
+	}
+	return true
+}
+
+func isValidDockerfileVarName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (i > 0 && c >= '0' && c <= '9') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func (p *Policy) validateDockerfileRegistries(content string, buildArgs map[string]string) error {
+	content = strings.TrimPrefix(content, "\xef\xbb\xbf")
+	content = strings.ReplaceAll(content, "\r\n", "\n")
+	rawLines := strings.Split(content, "\n")
+
+	escapeChar := byte('\\')
+	inDirectives := true
+	seenEscape := false
+	var logicalLines []string
+	var current strings.Builder
+	continuing := false
+
+	for _, line := range rawLines {
+		noCR := strings.TrimRight(line, "\r")
+		trimmed := strings.TrimSpace(noCR)
+		if inDirectives {
+			if trimmed == "" {
+				inDirectives = false
+				continue
+			}
+			if strings.HasPrefix(trimmed, "#") {
+				dirBody := strings.TrimSpace(strings.TrimPrefix(trimmed, "#"))
+				eqIdx := strings.Index(dirBody, "=")
+				if eqIdx == -1 {
+					inDirectives = false
+					continue
+				}
+				rawKey := strings.TrimSpace(dirBody[:eqIdx])
+				val := strings.TrimSpace(dirBody[eqIdx+1:])
+				if !isValidDirectiveKey(rawKey) || val == "" {
+					inDirectives = false
+					continue
+				}
+				key := strings.ToLower(rawKey)
+				if key == "syntax" {
+					return deny("Dockerfile # syntax=%s frontend directive cannot be verified when docker.allowedRegistries is active", val)
+				}
+				if key == "escape" {
+					if seenEscape {
+						inDirectives = false
+						continue
+					}
+					if val != `\` && val != "`" {
+						return deny("invalid Dockerfile escape directive %q", val)
+					}
+					escapeChar = val[0]
+					seenEscape = true
+				}
+				continue
+			}
+			inDirectives = false
+		}
+
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+
+		trimmedRight := strings.TrimRight(noCR, " \t")
+		if len(trimmedRight) > 0 && trimmedRight[len(trimmedRight)-1] == escapeChar {
+			part := trimmedRight[:len(trimmedRight)-1]
+			current.WriteString(part)
+			continuing = true
+			continue
+		}
+
+		if continuing {
+			current.WriteString(noCR)
+			logicalLines = append(logicalLines, strings.TrimSpace(current.String()))
+			current.Reset()
+			continuing = false
+		} else {
+			logicalLines = append(logicalLines, trimmed)
+		}
+	}
+	if continuing && current.Len() > 0 {
+		logicalLines = append(logicalLines, strings.TrimSpace(current.String()))
+	}
+
+	globalArgs := make(map[string]string)
+	for k, v := range buildArgs {
+		globalArgs[k] = v
+	}
+	stages := make(map[string]bool)
+	seenFirstFrom := false
+	stageCount := 0
+
+	for _, instr := range logicalLines {
+		fields := strings.Fields(instr)
+		if len(fields) == 0 {
+			continue
+		}
+		kw := strings.ToUpper(fields[0])
+		if kw == "ONBUILD" {
+			if len(fields) < 2 {
+				return deny("malformed Dockerfile ONBUILD instruction %q", instr)
+			}
+			fields = fields[1:]
+			kw = strings.ToUpper(fields[0])
+		}
+
+		switch kw {
+		case "ARG":
+			if seenFirstFrom {
+				continue
+			}
+			for _, tok := range fields[1:] {
+				name, def, hasDef := strings.Cut(tok, "=")
+				if name == "" {
+					continue
+				}
+				if _, overridden := buildArgs[name]; overridden {
+					continue
+				}
+				if hasDef {
+					rawVal := unquoteDockerfileValue(def)
+					if strings.Contains(rawVal, "$") {
+						expandedVal, ok := expandDockerfileVars(rawVal, globalArgs)
+						if !ok {
+							delete(globalArgs, name)
+							continue
+						}
+						globalArgs[name] = expandedVal
+					} else {
+						globalArgs[name] = rawVal
+					}
+				}
+			}
+		case "FROM":
+			seenFirstFrom = true
+			idx := 1
+			for idx < len(fields) && strings.HasPrefix(fields[idx], "--") {
+				idx++
+			}
+			if idx >= len(fields) {
+				return deny("malformed Dockerfile FROM instruction %q", instr)
+			}
+			rawRef := unquoteDockerfileValue(fields[idx])
+			stageName := ""
+			if idx+2 < len(fields) && strings.EqualFold(fields[idx+1], "AS") {
+				if idx+3 != len(fields) {
+					return deny("malformed Dockerfile FROM instruction %q", instr)
+				}
+				stageName = strings.ToLower(fields[idx+2])
+			} else if idx+1 != len(fields) {
+				return deny("malformed Dockerfile FROM instruction %q", instr)
+			}
+
+			expandedRef, ok := expandDockerfileVars(rawRef, globalArgs)
+			if !ok || strings.TrimSpace(expandedRef) == "" || strings.ContainsAny(expandedRef, "$\\\"' \t") {
+				return deny("unresolved ARG in Dockerfile FROM %q cannot be verified against allowedRegistries", rawRef)
+			}
+
+			lowerRef := strings.ToLower(expandedRef)
+			if lowerRef != "scratch" && !stages[lowerRef] {
+				if err := p.checkImageRegistry(expandedRef); err != nil {
+					return err
+				}
+			}
+			if stageName != "" {
+				stages[stageName] = true
+			}
+			stageCount++
+		case "COPY":
+			for _, tok := range fields[1:] {
+				if !strings.HasPrefix(tok, "--") {
+					break
+				}
+				if strings.HasPrefix(strings.ToLower(tok), "--from=") {
+					fromVal := unquoteDockerfileValue(tok[len("--from="):])
+					trimmedFrom := strings.TrimSpace(fromVal)
+					if trimmedFrom == "" || strings.ContainsAny(trimmedFrom, "$\\\"' \t") {
+						return deny("invalid or variable Dockerfile COPY --from=%q cannot be verified against allowedRegistries", fromVal)
+					}
+					lowerFrom := strings.ToLower(trimmedFrom)
+					if lowerFrom == "scratch" || stages[lowerFrom] {
+						continue
+					}
+					if stageIdx, err := strconv.Atoi(trimmedFrom); err == nil && stageIdx >= 0 && stageIdx < stageCount {
+						continue
+					}
+					if err := p.checkImageRegistry(trimmedFrom); err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func unquoteDockerfileValue(v string) string {
+	if len(v) >= 2 {
+		if (v[0] == '"' && v[len(v)-1] == '"') || (v[0] == '\'' && v[len(v)-1] == '\'') {
+			return v[1 : len(v)-1]
+		}
+	}
+	return v
+}
+
+func expandDockerfileVars(s string, vars map[string]string) (string, bool) {
+	var out strings.Builder
+	for i := 0; i < len(s); {
+		if s[i] != '$' {
+			out.WriteByte(s[i])
+			i++
+			continue
+		}
+		if i+1 >= len(s) {
+			return "", false
+		}
+		if s[i+1] == '$' {
+			out.WriteByte('$')
+			i += 2
+			continue
+		}
+		if s[i+1] == '{' {
+			closeIdx := strings.IndexByte(s[i+2:], '}')
+			if closeIdx == -1 {
+				return "", false
+			}
+			expr := s[i+2 : i+2+closeIdx]
+			i = i + 2 + closeIdx + 1
+
+			var name, def string
+			var hasDef, requireNonEmpty bool
+			if n, d, ok := strings.Cut(expr, ":-"); ok {
+				name, def, hasDef, requireNonEmpty = n, d, true, true
+			} else if n, d, ok := strings.Cut(expr, "-"); ok {
+				name, def, hasDef, requireNonEmpty = n, d, true, false
+			} else {
+				name = expr
+			}
+			if !isValidDockerfileVarName(name) {
+				return "", false
+			}
+			val, ok := vars[name]
+			if ok && (!requireNonEmpty || val != "") {
+				out.WriteString(val)
+				continue
+			}
+			if hasDef {
+				expandedDef, defOK := expandDockerfileVars(def, vars)
+				if !defOK {
+					return "", false
+				}
+				out.WriteString(expandedDef)
+				continue
+			}
+			return "", false
+		}
+
+		// $VAR form
+		start := i + 1
+		end := start
+		for end < len(s) && (s[end] == '_' || (s[end] >= 'A' && s[end] <= 'Z') || (s[end] >= 'a' && s[end] <= 'z') || (end > start && s[end] >= '0' && s[end] <= '9')) {
+			end++
+		}
+		if end == start {
+			return "", false
+		}
+		name := s[start:end]
+		val, ok := vars[name]
+		if !ok {
+			return "", false
+		}
+		out.WriteString(val)
+		i = end
+	}
+	return out.String(), true
 }
 
 func asInt64(v any) (int64, bool) {

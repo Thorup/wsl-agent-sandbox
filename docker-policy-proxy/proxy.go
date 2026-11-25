@@ -725,6 +725,36 @@ func (pp *PolicyProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if r.Method == http.MethodPost && norm == "/build" && len(pol.AllowedRegistries) > 0 {
+		limited := io.LimitReader(r.Body, maxInspectBuildContextBytes+1)
+		bodyBytes, err := io.ReadAll(limited)
+		_ = r.Body.Close()
+		if err != nil {
+			writeDockerJSONError(w, http.StatusBadRequest, "failed reading build context body: "+err.Error())
+			return
+		}
+		if len(bodyBytes) > maxInspectBuildContextBytes {
+			writeDockerJSONError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("build context exceeds %d MiB inspection limit when docker.allowedRegistries is active", maxInspectBuildContextBytes/(1024*1024)))
+			return
+		}
+		if err := pol.ValidateBuildContextRegistries(r.URL.Query(), bodyBytes); err != nil {
+			var pe *PolicyError
+			if errors.As(err, &pe) {
+				pp.logger.Printf("DENY method=%s path=%s reason=%s", r.Method, r.URL.Path, pe.Reason)
+				writeDockerJSONError(w, http.StatusForbidden, pe.Error())
+				return
+			}
+			pp.logger.Printf("ERROR method=%s path=%s err=%v", r.Method, r.URL.Path, err)
+			writeDockerJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		r.ContentLength = int64(len(bodyBytes))
+		r.TransferEncoding = nil
+		r.Header.Del("Transfer-Encoding")
+		r.Header.Set("Content-Length", strconvItoa(len(bodyBytes)))
+	}
+
 	var ephemeralTargets []string
 	if needsJSONBodyInspection(r.Method, r.URL.Path) {
 		limited := io.LimitReader(r.Body, maxInspectBodyBytes+1)
@@ -797,6 +827,7 @@ func (pp *PolicyProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		bufW.flushTo(w)
 		return
 	}
+
 
 	if r.Method == http.MethodPost && norm == "/containers/prune" {
 		capW := &statusCaptureWriter{ResponseWriter: w}
